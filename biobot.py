@@ -7,11 +7,13 @@ import time
 import heapq
 import random
 import sqlite3
+import calendar
 import itertools
 import threading
 import traceback
 import unicodedata
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Optional, Tuple, List, Dict
 
 import telebot
@@ -60,7 +62,7 @@ OWNER_ID = CREATOR_ID
 
 # ссылки
 IRIS_BOT_LINK = "http://t.me/iris_cm_bot"
-URL_COMMANDS = "http://www.example.com/"
+URL_COMMANDS = "https://teletype.in/@biowar/commands"
 URL_SUPPORT_CHAT = "https://t.me/dnd_bot_tgk?direct"
 URL_DEV_CHANNEL = "https://t.me/dnd_bot_tgk"
 # миниатюры
@@ -785,6 +787,8 @@ PREMIUM_EMOJI_IDS: Dict[str, str] = {
     "🔊": "5260325873688518261",
     "🔇": "5258267368877989660",
     "⏳": "5199457120428249992",
+    "⏰": "5258258882022612173",
+    "🔁": "5258419835922030550",
     "🤧": "5370880659759831851",
     "🤒": "5373262021556967911",
     "🕵️‍♂️": "",
@@ -882,6 +886,13 @@ def premiumize_html_text(text: str) -> str:
         i += 1
 
     return "".join(out)
+
+def premium_emoji_html(emoji: str) -> str:
+    emo = str(emoji or "")
+    eid = _premium_emoji_id(emo) if PREMIUM_EMOJI_ENABLED else ""
+    if eid:
+        return f'<tg-emoji emoji-id="{h(eid)}">{h(emo)}</tg-emoji>'
+    return emo
 
 def InlineKeyboardButton(text, *args, **kwargs):
     return _RAW_INLINE_KEYBOARD_BUTTON(text, *args, **kwargs)
@@ -1161,6 +1172,8 @@ _REAL_BOT_SEND_VIDEO = bot.send_video
 
 def _premium_text_payload(value):
     if isinstance(value, str):
+        if "<tg-emoji" in value:
+            return value
         return premiumize_html_text(value)
     return value
 
@@ -1512,6 +1525,7 @@ def _housekeeping_daemon():
                     send_error_report("_corp_invite_expire", e)
 
             purge_deleted_db(now)
+            _run_due_timers(now)
 
         except Exception as e:
             send_error_report("_tz3_housekeeping_daemon", e)
@@ -1522,13 +1536,14 @@ def _housekeeping_daemon():
 def init_db():
     db_exec("""
     CREATE TABLE IF NOT EXISTS users (
-        user_id     INTEGER PRIMARY KEY,
-        username    TEXT,
-        first_name  TEXT,
-        last_name   TEXT,
-        notify_chat_id INTEGER DEFAULT 0,
-        notify_off     INTEGER DEFAULT 0,
-        last_seen   INTEGER DEFAULT 0
+        user_id         INTEGER PRIMARY KEY,
+        username        TEXT,
+        first_name      TEXT,
+        last_name       TEXT,
+        notify_chat_id  INTEGER DEFAULT 0,
+        notify_off      INTEGER DEFAULT 0,
+        last_seen       INTEGER DEFAULT 0,
+        is_placeholder  INTEGER DEFAULT 0
     );
     """, commit=True)
 
@@ -1693,6 +1708,54 @@ def init_db():
     """, commit=True)
 
     db_exec("""
+    CREATE TABLE IF NOT EXISTS user_timers (
+        timer_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id        INTEGER NOT NULL,
+        chat_id        INTEGER NOT NULL DEFAULT 0,
+        created_at     INTEGER NOT NULL DEFAULT 0,
+        next_run_ts    INTEGER NOT NULL DEFAULT 0,
+        is_cycle       INTEGER NOT NULL DEFAULT 0,
+        repeat_spec    TEXT NOT NULL DEFAULT '',
+        cycle_total    INTEGER NOT NULL DEFAULT 0,
+        cycle_left     INTEGER NOT NULL DEFAULT 0,
+        command_text   TEXT NOT NULL DEFAULT ''
+    );
+    """, commit=True)
+
+    for sql in (
+        "ALTER TABLE user_timers ADD COLUMN chat_id INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE user_timers ADD COLUMN cycle_total INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE user_timers ADD COLUMN cycle_left INTEGER NOT NULL DEFAULT 0",
+    ):
+        try:
+            db_exec(sql, commit=True)
+        except Exception:
+            pass
+
+    try:
+        db_exec(
+            "UPDATE user_timers SET cycle_total=2, cycle_left=2 "
+            "WHERE is_cycle=1 AND (COALESCE(cycle_total,0)=0 OR COALESCE(cycle_left,0)=0)",
+            commit=True
+        )
+    except Exception:
+        pass
+
+    db_exec("""
+    CREATE TABLE IF NOT EXISTS user_name_restrictions (
+        user_id            INTEGER PRIMARY KEY,
+        lab_locked         INTEGER NOT NULL DEFAULT 0,
+        lab_by             INTEGER NOT NULL DEFAULT 0,
+        lab_at             INTEGER NOT NULL DEFAULT 0,
+        lab_reason         TEXT NOT NULL DEFAULT '',
+        pat_locked         INTEGER NOT NULL DEFAULT 0,
+        pat_by             INTEGER NOT NULL DEFAULT 0,
+        pat_at             INTEGER NOT NULL DEFAULT 0,
+        pat_reason         TEXT NOT NULL DEFAULT ''
+    );
+    """, commit=True)
+
+    db_exec("""
     CREATE TABLE IF NOT EXISTS labs (
         user_id         INTEGER PRIMARY KEY,
         lab_name        TEXT,
@@ -1750,6 +1813,7 @@ def init_db():
     for sql in (
         "ALTER TABLE users ADD COLUMN notify_chat_id INTEGER DEFAULT 0",
         "ALTER TABLE users ADD COLUMN notify_off INTEGER DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN is_placeholder INTEGER DEFAULT 0",
     ):
         try:
             db_exec(sql, commit=True)
@@ -2409,13 +2473,14 @@ def _restore_deleted_lab(user_id: int, *, support_mode: bool = False) -> tuple[b
 
 def upsert_user(tg_user):
     db_exec("""
-        INSERT INTO users(user_id, username, first_name, last_name, last_seen)
-        VALUES(?,?,?,?,?)
+        INSERT INTO users(user_id, username, first_name, last_name, last_seen, is_placeholder)
+        VALUES(?,?,?,?,?,0)
         ON CONFLICT(user_id) DO UPDATE SET
             username=excluded.username,
             first_name=excluded.first_name,
             last_name=excluded.last_name,
-            last_seen=excluded.last_seen
+            last_seen=excluded.last_seen,
+            is_placeholder=0
     """, (
         int(tg_user.id),
         (tg_user.username or "").lower() if tg_user.username else None,
@@ -3380,29 +3445,42 @@ def render_corp_info_text(corp_row, viewer_id: int) -> tuple[str, InlineKeyboard
 
     owner = corp_owner(corp_id)
     deputies = corp_deputies(corp_id)
+    members = corp_members_full(corp_id)
     sum_be, sum_inf = corp_sums(corp_id)
+
+    stats_by_uid = {int(m["user_id"]): m for m in members}
+
+    def _stats_suffix(uid: int) -> str:
+        row = stats_by_uid.get(int(uid))
+        if not row:
+            return "☣️0|🤧0"
+        return f"☣️{_fmt_k(int(row['be'] or 0))}|🤧{_fmt_k(int(row['sick'] or 0))}"
 
     if owner:
         ou = (owner["username"] or "")
         od = display_name(owner["first_name"] or "", owner["last_name"] or "", ou, int(owner["user_id"]))
         owner_tag = tg_mention(int(owner["user_id"]), od, username=ou)
+        owner_line = f"🧑‍✈️ Владелец: {owner_tag} | {_stats_suffix(int(owner['user_id']))}"
     else:
-        owner_tag = "неизвестно"
+        owner_line = "🧑‍✈️ Владелец: неизвестно"
 
     dep_tags = []
     for d in deputies:
         du = (d["username"] or "")
         dd = display_name(d["first_name"] or "", d["last_name"] or "", du, int(d["user_id"]))
-        dep_tags.append(tg_mention(int(d["user_id"]), dd, username=du))
+        tag = tg_mention(int(d["user_id"]), dd, username=du)
+        dep_tags.append(f"{tag} | {_stats_suffix(int(d['user_id']))}")
 
     lines = []
     lines.append(f"🏢 Досье корпорации {corp_name_display(name)}")
-    lines.append(f"🧑‍✈️ Владелец: {owner_tag}")
+    lines.append(owner_line)
     if dep_tags:
         if len(dep_tags) == 1:
             lines.append(f"🧑‍💼 Заместитель: {dep_tags[0]}")
         else:
-            lines.append(f"🧑‍💼 Заместители: " + ", ".join(dep_tags))
+            lines.append("🧑‍💼 Заместители:")
+            for dline in dep_tags:
+                lines.append(dline)
     lines.append("")
     lines.append(f"🏷️ Тип корпорации: {'Открытый' if is_open == 1 else 'Закрытый'}")
     if min_be > 0:
@@ -3410,6 +3488,7 @@ def render_corp_info_text(corp_row, viewer_id: int) -> tuple[str, InlineKeyboard
     lines.append("")
     lines.append(f"☣️ Био-опыт: {_fmt_k(sum_be)}")
     lines.append(f"🤧 Заражённых: {_fmt_k(sum_inf)}")
+    lines.append(f"🔬 Лабораторий: {len(members)}")
 
     is_member = corp_is_member(corp_id, int(viewer_id))
     kb = kb_corp_info(corp_id, int(viewer_id), is_member)
@@ -3451,6 +3530,45 @@ def render_corp_members_text(corp_row, viewer_id: int) -> tuple[str, InlineKeybo
 
         if i >= 60:
             break
+
+    kb = kb_corp_members(corp_id, int(viewer_id))
+    return "\n".join(lines), kb
+
+def render_corp_requests_text(corp_row, viewer_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    corp_id = int(corp_row["corp_id"])
+    name = (corp_row["name"] or "").strip()
+
+    rows = db_all(
+        "SELECT r.request_id, r.user_id, "
+        "COALESCE(l.bio_exp,0) AS be, COALESCE(l.infected_total,0) AS sick, "
+        "u.username, u.first_name, u.last_name "
+        "FROM corp_requests r "
+        "LEFT JOIN labs l ON l.user_id=r.user_id "
+        "LEFT JOIN users u ON u.user_id=r.user_id "
+        "WHERE r.corp_id=? AND r.status='pending' "
+        "ORDER BY r.request_id ASC",
+        (corp_id,)
+    ) or []
+
+    lines = []
+    lines.append(f"📑 ЗАЯВКИ В КОРПОРАЦИЮ {corp_name_display(name)}")
+    lines.append("")
+
+    if not rows:
+        lines.append("Активных заявок нет.")
+    else:
+        i = 0
+        for r in rows:
+            i += 1
+            uid = int(r["user_id"])
+            un = (r["username"] or "")
+            disp = display_name(r["first_name"] or "", r["last_name"] or "", un, uid)
+            tag = tg_mention(uid, disp, username=un)
+            lines.append(
+                f"{i}. {tag} | ☣️ {_fmt_k(int(r['be'] or 0))} | 🤧 {_fmt_k(int(r['sick'] or 0))} | ID {int(r['request_id'])}"
+            )
+            if i >= 60:
+                break
 
     kb = kb_corp_members(corp_id, int(viewer_id))
     return "\n".join(lines), kb
@@ -3685,7 +3803,13 @@ def find_user_id_by_username(username: str) -> Optional[int]:
     if not username:
         return None
 
-    row = db_one("SELECT user_id FROM users WHERE username=? LIMIT 1", (username,))
+    row = db_one(
+        "SELECT user_id FROM users "
+        "WHERE username=? "
+        "ORDER BY COALESCE(is_placeholder,0) ASC, COALESCE(last_seen,0) DESC, user_id DESC "
+        "LIMIT 1",
+        (username,)
+    )
     if row:
         return int(row["user_id"])
 
@@ -3694,6 +3818,217 @@ def find_user_id_by_username(username: str) -> Optional[int]:
         return int(row["user_id"])
 
     return None
+
+def _extract_public_username_token(token: str) -> str:
+    s = (token or "").strip()
+
+    if s.startswith("@"):
+        uname = s[1:].strip()
+    else:
+        m = re.match(
+            r"^(?:https?://)?(?:t\.me|telegram\.me)/([A-Za-z0-9_]{3,64})/?$",
+            s,
+            flags=re.IGNORECASE
+        )
+        if not m:
+            return ""
+        uname = m.group(1).strip()
+
+    uname = re.sub(r"[^A-Za-z0-9_]", "", uname)
+    return uname.lower()
+
+def _alloc_placeholder_user_id() -> int:
+    row = db_one("SELECT MIN(user_id) AS mn FROM users WHERE user_id < 0")
+    mn = int(row["mn"] or 0) if row else 0
+    if mn >= 0:
+        return -1
+    return int(mn) - 1
+
+def _ensure_placeholder_user_by_uid(user_id: int) -> int:
+    uid = int(user_id)
+    row = get_user_row(uid)
+    if row:
+        if int(row["is_placeholder"] or 0) != 1:
+            db_exec("UPDATE users SET is_placeholder=0 WHERE user_id=?", (uid,), commit=True)
+        return uid
+
+    db_exec(
+        "INSERT INTO users(user_id, username, first_name, last_name, last_seen, is_placeholder) VALUES (?,?,?,?,?,1)",
+        (uid, None, None, None, 0),
+        commit=True
+    )
+    return uid
+
+def _ensure_placeholder_user_by_username(username: str) -> int:
+    uname = (username or "").strip().lstrip("@").lower()
+    if not uname:
+        return 0
+
+    known = find_user_id_by_username(uname)
+    if known is not None:
+        return int(known)
+
+    row = db_one(
+        "SELECT user_id FROM users WHERE username=? AND COALESCE(is_placeholder,0)=1 LIMIT 1",
+        (uname,)
+    )
+    if row:
+        return int(row["user_id"])
+
+    ph_id = _alloc_placeholder_user_id()
+    db_exec(
+        "INSERT INTO users(user_id, username, first_name, last_name, last_seen, is_placeholder) VALUES (?,?,?,?,?,1)",
+        (int(ph_id), uname, None, None, 0),
+        commit=True
+    )
+    return int(ph_id)
+
+def _resolve_or_create_infect_target(token: str) -> Optional[int]:
+    s = (token or "").strip()
+    if not s:
+        return None
+
+    uname = _extract_public_username_token(s)
+    if uname:
+        return _ensure_placeholder_user_by_username(uname)
+
+    if re.fullmatch(r"-?\d{1,20}", s):
+        uid = int(s)
+        row = get_user_row(uid)
+        if row:
+            return int(uid)
+
+        if uid > 0 and len(str(uid)) >= 7:
+            return _ensure_placeholder_user_by_uid(uid)
+
+        return None
+
+    m = re.search(r"tg://user\?id=(\d+)", s)
+    if m:
+        return _ensure_placeholder_user_by_uid(int(m.group(1)))
+
+    return None
+def is_placeholder_user(user_id: int) -> bool:
+    row = get_user_row(int(user_id))
+    if not row:
+        return False
+    return int(row["is_placeholder"] or 0) == 1
+
+def public_user_tag(user_id: int) -> str:
+    uid = int(user_id)
+    row = get_user_row(uid)
+
+    if row and int(row["is_placeholder"] or 0) == 1:
+        un = (row["username"] or "").strip()
+        return tg_mention(uid, "неизвестный пользователь", username=un)
+
+    if row:
+        un = (row["username"] or "").strip()
+        disp = display_name(row["first_name"] or "", row["last_name"] or "", un, uid)
+        return tg_mention(uid, disp, username=un)
+
+    if uid > 0:
+        return tg_mention(uid, "неизвестный пользователь")
+
+    return "неизвестный пользователь"
+
+def _merge_placeholder_to_real_user(tg_user):
+    real_uid = int(tg_user.id)
+    uname = ((getattr(tg_user, "username", None) or "").strip().lower())
+
+    # positive uid-placeholder: просто снимаем флаг
+    db_exec("UPDATE users SET is_placeholder=0 WHERE user_id=?", (real_uid,), commit=True)
+
+    if not uname:
+        return
+
+    ph = db_one(
+        "SELECT user_id FROM users "
+        "WHERE username=? AND COALESCE(is_placeholder,0)=1 AND user_id<>? "
+        "ORDER BY user_id ASC LIMIT 1",
+        (uname, real_uid)
+    )
+    if not ph:
+        return
+
+    ph_uid = int(ph["user_id"])
+
+    real_lab = db_one("SELECT COALESCE(lab_active,0) AS la FROM labs WHERE user_id=? LIMIT 1", (real_uid,))
+    ph_lab = db_one(
+        "SELECT COALESCE(bio_exp,0) AS be, COALESCE(fever_until_ts,0) AS fut, "
+        "COALESCE(diseases_total,0) AS dt, COALESCE(fever_pathogen,'') AS fp "
+        "FROM labs WHERE user_id=? LIMIT 1",
+        (ph_uid,)
+    )
+
+    with DB_LOCK:
+        c = conn.cursor()
+        try:
+            c.execute("BEGIN")
+
+            if ph_lab:
+                if (not real_lab) or int(real_lab["la"] or 0) == 0:
+                    c.execute("DELETE FROM labs WHERE user_id=?", (real_uid,))
+                    c.execute("UPDATE labs SET user_id=? WHERE user_id=?", (real_uid, ph_uid))
+                else:
+                    c.execute(
+                        "UPDATE labs SET "
+                        "bio_exp=MAX(COALESCE(bio_exp,0), ?), "
+                        "fever_until_ts=MAX(COALESCE(fever_until_ts,0), ?), "
+                        "diseases_total=MAX(COALESCE(diseases_total,0), ?), "
+                        "fever_pathogen=CASE WHEN COALESCE(fever_pathogen,'')='' THEN ? ELSE fever_pathogen END "
+                        "WHERE user_id=?",
+                        (
+                            int(ph_lab["be"] or 0),
+                            int(ph_lab["fut"] or 0),
+                            int(ph_lab["dt"] or 0),
+                            str(ph_lab["fp"] or ""),
+                            real_uid,
+                        )
+                    )
+                    c.execute("DELETE FROM labs WHERE user_id=?", (ph_uid,))
+
+            c.execute(
+                "INSERT OR REPLACE INTO infections(attacker_id,target_id,start_ts,end_ts,add_bio_res,next_payout_ts,counted,pathogen_name) "
+                "SELECT attacker_id, ?, start_ts, end_ts, add_bio_res, next_payout_ts, counted, COALESCE(pathogen_name,'') "
+                "FROM infections WHERE target_id=?",
+                (real_uid, ph_uid)
+            )
+            c.execute("DELETE FROM infections WHERE target_id=?", (ph_uid,))
+
+            c.execute(
+                "INSERT OR IGNORE INTO infection_seen(attacker_id,target_id,first_ts) "
+                "SELECT attacker_id, ?, first_ts FROM infection_seen WHERE target_id=?",
+                (real_uid, ph_uid)
+            )
+            c.execute("DELETE FROM infection_seen WHERE target_id=?", (ph_uid,))
+
+            c.execute(
+                "INSERT OR REPLACE INTO infection_cooldowns(attacker_id,target_id,until_ts) "
+                "SELECT attacker_id, ?, until_ts FROM infection_cooldowns WHERE target_id=?",
+                (real_uid, ph_uid)
+            )
+            c.execute("DELETE FROM infection_cooldowns WHERE target_id=?", (ph_uid,))
+
+            c.execute(
+                "INSERT OR REPLACE INTO sabotage_cooldowns(attacker_id,target_id,until_ts) "
+                "SELECT attacker_id, ?, until_ts FROM sabotage_cooldowns WHERE target_id=?",
+                (real_uid, ph_uid)
+            )
+            c.execute("DELETE FROM sabotage_cooldowns WHERE target_id=?", (ph_uid,))
+
+            c.execute("DELETE FROM users WHERE user_id=? AND COALESCE(is_placeholder,0)=1", (ph_uid,))
+            c.execute("UPDATE users SET is_placeholder=0 WHERE user_id=?", (real_uid,))
+
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            try:
+                c.close()
+            except Exception:
+                pass
 
 def add_support_agent(target_id: int, added_by: int, role: str = "support") -> None:
     db_exec("""
@@ -3704,6 +4039,302 @@ def add_support_agent(target_id: int, added_by: int, role: str = "support") -> N
             added_by=excluded.added_by,
             added_at=excluded.added_at
     """, (int(target_id), role, int(added_by), now_ts()), commit=True)
+
+def remove_support_agent(target_id: int):
+    db_exec("DELETE FROM support_agents WHERE user_id=?", (int(target_id),), commit=True)
+
+def get_name_restriction_row(user_id: int):
+    return db_one(
+        "SELECT user_id, lab_locked, lab_by, lab_at, lab_reason, pat_locked, pat_by, pat_at, pat_reason "
+        "FROM user_name_restrictions WHERE user_id=? LIMIT 1",
+        (int(user_id),)
+    )
+
+def set_name_restriction(user_id: int, kind: str, locked: int, imposed_by: int, reason: str):
+    uid = int(user_id)
+    agent = int(imposed_by)
+    reason = str(reason or "")[:50]
+    now = now_ts()
+
+    row = get_name_restriction_row(uid)
+    cur = dict(row) if row else {
+        "lab_locked": 0, "lab_by": 0, "lab_at": 0, "lab_reason": "",
+        "pat_locked": 0, "pat_by": 0, "pat_at": 0, "pat_reason": "",
+    }
+
+    if kind == "lab":
+        cur["lab_locked"] = int(locked)
+        cur["lab_by"] = agent if int(locked) == 1 else 0
+        cur["lab_at"] = now if int(locked) == 1 else 0
+        cur["lab_reason"] = reason if int(locked) == 1 else ""
+    else:
+        cur["pat_locked"] = int(locked)
+        cur["pat_by"] = agent if int(locked) == 1 else 0
+        cur["pat_at"] = now if int(locked) == 1 else 0
+        cur["pat_reason"] = reason if int(locked) == 1 else ""
+
+    if int(cur["lab_locked"]) == 0 and int(cur["pat_locked"]) == 0:
+        db_exec("DELETE FROM user_name_restrictions WHERE user_id=?", (uid,), commit=True)
+        return
+
+    db_exec(
+        "INSERT INTO user_name_restrictions(user_id, lab_locked, lab_by, lab_at, lab_reason, pat_locked, pat_by, pat_at, pat_reason) "
+        "VALUES (?,?,?,?,?,?,?,?,?) "
+        "ON CONFLICT(user_id) DO UPDATE SET "
+        "lab_locked=excluded.lab_locked, lab_by=excluded.lab_by, lab_at=excluded.lab_at, lab_reason=excluded.lab_reason, "
+        "pat_locked=excluded.pat_locked, pat_by=excluded.pat_by, pat_at=excluded.pat_at, pat_reason=excluded.pat_reason",
+        (
+            uid,
+            int(cur["lab_locked"]), int(cur["lab_by"]), int(cur["lab_at"]), str(cur["lab_reason"]),
+            int(cur["pat_locked"]), int(cur["pat_by"]), int(cur["pat_at"]), str(cur["pat_reason"]),
+        ),
+        commit=True
+    )
+
+def _restriction_target_and_reason_from_message(message):
+    first_line, body = _timer_first_line_and_body(message.text or "")
+    first_line = strip_bio_prefix(first_line)
+    if first_line.startswith("/") or first_line.startswith("."):
+        first_line = first_line[1:].strip()
+
+    parts = first_line.split()
+    if len(parts) < 2:
+        return None, "", ""
+    token = parts[1].strip()
+    reason = (body or "").strip()[:50]
+    return token, reason, first_line
+
+def _blacklist_collect_rows() -> list[dict]:
+    out: Dict[int, dict] = {}
+
+    bans = db_all(
+        "SELECT user_id, banned_by, banned_at, reason, username, first_name, last_name FROM bot_bans ORDER BY banned_at DESC, user_id DESC"
+    ) or []
+    for r in bans:
+        uid = int(r["user_id"])
+        item = out.setdefault(uid, {
+            "user_id": uid,
+            "statuses": [],
+            "reasons": [],
+            "agents": [],
+            "latest_ts": 0,
+            "username": (r["username"] or "").strip(),
+            "first_name": (r["first_name"] or "").strip(),
+            "last_name": (r["last_name"] or "").strip(),
+        })
+        item["statuses"].append("блокировка в боте")
+        if (r["reason"] or "").strip():
+            item["reasons"].append((r["reason"] or "").strip())
+        if int(r["banned_by"] or 0) > 0:
+            item["agents"].append(int(r["banned_by"]))
+        item["latest_ts"] = max(int(item["latest_ts"]), int(r["banned_at"] or 0))
+
+    locks = db_all(
+        "SELECT user_id, lab_locked, lab_by, lab_at, lab_reason, pat_locked, pat_by, pat_at, pat_reason "
+        "FROM user_name_restrictions "
+        "WHERE lab_locked=1 OR pat_locked=1 "
+        "ORDER BY MAX(lab_at, pat_at) DESC, user_id DESC"
+    ) or []
+    for r in locks:
+        uid = int(r["user_id"])
+        u = get_user_row(uid)
+        item = out.setdefault(uid, {
+            "user_id": uid,
+            "statuses": [],
+            "reasons": [],
+            "agents": [],
+            "latest_ts": 0,
+            "username": ((u["username"] or "").strip() if u else ""),
+            "first_name": ((u["first_name"] or "").strip() if u else ""),
+            "last_name": ((u["last_name"] or "").strip() if u else ""),
+        })
+
+        if int(r["lab_locked"] or 0) == 1:
+            item["statuses"].append("имени лабы")
+            if (r["lab_reason"] or "").strip():
+                item["reasons"].append((r["lab_reason"] or "").strip())
+            if int(r["lab_by"] or 0) > 0:
+                item["agents"].append(int(r["lab_by"]))
+            item["latest_ts"] = max(int(item["latest_ts"]), int(r["lab_at"] or 0))
+
+        if int(r["pat_locked"] or 0) == 1:
+            item["statuses"].append("имени патогена")
+            if (r["pat_reason"] or "").strip():
+                item["reasons"].append((r["pat_reason"] or "").strip())
+            if int(r["pat_by"] or 0) > 0:
+                item["agents"].append(int(r["pat_by"]))
+            item["latest_ts"] = max(int(item["latest_ts"]), int(r["pat_at"] or 0))
+
+    rows = list(out.values())
+    rows.sort(key=lambda x: (int(x["latest_ts"]), int(x["user_id"])), reverse=True)
+    return rows
+
+def _blacklist_cb(page: int) -> str:
+    return f"{BLUI_TAG}:{int(page)}"
+
+def _blacklist_parse_cb(data: str) -> Optional[int]:
+    try:
+        p = (data or "").split(":")
+        if len(p) != 2 or p[0] != BLUI_TAG:
+            return None
+        return int(p[1])
+    except Exception:
+        return None
+
+def _user_display_from_any(uid: int, username: str = "", first_name: str = "", last_name: str = "") -> str:
+    uid = int(uid)
+    u = get_user_row(uid)
+    if u:
+        un = (u["username"] or "").strip()
+        fn = (u["first_name"] or "").strip()
+        ln = (u["last_name"] or "").strip()
+        return tg_mention(uid, display_name(fn, ln, un, uid), username=un)
+
+    un = (username or "").strip()
+    fn = (first_name or "").strip()
+    ln = (last_name or "").strip()
+    if fn or ln or un:
+        return tg_mention(uid, display_name(fn, ln, un, uid), username=un)
+
+    return f"<code>{uid}</code>"
+
+def _agent_name_by_id(uid: int) -> str:
+    u = get_user_row(int(uid))
+    if u:
+        un = (u["username"] or "").strip()
+        disp = display_name(u["first_name"] or "", u["last_name"] or "", un, int(uid))
+        return tg_mention(int(uid), disp, username=un)
+    return f"<code>{int(uid)}</code>"
+
+def render_blacklist_text(page: int) -> tuple[str, Optional[InlineKeyboardMarkup]]:
+    rows = _blacklist_collect_rows()
+    total = len(rows)
+
+    if total <= 0:
+        return "📑 ЧЁРНЫЙ СПИСОК:\nЗдесь пока пусто.", None
+
+    total_pages = max(1, (total + TIMER_PAGE_SIZE - 1) // TIMER_PAGE_SIZE)
+    page = max(1, min(int(page), total_pages))
+    start = (page - 1) * TIMER_PAGE_SIZE
+    part = rows[start:start + TIMER_PAGE_SIZE]
+
+    lines = []
+    lines.append("📑 ЧЁРНЫЙ СПИСОК:")
+    lines.append("")
+    lines.append("<blockquote>")
+    for idx, row in enumerate(part, start + 1):
+        who = _user_display_from_any(
+            int(row["user_id"]),
+            username=str(row.get("username", "") or ""),
+            first_name=str(row.get("first_name", "") or ""),
+            last_name=str(row.get("last_name", "") or "")
+        )
+        statuses = " / ".join(dict.fromkeys([str(x) for x in row["statuses"] if str(x).strip()]))
+        reasons = " | ".join(dict.fromkeys([str(x) for x in row["reasons"] if str(x).strip()])) or "—"
+
+        agents_unique = []
+        seen = set()
+        for aid in row["agents"]:
+            aid = int(aid)
+            if aid > 0 and aid not in seen:
+                seen.add(aid)
+                agents_unique.append(_agent_name_by_id(aid))
+        agent_text = " | ".join(agents_unique) if agents_unique else "—"
+
+        lines.append(f"{idx}. {who} | {_fmt_ts(int(row['latest_ts'] or 0))}")
+        lines.append(f"Ограничения: {h(statuses)}")
+        lines.append(f"Причина: {h(reasons)}")
+        lines.append(f"Агент: {agent_text}")
+        if idx < start + len(part):
+            lines.append("")
+
+    lines.append("</blockquote>")
+
+    kb = None
+    if total_pages > 1:
+        kb = InlineKeyboardMarkup(row_width=8)
+        row_btns = []
+
+        if page > 2:
+            row_btns.append(InlineKeyboardButton("<<", callback_data=_blacklist_cb(1)))
+        if page > 1:
+            row_btns.append(InlineKeyboardButton("<", callback_data=_blacklist_cb(page - 1)))
+
+        page_nums = [page]
+        if page == 1:
+            page_nums.extend([p for p in (2, 3, 4) if p <= total_pages])
+        elif page == total_pages:
+            page_nums = [p for p in (max(1, page - 3), max(1, page - 2), max(1, page - 1), page) if p <= total_pages]
+        else:
+            candidates = [page - 1, page, page + 1, page + 2]
+            page_nums = [p for p in candidates if 1 <= p <= total_pages]
+
+        page_nums = sorted(dict.fromkeys(page_nums))
+        for p in page_nums:
+            if p == page:
+                row_btns.append(InlineKeyboardButton(f"·{p}·", callback_data=_blacklist_cb(page)))
+            else:
+                row_btns.append(InlineKeyboardButton(str(p), callback_data=_blacklist_cb(p)))
+
+        if page < total_pages:
+            row_btns.append(InlineKeyboardButton(">", callback_data=_blacklist_cb(page + 1)))
+        if page < total_pages - 1:
+            row_btns.append(InlineKeyboardButton(">>", callback_data=_blacklist_cb(total_pages)))
+
+        kb.row(*row_btns)
+
+    return "\n".join(lines), kb
+
+def build_agents_panel_text(user_id: int) -> str:
+    uid = int(user_id)
+    self_row = get_user_row(uid)
+    self_name = (
+        display_name(
+            self_row["first_name"] or "",
+            self_row["last_name"] or "",
+            self_row["username"] or "",
+            int(uid)
+        ) if self_row else str(uid)
+    )
+    role_word = "создатель" if uid == int(CREATOR_ID) else "агент"
+
+    agents = get_support_agents()
+    online, offline = split_agents_by_online(agents)
+
+    online = [a for a in online if int(a["user_id"]) != uid]
+    offline = [a for a in offline if int(a["user_id"]) != uid]
+
+    lines = []
+    lines.append(f"🔬 Приветствуем вас, {role_word} <b>{h(self_name)}</b>, в {h(BOT_TITLE)}")
+    lines.append("👨‍⚕️ <b>Другие агенты поддержки</b>")
+
+    if not online and not offline:
+        lines.append("Список пока пуст.")
+    else:
+        if online:
+            lines.append("🟢 Онлайн")
+            for a in online:
+                lines.append(format_agent_line(a))
+        if offline:
+            lines.append("🔘 Оффлайн")
+            for a in offline:
+                lines.append(format_agent_line(a))
+
+    lines.append("")
+    lines.append("💬 Следующие доступные Вам команды:")
+
+    if uid == int(CREATOR_ID):
+        lines.append("/owner — назначить агента")
+        lines.append("/owner_remove — снять права с агента")
+
+    lines.append("/bot_ban — заблокировать пользователя")
+    lines.append("/bot_unban — разблокировать пользователя")
+    lines.append("/remake_lab — восстановить лабораторию")
+    lines.append("/+lab_name | /-lab_name — разрешает/запрещает имена лаборатории для пользователя")
+    lines.append("/+pat_name | /-pat_name — разрешает/запрещает имена патогена для пользователя")
+    lines.append("/blacklist — список пользователей с ограничениями")
+
+    return "\n".join(lines)
 
 def get_bot_ban_row(user_id: int):
     row = db_one(
@@ -4100,7 +4731,7 @@ def render_settings_text(user_id: int) -> str:
         lines.append(f"Корпоративные уведомления: {corp_notify_txt}")
 
     if deleted_row:
-        lines.append(f"⏳ Таймер удаления лабы: {_settings_restore_timer_text(uid)}")
+        lines.append(f"⏳ Таймер удаления лабы {_settings_restore_timer_text(uid)}")
 
     return "\n".join(lines)
 
@@ -4496,6 +5127,41 @@ def normalize(text: str) -> str:
 def parse_message_as_command(text: str) -> Optional[Parsed]:
     if not text:
         return None
+    
+    raw_multiline = (text or "").strip()
+    first_line_raw, _, _body_raw = raw_multiline.partition("\n")
+    first_line = first_line_raw.strip()
+
+    if first_line.startswith("/") or first_line.startswith("."):
+        pch = first_line[0]
+        body = first_line[1:].strip()
+
+        nested = parse_message_as_command(body)
+        if nested:
+            return Parsed(
+                raw=raw_multiline,
+                has_prefix_char=True,
+                prefix_char=pch,
+                cmd=nested.cmd,
+                args=nested.args
+            )
+
+        parts = body.split(" ", 1)
+        c = parts[0].lower()
+        a = parts[1].strip() if len(parts) > 1 else ""
+
+        if c in ("owner", "агент", "owner_remove", "agents", "blacklist", "bot_ban", "bot_unban", "remake_lab"):
+            cmd_map = {
+                "owner": "owner",
+                "агент": "owner",
+                "owner_remove": "owner_remove",
+                "agents": "agents_panel",
+                "blacklist": "blacklist",
+                "bot_ban": "bot_ban",
+                "bot_unban": "bot_unban",
+                "remake_lab": "remake_lab",
+            }
+            return Parsed(raw=raw_multiline, has_prefix_char=True, prefix_char=pch, cmd=cmd_map[c], args=a)
 
     raw = normalize(text)
     t = raw.strip()
@@ -4527,11 +5193,47 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
 
     t = strip_bio_prefix(t)
 
+    # таймеры
+    first_line = strip_bio_prefix(first_line)
+    timer_head = first_line.strip()
+
+    timer_sign = None
+    if timer_head.startswith("++"):
+        timer_sign = "++"
+        timer_head = timer_head[2:].lstrip()
+    elif timer_head.startswith(("+", "-", "!")):
+        timer_sign = timer_head[0]
+        timer_head = timer_head[1:].lstrip()
+
+    timer_low = timer_head.lower()
+
+    if timer_low == "таймеры":
+        return Parsed(raw=raw_multiline, has_prefix_char=False, prefix_char=None, cmd="timer_list", args="")
+
+    if timer_sign == "!" and timer_low in ("сбросить таймеры", "удалить все таймеры"):
+        return Parsed(raw=raw_multiline, has_prefix_char=False, prefix_char=None, cmd="timer_clear_all", args="")
+
+    if timer_sign == "-" and timer_low.startswith("таймер "):
+        rest = timer_head.split(" ", 1)[1].strip() if " " in timer_head else ""
+        return Parsed(raw=raw_multiline, has_prefix_char=False, prefix_char=None, cmd="timer_delete", args=rest)
+
+    if (timer_sign in (None, "+")) and timer_low.startswith("таймер цикл "):
+        rest = timer_head[len("таймер цикл "):].strip()
+        return Parsed(raw=raw_multiline, has_prefix_char=False, prefix_char=None, cmd="timer_add_cycle", args=rest)
+
+    if (timer_sign in (None, "+")) and timer_low.startswith("таймер через "):
+        rest = timer_head[len("таймер через "):].strip()
+        return Parsed(raw=raw_multiline, has_prefix_char=False, prefix_char=None, cmd="timer_add_rel", args=rest)
+
+    if (timer_sign in (None, "+")) and timer_low.startswith("таймер на "):
+        rest = timer_head[len("таймер на "):].strip()
+        return Parsed(raw=raw_multiline, has_prefix_char=False, prefix_char=None, cmd="timer_add_abs", args=rest)
+
     sign = None
     if t.startswith("++"):
         sign = "++"
         t = t[2:].lstrip()
-    elif t.startswith(("+", "-")):
+    elif t.startswith(("+", "-", "!")):
         sign = t[0]
         t = t[1:].lstrip()
 
@@ -4544,9 +5246,53 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
     if low in ("report", "репорт"):
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="report", args="")
 
+    if low in ("agents", "агенты"):
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="agents_panel", args="")
+
+    if low.startswith("owner_remove"):
+        rest = ""
+        parts = t.split(" ", 1)
+        if len(parts) > 1:
+            rest = parts[1].strip()
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="owner_remove", args=rest)
+
+    if low == "blacklist":
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="blacklist", args="")
+
+    if sign in ("+", "-") and (low == "lab_name" or low.startswith("lab_name ")):
+        rest = ""
+        parts = t.split(" ", 1)
+        if len(parts) > 1:
+            rest = parts[1].strip()
+        return Parsed(
+            raw=raw_multiline,
+            has_prefix_char=False,
+            prefix_char=None,
+            cmd="name_lock_lab",
+            args=rest
+        )
+
+    if sign in ("+", "-") and (low == "pat_name" or low.startswith("pat_name ")):
+        rest = ""
+        parts = t.split(" ", 1)
+        if len(parts) > 1:
+            rest = parts[1].strip()
+        return Parsed(
+            raw=raw_multiline,
+            has_prefix_char=False,
+            prefix_char=None,
+            cmd="name_lock_pat",
+            args=rest
+        )
+
+    #команды помощи
     if low in ("помощь", "help"):
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="help", args="")
 
+    if low in ("команды", "commands"):
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="commands_link", args="")
+
+    # агент команды
     if low == "bot_ban" or low.startswith("bot_ban "):
         rest = ""
         parts = t.split(" ", 1)
@@ -4576,20 +5322,20 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
         if low in ("баланс", "мешок", "кошелек", "кошелёк", "кош", "бал", "меш"):
             return Parsed(raw=raw, has_prefix_char=False, prefix_char=None,
                           cmd=("balance_show" if sign == "+" else "balance_hide"), args="")
-        if low in ("лаб", "лаборат", "лаборатория", "лаба"):
+        if low in ("лаб", "лаборатория", "лаба"):
             return Parsed(raw=raw, has_prefix_char=False, prefix_char=None,
                           cmd=("lab_show" if sign == "+" else "lab_hide"), args="")
 
     if low.startswith("скрыть"):
         if ("баланс" in low) or ("мешок" in low) or ("кошелек" in low) or ("кошелёк" in low):
             return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="balance_hide", args="")
-        if ("лаб" in low) or ("лаборат" in low):
+        if ("лаб" in low) or ("лабораторию" in low) or ("лабу" in low):
             return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="lab_hide", args="")
 
     if low.startswith("показать"):
         if ("баланс" in low) or ("мешок" in low) or ("кошелек" in low) or ("кошелёк" in low):
             return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="balance_show", args="")
-        if ("лаб" in low) or ("лаборат" in low):
+        if ("лаб" in low) or ("лабораторию" in low) or ("лабу" in low):
             return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="lab_show", args="")
 
     # улучшения навыков
@@ -4674,7 +5420,8 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
     if low in ("моя корп", "моя корпорация", "моя корпа", "моя к"):
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="corp_my", args="")
 
-    if low.startswith(("корп инфо", "корпорация инфо", "икорп", "к инфо", "корп", "досье корп", "досье корпорации")):
+    if low.startswith(("корп инфо", "корпорация инфо", "икорп", "к инфо", 
+                       "корп", "досье корп", "досье корпорации")):
         rest = ""
         parts = t.split(" ", 2)
         if len(parts) >= 3:
@@ -4687,6 +5434,9 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
         if len(parts) > 1:
             rest = parts[1].strip()
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="corp_join", args=rest)
+
+    if low == "корп заявки" or low == "корпорация заявки":
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="corp_req_list", args="")
 
     if low == "принять" or low.startswith("принять "):
         rest = ""
@@ -4709,24 +5459,34 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
             rest = parts[1].strip()
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="corp_invite", args=rest)
 
-    if sign == "+" and low in ("зам", "заместитель"):
+    if sign == "+" and low in ("корп зам", "корп заместитель", "зам", "заместитель"):
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="corp_deputy", args="")
 
-    if sign == "+" and (low.startswith("зам ") or low.startswith("заместитель ")):
+    if sign == "+" and (low.startswith(("корп зам ", "зам ")) or low.startswith(("корп заместитель ", "заместитель "))):
         rest = ""
         parts = t.split(" ", 1)
         if len(parts) > 1:
             rest = parts[1].strip()
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="corp_deputy", args=rest)
 
-    if low == "исключить" or low.startswith("исключить "):
+    if sign == "-" and low in ("корп зам", "корп заместитель", "зам", "заместитель"):
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="corp_deputy_remove", args="")
+
+    if sign == "-" and (low.startswith(("корп зам ", "зам ")) or low.startswith(("корп заместитель ", "заместитель "))):
+        rest = ""
+        parts = t.split(" ", 2)
+        if len(parts) >= 3:
+            rest = parts[2].strip()
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="corp_deputy_remove", args=rest)
+
+    if low in ("исключить", "корп кик") or low.startswith(("исключить ", "корп кик ")):
         rest = ""
         parts = t.split(" ", 1)
         if len(parts) > 1:
             rest = parts[1].strip()
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="corp_kick", args=rest)
 
-    if low == "покинуть":
+    if low in ("покинуть", "выйти"):
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="corp_leave", args="")
 
     if low == "передать права" or low.startswith("передать права "):
@@ -4836,6 +5596,33 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
             rest = parts[1].strip()
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="lab", args=rest)
 
+    # "-имя лабы" / "-имя лаборатории" / "-имя пата" / "-имя патогена"
+    if sign == "-" and (
+        low == "имя лабы"
+        or low == "имя лаборатории"
+        or low.startswith("имя лабы ")
+        or low.startswith("имя лаборатории ")
+    ):
+        rest = ""
+        spl = t.split(" ", 2)
+        if len(spl) == 3:
+            rest = spl[2].strip()
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="labname_clear", args=rest)
+
+    if sign == "-" and (
+        low == "имя пата"
+        or low == "имя патогена"
+        or low == "имя болезни"
+        or low.startswith("имя пата ")
+        or low.startswith("имя патогена ")
+        or low.startswith("имя болезни ")
+    ):
+        rest = ""
+        spl = t.split(" ", 2)
+        if len(spl) == 3:
+            rest = spl[2].strip()
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="pathogenname_clear", args=rest)
+
     # "имя лабы" / "имя лаборатории"
     if low.startswith("имя лабы") or low.startswith("имя лаборатории"):
         rest = ""
@@ -4900,7 +5687,7 @@ def build_start_text(user) -> str:
     lines.append(f'📑 Список всех команд <a href="{h(URL_COMMANDS)}">с их описанием</a>')
     lines.append(f'📑 Чат <a href="{h(URL_SUPPORT_CHAT)}">тех.поддержки</a>')
     lines.append(f'📑 Основной <a href="{h(URL_DEV_CHANNEL)}">канал разработки бота</a>')
-    lines.append(f'💬 Для повторного вызова агент-листа, введите <code>.помощь</code>')
+    lines.append(f'💬 Для повторного вызова агент-листа, введите в чат <code>.помощь</code>')
 
 
     return "\n".join(lines)
@@ -4929,6 +5716,213 @@ def handle_help_command(message):
     if message.chat.type == "private":
         ensure_lab_exists(int(message.from_user.id))
     send_welcome_message(int(message.chat.id), message.from_user)
+
+def handle_commands_link(message):
+    bot.reply_to(
+        message,
+        f"📑 Список <a href={h(URL_COMMANDS)}>команд бота</a>",
+        parse_mode="HTML"
+    )
+
+def handle_agents_panel_command(message):
+    if message.chat.type != "private":
+        bot.reply_to(message, "📑 Эта команда работает только в личных сообщениях бота.")
+        return
+
+    uid = int(message.from_user.id)
+    if not is_support(uid):
+        bot.reply_to(message, "📑 Эта команда доступна только агентам техподдержки и владельцу бота.")
+        return
+
+    bot.reply_to(
+        message,
+        build_agents_panel_text(uid),
+        parse_mode="HTML",
+        disable_web_page_preview=True
+    )
+
+def handle_owner_remove_command(message, parsed: Parsed):
+    if message.chat.type != "private":
+        bot.reply_to(message, "📑 Эта команда работает только в личных сообщениях бота.")
+        return
+
+    uid = int(message.from_user.id)
+    if not can_manage_support(uid):
+        bot.reply_to(message, "📑 Только владелец бота может снимать права с агента.")
+        return
+
+    target_id = resolve_target_id((parsed.args or "").strip())
+    if target_id is None:
+        return
+
+    if int(target_id) == int(CREATOR_ID):
+        bot.reply_to(message, "📑 Нельзя снять права с создателя бота.")
+        return
+
+    remove_support_agent(int(target_id))
+    bot.reply_to(message, f"✅ Пользователь <code>{int(target_id)}</code> больше не является агентом техподдержки.", parse_mode="HTML")
+
+def handle_admin_name_restriction_command(message, parsed: Parsed):
+    if message.chat.type != "private":
+        bot.reply_to(message, "📑 Эта команда работает только в личных сообщениях бота.")
+        return
+
+    uid = int(message.from_user.id)
+    if not is_support(uid):
+        bot.reply_to(message, "📑 Эта команда доступна только агентам техподдержки и владельцу бота.")
+        return
+
+    first_line, _body = _timer_first_line_and_body(message.text or "")
+    fl = first_line.strip()
+    if fl.startswith("/") or fl.startswith("."):
+        fl = fl[1:].strip()
+
+    parts = fl.split()
+    if len(parts) < 2:
+        return
+
+    token = parts[1].strip()
+    target_id = resolve_target_id(token)
+
+    if target_id is None:
+        return
+
+    reason = _timer_parse_reason_from_message(message.text or "")
+
+    if parsed.cmd == "name_lock_lab":
+        locked = 1 if fl.startswith("-") or fl.lower().startswith("-lab_name") or fl.lower().startswith("/-lab_name") or fl.lower().startswith(".-lab_name") else 0
+        set_name_restriction(int(target_id), "lab", locked, int(uid), reason)
+        bot.reply_to(
+            message,
+            f"✅ Для пользователя <code>{int(target_id)}</code> {'запрещено' if locked == 1 else 'разрешено'} менять имя лаборатории.",
+            parse_mode="HTML"
+        )
+        return
+
+    locked = 1 if fl.startswith("-") or fl.lower().startswith("-pat_name") or fl.lower().startswith("/-pat_name") or fl.lower().startswith(".-pat_name") else 0
+    set_name_restriction(int(target_id), "pat", locked, int(uid), reason)
+    bot.reply_to(
+        message,
+        f"✅ Для пользователя <code>{int(target_id)}</code> {'запрещено' if locked == 1 else 'разрешено'} менять имя патогена.",
+        parse_mode="HTML"
+    )
+
+def handle_blacklist_command(message):
+    if message.chat.type != "private":
+        bot.reply_to(message, "📑 Эта команда работает только в личных сообщениях бота.")
+        return
+
+    uid = int(message.from_user.id)
+    if not is_support(uid):
+        bot.reply_to(message, "📑 Эта команда доступна только агентам техподдержки и владельцу бота.")
+        return
+
+    text, rm = render_blacklist_text(1)
+    bot.reply_to(message, text, parse_mode="HTML", disable_web_page_preview=True, reply_markup=rm)
+
+def handle_timer_commands(message, parsed: Parsed):
+    uid = int(message.from_user.id)
+    chat_id = int(message.chat.id)
+    upsert_user(message.from_user)
+    ensure_creator_is_support()
+
+    if parsed.cmd == "timer_list":
+        bot.reply_to(message, render_timer_list_text(uid, chat_id), parse_mode="HTML", disable_web_page_preview=True)
+        return
+
+    if parsed.cmd == "timer_clear_all":
+        db_exec("DELETE FROM user_timers WHERE chat_id=?", (int(chat_id),), commit=True)
+        bot.reply_to(message, "✅ Все таймеры успешно удалены.")
+        return
+
+    if parsed.cmd == "timer_delete":
+        arg = (parsed.args or "").strip()
+        if not arg.isdigit():
+            bot.reply_to(message, "📑 Укажите номер таймера из списка.")
+            return
+
+        idx = int(arg)
+        rows = _timer_rows_for_chat(chat_id)
+        if idx < 1 or idx > len(rows):
+            bot.reply_to(message, "📑 Таймер с таким номером не найден.")
+            return
+
+        timer_id = int(rows[idx - 1]["timer_id"])
+        db_exec("DELETE FROM user_timers WHERE timer_id=? AND chat_id=?", (timer_id, int(chat_id)), commit=True)
+        bot.reply_to(message, "✅ Таймер успешно удалён.")
+        return
+
+    command_text = _timer_body_command(message.text or "")
+    if not command_text:
+        bot.reply_to(message, "📑 Со следующей строки укажите текст команды бота для исполнения.")
+        return
+
+    current_rows = _timer_rows_for_chat(chat_id)
+    if len(current_rows) >= 10:
+        bot.reply_to(message, "📑 В этом чате уже установлено максимальное количество таймеров: 10.")
+        return
+
+    if parsed.cmd == "timer_add_rel":
+        spec, err = _timer_parse_period_spec((parsed.args or "").strip())
+        if not spec:
+            bot.reply_to(message, err)
+            return
+
+        next_dt = _timer_apply_period(datetime.now(), spec)
+        next_run_ts = int(next_dt.timestamp())
+        _timer_create(uid, chat_id, next_run_ts, 0, {}, command_text)
+
+        bot.reply_to(
+            message,
+            f"✅ Таймер создан.\nСработает <code>{h(_fmt_ts(next_run_ts))}</code>\nПериод: {_timer_spec_to_text(spec)}",
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
+        return
+
+    if parsed.cmd == "timer_add_cycle":
+        cycle_rows = db_all(
+            "SELECT timer_id FROM user_timers WHERE user_id=? AND is_cycle=1 ORDER BY timer_id ASC",
+            (int(uid),)
+        ) or []
+        if len(cycle_rows) >= 2:
+            bot.reply_to(message, "📑 У вас уже установлено максимальное количество циклических таймеров.")
+            return
+
+        runs_total, spec, err = _timer_parse_cycle_args((parsed.args or "").strip())
+        if not spec:
+            bot.reply_to(message, err, parse_mode="HTML", disable_web_page_preview=True)
+            return
+
+        next_dt = _timer_apply_period(datetime.now(), spec)
+        next_run_ts = int(next_dt.timestamp())
+        _timer_create(uid, chat_id, next_run_ts, 1, spec, command_text, cycle_total=int(runs_total), cycle_left=int(runs_total))
+
+        bot.reply_to(
+            message,
+            f"✅ Циклический таймер создан.\n"
+            f"Первое срабатывание: <code>{h(_fmt_ts(next_run_ts))}</code>\n"
+            f"Период: {_timer_spec_to_text(spec)}\n"
+            f"Срабатываний: <b>{int(runs_total)}</b>",
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
+        return
+
+    if parsed.cmd == "timer_add_abs":
+        ts, err = _timer_parse_absolute_spec((parsed.args or "").strip())
+        if ts is None:
+            bot.reply_to(message, err)
+            return
+
+        _timer_create(uid, chat_id, int(ts), 0, {}, command_text)
+        bot.reply_to(
+            message,
+            f"✅ Таймер создан на <code>{h(_fmt_ts(int(ts)))}</code>",
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
+        return
 
 # RESOLVE TARGETS
 def resolve_target_id(token: str) -> Optional[int]:
@@ -5380,6 +6374,447 @@ def _fmt_date_ddmmyy(ts: int) -> str:
     except Exception:
         return "??.??.??"
 
+TIMER_MAX_SECONDS = 366 * 24 * 3600
+TIMER_PAGE_SIZE = 15
+
+def _timer_first_line_and_body(text: str) -> tuple[str, str]:
+    raw = (text or "").strip()
+    first, _, body = raw.partition("\n")
+    return first.strip(), body.strip()
+
+def _timer_parse_reason_from_message(text: str) -> str:
+    _first, body = _timer_first_line_and_body(text)
+    body = (body or "").strip()
+    if not body:
+        return ""
+    return body[:50]
+
+def _timer_period_unit_key(unit_raw: str) -> str:
+    u = (unit_raw or "").strip().lower()
+
+    if u in ("мин", "минута", "минуты", "минут", "минуту"):
+        return "minutes"
+
+    if u in ("час", "часа", "часов"):
+        return "hours"
+
+    if u in ("день", "дня", "дней"):
+        return "days"
+
+    if u in ("неделя", "недели", "недель", "неделю"):
+        return "weeks"
+
+    if u in ("месяц", "месяца", "месяцев", "мес"):
+        return "months"
+
+    return ""
+
+def _timer_parse_period_spec(text: str) -> tuple[Optional[dict], str]:
+    s = (text or "").strip().lower()
+    if not s:
+        return None, "📑 Укажите период таймера."
+
+    pattern = re.compile(
+        r"(?P<num>\d+)?\s*(?P<unit>"
+        r"минуту|минуты|минута|минут|мин|"
+        r"часов|часа|час|"
+        r"неделю|недели|неделя|недель|"
+        r"дней|дня|день|"
+        r"месяцев|месяца|месяц|мес"
+        r")",
+        flags=re.IGNORECASE
+    )
+
+    pos = 0
+    spec = {"months": 0, "weeks": 0, "days": 0, "hours": 0, "minutes": 0}
+    found = False
+
+    for m in pattern.finditer(s):
+        gap = s[pos:m.start()]
+        if gap.strip():
+            return None, "📑 Неверный формат периода таймера."
+
+        num = int(m.group("num") or 1)
+        if num <= 0:
+            return None, "📑 Значение периода должно быть больше нуля."
+
+        key = _timer_period_unit_key(m.group("unit"))
+        if not key:
+            return None, "📑 Неверный формат периода таймера."
+
+        spec[key] += num
+        pos = m.end()
+        found = True
+
+    if not found:
+        return None, "📑 Неверный формат периода таймера."
+
+    if s[pos:].strip():
+        return None, "📑 Неверный формат периода таймера."
+
+    approx = (
+        spec["months"] * 30 * 86400
+        + spec["weeks"] * 7 * 86400
+        + spec["days"] * 86400
+        + spec["hours"] * 3600
+        + spec["minutes"] * 60
+    )
+
+    if approx <= 0:
+        return None, "📑 Период таймера должен быть больше нуля."
+    if approx > TIMER_MAX_SECONDS:
+        return None, "📑 Максимальный срок таймера — один год."
+
+    return spec, ""
+
+def _timer_spec_to_text(spec: dict) -> str:
+    parts = []
+
+    if int(spec.get("minutes", 0) or 0) > 0:
+        n = int(spec["minutes"])
+        parts.append(f"{n} {_ru_form(n, 'минута', 'минуты', 'минут')}")
+    if int(spec.get("hours", 0) or 0) > 0:
+        n = int(spec["hours"])
+        parts.append(f"{n} {_ru_form(n, 'час', 'часа', 'часов')}")
+    if int(spec.get("days", 0) or 0) > 0:
+        n = int(spec["days"])
+        parts.append(f"{n} {_ru_form(n, 'день', 'дня', 'дней')}")
+    if int(spec.get("weeks", 0) or 0) > 0:
+        n = int(spec["weeks"])
+        parts.append(f"{n} {_ru_form(n, 'неделя', 'недели', 'недель')}")
+    if int(spec.get("months", 0) or 0) > 0:
+        n = int(spec["months"])
+        parts.append(f"{n} {_ru_form(n, 'месяц', 'месяца', 'месяцев')}")
+
+    return " ".join(parts) if parts else "0 минут"
+
+def _timer_spec_seconds_approx(spec: dict) -> int:
+    return int(
+        int(spec.get("months", 0) or 0) * 30 * 86400
+        + int(spec.get("weeks", 0) or 0) * 7 * 86400
+        + int(spec.get("days", 0) or 0) * 86400
+        + int(spec.get("hours", 0) or 0) * 3600
+        + int(spec.get("minutes", 0) or 0) * 60
+    )
+
+def _timer_parse_cycle_args(text: str) -> tuple[Optional[int], Optional[dict], str]:
+    s = (text or "").strip()
+    if not s:
+        return None, None, "📑 Укажите число срабатываний и период циклического таймера."
+
+    parts = s.split(None, 1)
+    if len(parts) < 2 or not parts[0].isdigit():
+        return None, None
+
+    runs_total = int(parts[0])
+    if runs_total < 2 or runs_total > 30:
+        return None, None, "📑 Количество срабатываний циклического таймера должно быть от 2 до 30."
+
+    spec, err = _timer_parse_period_spec(parts[1].strip())
+    if not spec:
+        return None, None, err
+
+    if _timer_spec_seconds_approx(spec) < 600:
+        return None, None, "📑 Минимальный период циклического таймера — 10 минут."
+
+    return runs_total, spec, ""
+
+def _timer_add_months(dt: datetime, months: int) -> datetime:
+    if months <= 0:
+        return dt
+
+    month_index = (dt.month - 1) + int(months)
+    year = dt.year + (month_index // 12)
+    month = (month_index % 12) + 1
+    day = min(dt.day, calendar.monthrange(year, month)[1])
+
+    return dt.replace(year=year, month=month, day=day)
+
+def _timer_apply_period(dt: datetime, spec: dict) -> datetime:
+    out = dt
+    out = _timer_add_months(out, int(spec.get("months", 0) or 0))
+    out = out + timedelta(
+        weeks=int(spec.get("weeks", 0) or 0),
+        days=int(spec.get("days", 0) or 0),
+        hours=int(spec.get("hours", 0) or 0),
+        minutes=int(spec.get("minutes", 0) or 0),
+    )
+    return out
+
+def _timer_parse_absolute_spec(text: str) -> tuple[Optional[int], str]:
+    s = (text or "").strip()
+    if not s:
+        return None, "📑 Укажите дату или время таймера."
+
+    mt = re.search(r"(?<!\d)(\d{1,2}):(\d{2})(?!\d)", s)
+    md = re.search(r"(?<!\d)(\d{1,2})\.(\d{1,2})(?:\.(\d{2,4}))?(?!\d)", s)
+
+    if not mt and not md:
+        return None, "📑 Неверный формат даты таймера."
+
+    now_dt = datetime.now()
+
+    day = now_dt.day
+    month = now_dt.month
+    year = now_dt.year
+    hour = 0
+    minute = 0
+
+    if mt:
+        hour = int(mt.group(1))
+        minute = int(mt.group(2))
+        if hour > 23 or minute > 59:
+            return None, "📑 Неверный формат времени таймера."
+
+    if md:
+        day = int(md.group(1))
+        month = int(md.group(2))
+        y = md.group(3)
+        if y:
+            y = str(y)
+            year = int(y)
+            if year < 100:
+                year += 2000
+
+    try:
+        target_dt = datetime(year, month, day, hour, minute)
+    except Exception:
+        return None, "📑 Неверная дата таймера."
+
+    delta_sec = int(target_dt.timestamp()) - now_ts()
+    if delta_sec <= 0:
+        return None, "📑 Нельзя установить таймер задним числом."
+    if delta_sec > TIMER_MAX_SECONDS:
+        return None, "📑 Максимальный срок таймера — один год."
+
+    return int(target_dt.timestamp()), ""
+
+def _timer_body_command(text: str) -> str:
+    _first, body = _timer_first_line_and_body(text)
+    return (body or "").strip()
+
+def _timer_rows_for_chat(chat_id: int) -> List[sqlite3.Row]:
+    return db_all(
+        "SELECT timer_id, user_id, chat_id, created_at, next_run_ts, is_cycle, repeat_spec, cycle_total, cycle_left, command_text "
+        "FROM user_timers WHERE chat_id=? "
+        "ORDER BY next_run_ts ASC, timer_id ASC",
+        (int(chat_id),)
+    ) or []
+
+def _timer_create(
+    user_id: int,
+    chat_id: int,
+    next_run_ts: int,
+    is_cycle: int,
+    repeat_spec: dict,
+    command_text: str,
+    cycle_total: int = 0,
+    cycle_left: int = 0
+):
+    db_exec(
+        "INSERT INTO user_timers(user_id, chat_id, created_at, next_run_ts, is_cycle, repeat_spec, cycle_total, cycle_left, command_text) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        (
+            int(user_id),
+            int(chat_id),
+            int(now_ts()),
+            int(next_run_ts),
+            int(is_cycle),
+            json.dumps(repeat_spec or {}, ensure_ascii=False),
+            int(cycle_total or 0),
+            int(cycle_left or 0),
+            str(command_text or "").strip(),
+        ),
+        commit=True
+    )
+
+def _timer_row_to_display(index_num: int, row: sqlite3.Row) -> str:
+    next_ts = int(row["next_run_ts"] or 0)
+    is_cycle = int(row["is_cycle"] or 0)
+    cycle_left = int(row["cycle_left"] or 0)
+    cycle_total = int(row["cycle_total"] or 0)
+
+    cmd = (row["command_text"] or "").strip()
+    first_cmd = cmd.splitlines()[0].strip() if cmd else "—"
+    if len(first_cmd) > 42:
+        first_cmd = first_cmd[:42] + "…"
+
+    mark = premium_emoji_html("🔁") if is_cycle == 1 else premium_emoji_html("⏰")
+
+    suffix = ""
+    if is_cycle == 1:
+        try:
+            spec = json.loads((row["repeat_spec"] or "") or "{}")
+            suffix = f" | {_timer_spec_to_text(spec)}"
+        except Exception:
+            suffix = ""
+
+        if cycle_total > 0:
+            suffix += f" | осталось: {cycle_left}/{cycle_total}"
+
+    return f"{index_num}. {mark} {_fmt_ts(next_ts)}{suffix}\n<code>{h(first_cmd)}</code>"
+
+def render_timer_list_text(user_id: int, chat_id: int) -> str:
+    uid = int(user_id)
+    cid = int(chat_id)
+
+    if cid == uid:
+        u = get_user_row(uid)
+        scope_name = (
+            display_name(
+                u["first_name"] or "",
+                u["last_name"] or "",
+                u["username"] or "",
+                int(uid)
+            ) if u else str(uid)
+        )
+    else:
+        scope_name = _get_chat_title_cached(cid)
+
+    rows = _timer_rows_for_chat(cid)
+
+    lines = []
+    lines.append(f"{premium_emoji_html('⏳')} Список таймеров {h(scope_name)}")
+    lines.append("")
+
+    if not rows:
+        lines.append("Список пока пуст.")
+    else:
+        lines.append("<blockquote expandable>")
+        for i, row in enumerate(rows, 1):
+            lines.append(_timer_row_to_display(i, row))
+            if i < len(rows):
+                lines.append("")
+        lines.append("</blockquote>")
+
+    lines.append("")
+    lines.append("💬 Вы можете создать таймер командой <code>таймер через {период}</code>, <code>таймер на {период}</code> или <code>таймер цикл {число срабатываний} {период}</code> и далее ввести текст команды на исполнения")
+    return "\n".join(lines)
+
+def _make_fake_timer_message(user_id: int, chat_id: int, text: str):
+    class _FakeUser:
+        pass
+
+    class _FakeChat:
+        pass
+
+    class _FakeMsg:
+        pass
+
+    u = get_user_row(int(user_id))
+
+    placeholder = _REAL_BOT_SEND_MESSAGE(int(chat_id), "⏳")
+
+    fu = _FakeUser()
+    fu.id = int(user_id)
+    fu.username = (u["username"] or "") if u else ""
+    fu.first_name = (u["first_name"] or "") if u else ""
+    fu.last_name = (u["last_name"] or "") if u else ""
+    fu.is_bot = False
+
+    fc = _FakeChat()
+    fc.id = int(chat_id)
+    fc.type = "private" if int(chat_id) == int(user_id) else "group"
+
+    fm = _FakeMsg()
+    fm.from_user = fu
+    fm.chat = fc
+    fm.text = str(text or "")
+    fm.message_id = int(placeholder.message_id)
+    fm.reply_to_message = None
+    fm.via_bot = None
+    fm.content_type = "text"
+    fm.date = now_ts()
+
+    return fm, placeholder
+
+def _execute_timer_command_text(user_id: int, chat_id: int, command_text: str):
+    cmd_text = (command_text or "").strip()
+    if not cmd_text:
+        return
+
+    parsed = parse_message_as_command(cmd_text)
+    if not parsed:
+        _REAL_BOT_SEND_MESSAGE(int(chat_id), "📑 Таймер сработал, но текст команды не распознан.")
+        return
+
+    if parsed.cmd in (
+        "timer_add_rel", "timer_add_abs", "timer_add_cycle",
+        "timer_delete", "timer_clear_all", "timer_list",
+        "owner", "owner_remove", "agents_panel",
+        "bot_ban", "bot_unban", "remake_lab",
+        "report", "settings", "blacklist",
+        "name_lock_lab", "name_lock_pat"
+    ):
+        _REAL_BOT_SEND_MESSAGE(int(chat_id), "📑 Эта команда не может быть выполнена таймером.")
+        return
+
+    fake_msg = None
+    placeholder = None
+    try:
+        fake_msg, placeholder = _make_fake_timer_message(int(user_id), int(chat_id), cmd_text)
+        text_router(fake_msg)
+    finally:
+        if placeholder is not None:
+            try:
+                bot.delete_message(int(placeholder.chat.id), int(placeholder.message_id))
+            except Exception:
+                pass
+
+def _timer_reschedule_from_row(row: sqlite3.Row, now_ts_value: int) -> tuple[Optional[int], Optional[int]]:
+    if int(row["is_cycle"] or 0) != 1:
+        return None, None
+
+    try:
+        spec = json.loads((row["repeat_spec"] or "") or "{}")
+    except Exception:
+        return None, None
+
+    cycle_left = int(row["cycle_left"] or 0)
+    if cycle_left <= 1:
+        return None, None
+
+    base_dt = datetime.fromtimestamp(int(row["next_run_ts"] or 0))
+    nxt = _timer_apply_period(base_dt, spec)
+
+    guard = 0
+    while int(nxt.timestamp()) <= int(now_ts_value) and guard < 500:
+        nxt = _timer_apply_period(nxt, spec)
+        guard += 1
+
+    if guard >= 500:
+        return None, None
+
+    return int(nxt.timestamp()), int(cycle_left - 1)
+
+def _run_due_timers(now_value: int):
+    rows = db_all(
+        "SELECT timer_id, user_id, chat_id, created_at, next_run_ts, is_cycle, repeat_spec, cycle_total, cycle_left, command_text "
+        "FROM user_timers WHERE next_run_ts>0 AND next_run_ts<=? "
+        "ORDER BY next_run_ts ASC, timer_id ASC LIMIT 50",
+        (int(now_value),)
+    ) or []
+
+    for row in rows:
+        timer_id = int(row["timer_id"])
+        user_id = int(row["user_id"])
+        chat_id = int(row["chat_id"] or user_id)
+
+        try:
+            _execute_timer_command_text(user_id, chat_id, row["command_text"] or "")
+        except Exception as e:
+            send_error_report(f"_run_due_timers#{timer_id}", e)
+
+        next_cycle_ts, new_left = _timer_reschedule_from_row(row, now_value)
+        if next_cycle_ts is None:
+            db_exec("DELETE FROM user_timers WHERE timer_id=?", (timer_id,), commit=True)
+        else:
+            db_exec(
+                "UPDATE user_timers SET next_run_ts=?, cycle_left=? WHERE timer_id=?",
+                (int(next_cycle_ts), int(new_left), int(timer_id)),
+                commit=True
+            )
+
 # форматы слов
 def _fmt_num(n: int) -> str:
     return f"{int(n):,}".replace(",", " ")
@@ -5485,6 +6920,7 @@ CORPUI_TAG = "G"
 TOPUI_TAG = "T"
 SETUI_TAG = "W"
 REPORTUI_TAG = "Y"
+BLUI_TAG = "K"
 
 # хендлеры и хэлперы
 #           report
@@ -5501,12 +6937,14 @@ INF_MODE_SYNONYMS = {
     "р": "r", "рандом": "r",
     "+": "p", "б": "p", "больше": "p",
     "-": "m", "м": "m", "меньше": "m",
+    "=": "e", "равный": "e",
     "чат": "c",
 }
 
 INF_CHAT_FILTER_SYNONYMS = {
     "+": "p", "б": "p", "больше": "p",
     "-": "m", "м": "m", "меньше": "m",
+    "=": "e", "равный": "e",
 }
 
 def _clamp(v: int, lo: int, hi: int) -> int:
@@ -5651,6 +7089,9 @@ def _pick_target_from_db(attacker_id: int, mode: str, chat_id: int, chat_filter:
         elif chat_filter == "m":
             base += " AND COALESCE(l.bio_exp,0) < ?"
             params.append(att_exp)
+        elif chat_filter == "e":
+            base += " AND COALESCE(l.bio_exp,0) = ?"
+            params.append(att_exp)
 
         rows = db_all(base, tuple(params)) or []
         if not rows:
@@ -5664,6 +7105,11 @@ def _pick_target_from_db(attacker_id: int, mode: str, chat_id: int, chat_filter:
             mn = min(int(r["be"] or 0) for r in rows)
             botm = [int(r["uid"]) for r in rows if int(r["be"] or 0) == mn]
             return random.choice(botm)
+        if chat_filter == "e":
+            eq = [int(r["uid"]) for r in rows if int(r["be"] or 0) == att_exp]
+            if not eq:
+                return None
+            return random.choice(eq)
 
         return int(random.choice(rows)["uid"])
 
@@ -5688,6 +7134,9 @@ def _pick_target_from_db(attacker_id: int, mode: str, chat_id: int, chat_filter:
     elif mode == "m":
         base += " AND COALESCE(l.bio_exp,0) < ?"
         params.append(att_exp)
+    elif mode == "e":
+        base += " AND COALESCE(l.bio_exp,0) = ?"
+        params.append(att_exp)
 
     rows = db_all(base, tuple(params)) or []
     if not rows:
@@ -5705,6 +7154,12 @@ def _pick_target_from_db(attacker_id: int, mode: str, chat_id: int, chat_filter:
         mn = min(int(r["be"] or 0) for r in rows)
         botm = [int(r["uid"]) for r in rows if int(r["be"] or 0) == mn]
         return random.choice(botm)
+
+    if mode == "e":
+        eq = [int(r["uid"]) for r in rows if int(r["be"] or 0) == att_exp]
+        if not eq:
+            return None
+        return random.choice(eq)
 
     return None
 
@@ -5843,39 +7298,32 @@ def _parse_infect_request(message, parsed: "Parsed", attacker_id: int) -> dict:
             flt = INF_CHAT_FILTER_SYNONYMS.get(toks[2].lower(), "n")
         return {"kind": "M", "mode": "c", "count": cnt, "filter": flt}
 
-    if toks[0].startswith("@"):
+    ref_tid = _resolve_or_create_infect_target(toks[0])
+    if ref_tid is not None:
         cnt = 1
         if len(toks) >= 2 and toks[1].isdigit():
             cnt = int(toks[1])
-        return {"kind": "U", "token": toks[0], "count": cnt}
+        return {"kind": "U", "target": int(ref_tid), "token": toks[0], "count": cnt}
 
     if toks[0].isdigit():
         tok0 = toks[0]
-        cand = int(tok0)
         cnt = 1
         if len(toks) >= 2 and toks[1].isdigit():
             cnt = int(toks[1])
 
         if len(tok0) >= 7:
-            return {"kind": "U", "token": tok0, "count": cnt}
-
-        known = False
-        try:
-            if db_one("SELECT 1 FROM users WHERE user_id=? LIMIT 1", (cand,)):
-                known = True
-            elif message.chat.type in ("group", "supergroup"):
-                if db_one(
-                    "SELECT 1 FROM chat_members WHERE chat_id=? AND user_id=? LIMIT 1",
-                    (int(message.chat.id), cand)
-                ):
-                    known = True
-        except Exception:
-            known = False
-
-        if known:
-            return {"kind": "U", "token": tok0, "count": cnt}
+            tid = _resolve_or_create_infect_target(tok0)
+            if tid is not None:
+                return {"kind": "U", "target": int(tid), "token": tok0, "count": cnt}
 
         return {"kind": "NONE"}
+    
+    public_ref_tid = _resolve_or_create_infect_target(toks[0])
+    if public_ref_tid is not None:
+        cnt = 1
+        if len(toks) >= 2 and toks[1].isdigit():
+            cnt = int(toks[1])
+        return {"kind": "U", "target": int(public_ref_tid), "token": toks[0], "count": cnt}
 
     key = toks[0].lower()
     mode = INF_MODE_SYNONYMS.get(key)
@@ -7069,7 +8517,7 @@ def cb_buy_vaccine(cq):
 
         if vac_cnt > 0:
             rm = InlineKeyboardMarkup()
-            rm.add(InlineKeyboardButton("💉 Использовать вакцину", callback_data=CB_USE_VACCINE))
+            rm.add(InlineKeyboardButton("💉 Использовать вакцину", callback_data=CB_USE_VACCINE), style="primary")
             text = (
                 "💉 У вас нет необходимости покупать вакцину. Для быстрого выздоровления используйте вакцину\n"
                 "команда <code>Био использовать вакцину</code>"
@@ -7163,7 +8611,7 @@ def cb_use_vaccine(cq):
                     f"{price_txt}, команда <code>Био купить вакцину</code>"
                 )
                 rm = InlineKeyboardMarkup()
-                rm.add(InlineKeyboardButton("💉 Купить вакцину", callback_data=CB_BUY_VACCINE))
+                rm.add(InlineKeyboardButton("💉 Купить вакцину", callback_data=CB_BUY_VACCINE, style="primary"))
             else:
                 text = "📝 У вас нет горячки. Нет необходимости использовать вакцину."
                 rm = None
@@ -7231,7 +8679,7 @@ def cb_use_vaccine_x(cq):
                     f"{price_txt}, команда <code>Био купить вакцину</code>"
                 )
                 rm = InlineKeyboardMarkup()
-                rm.add(InlineKeyboardButton("💉 Купить вакцину", callback_data=CB_BUY_VACCINE))
+                rm.add(InlineKeyboardButton("💉 Купить вакцину", callback_data=CB_BUY_VACCINE, style="primary"))
             else:
                 text = "📝 У вас нет горячки. Нет необходимости использовать вакцину."
                 rm = None
@@ -7960,6 +9408,46 @@ def cb_report_ui(cq):
         except Exception:
             pass
 
+@bot.callback_query_handler(func=lambda cq: (cq.data or "").startswith(f"{BLUI_TAG}:"))
+def cb_blacklist_ui(cq):
+    try:
+        page = _blacklist_parse_cb(cq.data or "")
+        if page is None:
+            bot.answer_callback_query(cq.id)
+            return
+
+        if not is_support(int(cq.from_user.id)):
+            bot.answer_callback_query(cq.id)
+            return
+
+        text, rm = render_blacklist_text(int(page))
+
+        if cq.inline_message_id:
+            limited_edit_message_text(
+                text=text,
+                inline_id=cq.inline_message_id,
+                parse_mode="HTML",
+                reply_markup=rm,
+                disable_web_page_preview=True
+            )
+        elif cq.message:
+            limited_edit_message_text(
+                text=text,
+                chat_id=cq.message.chat.id,
+                msg_id=cq.message.message_id,
+                parse_mode="HTML",
+                reply_markup=rm,
+                disable_web_page_preview=True
+            )
+
+        bot.answer_callback_query(cq.id)
+    except Exception as e:
+        send_error_report("cb_blacklist_ui", e)
+        try:
+            bot.answer_callback_query(cq.id)
+        except Exception:
+            pass
+
 @bot.callback_query_handler(func=lambda cq: (cq.data or "").startswith(f"{CB_LAB_DELETE_OK}:"))
 def cb_lab_delete_ok(cq):
     try:
@@ -8147,7 +9635,7 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
 
         if vac_cnt > 0:
             kb = InlineKeyboardMarkup()
-            kb.add(InlineKeyboardButton("💉 Использовать вакцину", callback_data=CB_USE_VACCINE))
+            kb.add(InlineKeyboardButton("💉 Использовать вакцину", callback_data=CB_USE_VACCINE, style="primary"))
             _emit(
                 f"🌡️ У вас горячка, вызванная {_pat_for_fever(fever_pat)}. Придётся отлежаться, пока она не пройдёт\n"
                 f"Время выздоровления {_format_hms(left)}"
@@ -8158,7 +9646,7 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
         else:
             price_txt = _fmt_bio_res(VACCINE_PRICE)
             kb = InlineKeyboardMarkup()
-            kb.add(InlineKeyboardButton("💉 Купить вакцину", callback_data=CB_BUY_VACCINE))
+            kb.add(InlineKeyboardButton("💉 Купить вакцину", callback_data=CB_BUY_VACCINE, style="primary"))
             _emit(
                 f"🌡️ У вас горячка, вызванная {_pat_for_fever(fever_pat)}. Придётся отлежаться, пока она не пройдёт\n"
                 f"Время выздоровления {_format_hms(left)}"
@@ -8286,18 +9774,7 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
         target_id: Optional[int] = req.get("target")
 
         if target_id is None and token:
-            if token.startswith("@"):
-                uname = token.lstrip("@").strip().lower()
-                target_id = find_user_id_by_username(token)
-                if target_id is None and message.chat.type in ("group", "supergroup"):
-                    r = db_one(
-                        "SELECT user_id FROM chat_members WHERE chat_id=? AND username=? LIMIT 1",
-                        (int(message.chat.id), uname)
-                    )
-                    if r:
-                        target_id = int(r["user_id"])
-            elif token.isdigit():
-                target_id = int(token)
+            target_id = _resolve_or_create_infect_target(token)
 
         if target_id is None:
             _emit("📑 Цель для заражения не найдена.")
@@ -8562,10 +10039,7 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
         att_un = getattr(actor, "username", "") or ""
         attacker_tag = tg_mention(attacker_id, att_disp, username=att_un)
 
-        ur = get_user_row(int(target_id))
-        tgt_disp = display_name(ur["first_name"] or "", ur["last_name"] or "", ur["username"] or "", int(target_id)) if ur else str(target_id)
-        tgt_un = (ur["username"] or "") if ur else ""
-        target_tag = tg_mention(int(target_id), tgt_disp, username=tgt_un)
+        target_tag = public_user_tag(int(target_id))
 
         pat_txt = f"«{h(pathogen_name.strip())}»" if (pathogen_name or "").strip() else "неизвестным патогеном"
 
@@ -8717,6 +10191,15 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
     last_gained: int = 0
     last_first_time: bool = False
 
+    succ_tags: list[str] = []
+    first_tags: list[str] = []
+    fail_tags: list[str] = []
+
+    def _mass_target_tag(tid: Optional[int], dummy: bool = False) -> str:
+        if dummy or tid is None:
+            return "неизвестный пользователь"
+        return public_user_tag(int(tid))
+
     evt_fail: int = 0
     rand_evt_pct = random_event_pct(attacker_qual)
     last_evt: bool = False
@@ -8734,6 +10217,11 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
                 last_dummy = True
                 last_gained = 1
                 last_first_time = True
+
+                dummy_tag = _mass_target_tag(None, True)
+                succ_tags.append(dummy_tag)
+                first_tags.append(dummy_tag)
+
                 with DB_LOCK:
                     c = conn.cursor()
                     try:
@@ -8770,6 +10258,7 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
             continue
 
         ensure_lab_exists(int(tid))
+        chosen_tag = _mass_target_tag(int(tid))
 
         trow = db_one(
             "SELECT COALESCE(immunity,0) AS imm, COALESCE(bio_exp,0) AS be, COALESCE(ids,1) AS t_ids FROM labs WHERE user_id=?",
@@ -8797,6 +10286,7 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
             last_first_time = False
             last_evt = True
             last_evt_text = pick_random_event_text()
+            fail_tags.append(chosen_tag)
         
             db_exec(
                 "UPDATE labs SET ready_pathogens=CASE WHEN COALESCE(ready_pathogens,0)>0 THEN ready_pathogens-1 ELSE 0 END, "
@@ -8847,6 +10337,7 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
             last_dummy = False
             last_gained = 0
             last_first_time = False
+            fail_tags.append(chosen_tag)
             db_exec(
                 "UPDATE labs SET ready_pathogens=CASE WHEN COALESCE(ready_pathogens,0)>0 THEN ready_pathogens-1 ELSE 0 END, "
                 "ops_total=COALESCE(ops_total,0)+1 WHERE user_id=?",
@@ -8877,6 +10368,7 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
             continue
 
         succ += 1
+        succ_tags.append(chosen_tag)
 
         texp = int(trow["be"] if trow else 0)
         stolen = (texp // 2)
@@ -8897,6 +10389,7 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
         last_first_time = bool(ft)
         if ft:
             first_cnt += 1
+            first_tags.append(chosen_tag)
 
         active = db_one(
             "SELECT end_ts, counted FROM infections WHERE attacker_id=? AND target_id=?",
@@ -8970,12 +10463,7 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
                 except Exception:
                     pass
         try:
-            ur = get_user_row(int(tid))
-            tgt_disp = display_name(
-                ur["first_name"] or "", ur["last_name"] or "", ur["username"] or "", int(tid)
-            ) if ur else str(tid)
-            tgt_un = (ur["username"] or "") if ur else ""
-            tgt_tag = tg_mention(int(tid), tgt_disp, username=tgt_un)
+            tgt_tag = public_user_tag(int(tid))
 
             notify_chat_id, notify_off = get_notify_prefs(int(tid))
             if not (int(notify_off) == 1 and int(notify_chat_id) == 0):
@@ -9032,12 +10520,7 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
         if last_dummy or (last_tid is None):
             single_target_tag = "неизвестный пользователь"
         else:
-            ur = get_user_row(int(last_tid))
-            tgt_disp = display_name(
-                ur["first_name"] or "", ur["last_name"] or "", ur["username"] or "", int(last_tid)
-            ) if ur else str(last_tid)
-            tgt_un = (ur["username"] or "") if ur else ""
-            single_target_tag = tg_mention(int(last_tid), tgt_disp, username=tgt_un)
+            single_target_tag = public_user_tag(int(last_tid))
 
         if last_evt:
             rem_row = db_one(
@@ -9097,14 +10580,27 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
             autoanswer_trigger(int(last_tid), attacker_id, int(message.chat.id), reply_mid, "CHAT")
         return
 
+    def _list_block(tags: list[str]) -> str:
+        if not tags:
+            return ""
+        return "<blockquote>" + "\n".join(tags) + "</blockquote>\n"
+
     txt = (
         "📋 Отчёт об операции массового заражения объектов:\n"
         f"Использовано патогенов: {used}\n\n"
         f"🦠 Успешно заражено: {succ}\n"
     )
+    if succ_tags:
+        txt += _list_block(succ_tags)
+
     if first_cnt > 0:
         txt += f"🩻 Заражено впервые: {first_cnt}\n"
+        if first_tags:
+            txt += _list_block(first_tags)
+
     txt += f"❌ Неудачные заражения: {fail}\n"
+    if fail_tags:
+        txt += _list_block(fail_tags)
 
     if succ > 0:
         bio_word = _ru_form(total_gained, "био-опыт", "био-опыта", "био-опыта")
@@ -9403,7 +10899,10 @@ def handle_lab_commands(message, parsed: Parsed):
     upsert_user(message.from_user)
     ensure_creator_is_support()
 
-    if parsed.cmd not in ("lab_delete", "restore_lab", "lab_delete_confirm_phrase"):
+    if parsed.cmd not in (
+        "lab_delete", "restore_lab", "lab_delete_confirm_phrase",
+        "labname_clear", "pathogenname_clear"
+    ):
         ensure_lab_exists(uid)
 
     if parsed.cmd == "lab_delete":
@@ -9434,6 +10933,64 @@ def handle_lab_commands(message, parsed: Parsed):
         bot.reply_to(message, text, parse_mode="HTML", disable_web_page_preview=True)
         return
 
+    if parsed.cmd in ("labname_clear", "pathogenname_clear"):
+        targeting_other = bool((parsed.args or "").strip()) or bool(message.reply_to_message)
+
+        if targeting_other and not is_support(int(uid)):
+            bot.reply_to(message, "📑 Эта команда доступна только агентам техподдержки.")
+            return
+
+        if targeting_other:
+            target_id, target_user_obj = resolve_target_from_reply_or_args(message, parsed)
+            tok = (parsed.args.split()[0] if parsed.args else "")
+
+            if is_bot_target(target_id, target_user_obj, tok):
+                bot.reply_to(message, bot_cannot_have("имени лаборатории или патогена"))
+                return
+
+            if target_id is None:
+                bot.reply_to(message, "📑 Укажите пользователя через @username, user_id или reply.")
+                return
+
+            if target_user_obj is not None:
+                capture_user_context(message, target_user_obj)
+        else:
+            target_id = int(uid)
+
+        ensure_lab_exists(int(target_id))
+
+        if parsed.cmd == "labname_clear":
+            set_lab_name(int(target_id), None)
+            default_name = default_lab_name(get_user_row(int(target_id)), int(target_id))
+
+            if int(target_id) == int(uid):
+                bot.reply_to(
+                    message,
+                    f"✅ Имя лаборатории удалено. Установлено стандартное имя: <b>{h(default_name)}</b>",
+                    parse_mode="HTML",
+                    disable_web_page_preview=True
+                )
+            else:
+                bot.reply_to(
+                    message,
+                    f"✅ Имя лаборатории у пользователя {_corp_actor_tag(int(target_id))} удалено. Установлено стандартное имя: <b>{h(default_name)}</b>",
+                    parse_mode="HTML",
+                    disable_web_page_preview=True
+                )
+            return
+
+        set_pathogen_name(int(target_id), None)
+        if int(target_id) == int(uid):
+            bot.reply_to(message, "✅ Имя патогена удалено. Установлено стандартное имя: <b>неизвестный патоген</b>", parse_mode="HTML")
+        else:
+            bot.reply_to(
+                message,
+                f"✅ Имя патогена у пользователя {_corp_actor_tag(int(target_id))} удалено. Установлено стандартное имя: <b>неизвестный патоген</b>",
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
+        return
+
     if parsed.cmd == "labname":
         if not parsed.args:
             lab = get_lab(uid)
@@ -9444,6 +11001,10 @@ def handle_lab_commands(message, parsed: Parsed):
             return
 
         new_name = parsed.args.strip()
+        lock_row = get_name_restriction_row(int(uid))
+        if lock_row and int(lock_row["lab_locked"] or 0) == 1:
+            bot.reply_to(message, "📑 Возможность менять имя лаборатории ограничена. Обратитесь к агенту тех.поддержки.")
+            return
         if len(new_name) > 40:
             bot.reply_to(message, "📑 Название вашей лаборатории превышает максимальные 40 символов.")
             return
@@ -9459,6 +11020,10 @@ def handle_lab_commands(message, parsed: Parsed):
             return
 
         new_name = parsed.args.strip()
+        lock_row = get_name_restriction_row(int(uid))
+        if lock_row and int(lock_row["pat_locked"] or 0) == 1:
+            bot.reply_to(message, "📑 Возможность менять имя патогена ограничена. Обратитесь к агенту тех.поддержки.")
+            return
         if len(new_name) > 40:
             bot.reply_to(message, "📑 Название вашего патогена превышает максимальные 40 символов.")
             return
@@ -9467,6 +11032,7 @@ def handle_lab_commands(message, parsed: Parsed):
         return
 
     if parsed.cmd in ("lab", "mylab"):
+        _merge_placeholder_to_real_user(message.from_user)
         mark_lab_active(int(uid))
         _maybe_apply_deleted_lab_bonus(int(uid))
         if parsed.cmd == "mylab":
@@ -9847,6 +11413,61 @@ def handle_corp_commands(message, parsed: Parsed):
         bot.reply_to(message, f"✅ Игрок {_corp_actor_tag(int(target_id))} назначен заместителем Корпорации {corp_name_display(corp['name'])}.", parse_mode="HTML", disable_web_page_preview=True)
         return
 
+    if parsed.cmd == "corp_deputy_remove":
+        if my_cid <= 0:
+            bot.reply_to(message, "📑 Вы не состоите в Корпорации.")
+            return
+
+        corp = corp_by_id(my_cid)
+        if not corp:
+            bot.reply_to(message, "📑 Корпорация не найдена.")
+            return
+
+        if int(corp["owner_id"]) != int(uid):
+            bot.reply_to(message, "📑 Снимать права заместителя может только владелец Корпорации.")
+            return
+
+        target_id, target_user_obj = resolve_target_from_reply_or_args(message, parsed)
+        tok = (parsed.args.split()[0] if parsed.args else "")
+
+        if is_bot_target(target_id, target_user_obj, tok):
+            bot.reply_to(message, bot_cannot_have("роли заместителя корпорации"))
+            return
+
+        if target_id is None:
+            return
+
+        if int(target_id) == int(uid):
+            bot.reply_to(message, "📑 Вы не можете разжаловать самого себя")
+            return
+
+        if target_user_obj is not None:
+            capture_user_context(message, target_user_obj)
+
+        tgt_cid, _ = get_user_corp_resolved(int(target_id))
+        if int(tgt_cid) != int(my_cid):
+            bot.reply_to(message, "📑 Этот игрок не состоит в вашей Корпорации.")
+            return
+
+        role = corp_role(int(my_cid), int(target_id))
+        if role != "deputy":
+            bot.reply_to(message, "📑 Этот игрок не является заместителем Корпорации.")
+            return
+
+        db_exec(
+            "UPDATE corp_members SET role='member' WHERE corp_id=? AND user_id=?",
+            (int(my_cid), int(target_id)),
+            commit=True
+        )
+
+        bot.reply_to(
+            message,
+            f"✅ Игрок {_corp_actor_tag(int(target_id))} больше не является заместителем Корпорации {corp_name_display(corp['name'])}.",
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
+        return
+
     if parsed.cmd == "corp_kick":
         if my_cid <= 0:
             bot.reply_to(message, "📑 Вы не состоите в Корпорации.")
@@ -10197,6 +11818,24 @@ def handle_corp_commands(message, parsed: Parsed):
 
         bot.reply_to(message, text, parse_mode="HTML", disable_web_page_preview=True, reply_markup=rm)
         return
+    
+    if parsed.cmd == "corp_req_list":
+        if my_cid <= 0:
+            bot.reply_to(message, "📑 Вы не состоите в Корпорации.")
+            return
+
+        corp = corp_by_id(my_cid)
+        if not corp:
+            bot.reply_to(message, "📑 Корпорация не найдена.")
+            return
+
+        if not corp_is_owner_or_deputy(int(my_cid), int(uid)):
+            bot.reply_to(message, "📑 Просматривать активные заявки могут только владелец и заместители Корпорации.")
+            return
+
+        text, rm = render_corp_requests_text(corp, uid)
+        bot.reply_to(message, text, parse_mode="HTML", disable_web_page_preview=True, reply_markup=rm)
+        return
 
 # INLINE MODE
 def _inline_strip_target_prefix(query: str) -> tuple[Optional[int], str, str]:
@@ -10294,7 +11933,7 @@ def _parse_inline_infect_query(query: str):
     if not raw:
         return None
 
-    pref_tid, _pref_tok, pref_tail = _inline_strip_target_prefix(raw)
+    pref_tid, pref_tok, pref_tail = _inline_strip_target_prefix(raw)
     if pref_tid is not None:
         if not pref_tail:
             return {"kind": "U", "target": int(pref_tid), "count": 1}
@@ -10306,16 +11945,15 @@ def _parse_inline_infect_query(query: str):
     if not toks:
         return None
 
-    if toks[0].isdigit() and len(toks) >= 2 and toks[1].startswith("@"):
-        tid = find_user_id_by_username(toks[1])
+    if len(toks) >= 2 and toks[0].isdigit():
+        tid = _resolve_or_create_infect_target(toks[1])
         if tid is not None:
             return {"kind": "U", "target": int(tid), "count": max(1, int(toks[0]))}
 
-    if toks[0].startswith("@"):
-        tid = find_user_id_by_username(toks[0])
-        if tid is not None:
-            cnt = int(toks[1]) if len(toks) >= 2 and toks[1].isdigit() else 1
-            return {"kind": "U", "target": int(tid), "count": max(1, cnt)}
+    tid0 = _resolve_or_create_infect_target(toks[0])
+    if tid0 is not None:
+        cnt = int(toks[1]) if len(toks) >= 2 and toks[1].isdigit() else 1
+        return {"kind": "U", "target": int(tid0), "count": max(1, cnt)}
 
     idx = 0
     cnt = 1
@@ -10341,7 +11979,7 @@ def _inline_infect_preview_text(req: dict) -> str:
         cnt = max(1, int(req["count"] or 1))
         word = _ru_form(cnt, "патоген", "патогена", "патогенов")
         return (
-            f"🦠 Подготовлено заражение цели {_corp_actor_tag(tid)}\n"
+            f"🦠 Подготовлено заражение цели {public_user_tag(tid)}\n"
             f"🧪 Будет использовано: {cnt} {word}\n\n"
             "Нажмите кнопку ниже, чтобы выполнить заражение."
         )
@@ -10353,6 +11991,7 @@ def _inline_infect_preview_text(req: dict) -> str:
         "r": "случайного объекта",
         "p": "объекта с большим био-опытом",
         "m": "объекта с меньшим био-опытом",
+        "e": "объекта с равным био-опытом",
     }.get(mode, "объекта")
 
     return (
@@ -10411,6 +12050,25 @@ def _inline_article(article_id: str, title: str, desc: str, text: str, reply_mar
         description=desc,
         input_message_content=content,
     )
+
+def _safe_answer_inline_query(inline_query_id: str, results, *, cache_time: int = 0, is_personal: bool = True) -> bool:
+    try:
+        bot.answer_inline_query(
+            inline_query_id,
+            results,
+            cache_time=cache_time,
+            is_personal=is_personal
+        )
+        return True
+    except Exception as e:
+        msg = str(e)
+        if (
+            "query is too old" in msg
+            or "response timeout expired" in msg
+            or "query ID is invalid" in msg
+        ):
+            return False
+        raise
 
 @bot.inline_handler(func=lambda q: True)
 def inline_query_handler(inline_query):
@@ -10564,14 +12222,14 @@ def inline_query_handler(inline_query):
                     ))
 
         if results:
-            bot.answer_inline_query(inline_query.id, results[:8], cache_time=0, is_personal=True)
+            _safe_answer_inline_query(inline_query.id, results[:8], cache_time=0, is_personal=True)
             return
 
-        bot.answer_inline_query(inline_query.id, [], cache_time=1, is_personal=True)
+        _safe_answer_inline_query(inline_query.id, [], cache_time=1, is_personal=True)
     except Exception as e:
         send_error_report("inline_query_handler", e)
         try:
-            bot.answer_inline_query(inline_query.id, [], cache_time=2, is_personal=True)
+            _safe_answer_inline_query(inline_query.id, [], cache_time=2, is_personal=True)
         except Exception:
             pass
 
@@ -10620,7 +12278,17 @@ def text_router(message):
         if parsed.cmd == "owner":
             handle_owner_command(message, parsed)
             return
-        
+
+        # /owner_remove
+        if parsed.cmd == "owner_remove":
+            handle_owner_remove_command(message, parsed)
+            return
+
+        # /agents
+        if parsed.cmd == "agents_panel":
+            handle_agents_panel_command(message)
+            return
+
         # помощь
         if parsed.cmd == "help":
             handle_help_command(message)
@@ -10631,6 +12299,19 @@ def text_router(message):
             handle_admin_service_commands(message, parsed)
             return
 
+        if parsed.cmd in ("name_lock_lab", "name_lock_pat"):
+            handle_admin_name_restriction_command(message, parsed)
+            return
+
+        if parsed.cmd == "blacklist":
+            handle_blacklist_command(message)
+            return
+
+        # список команд
+        if parsed.cmd == "commands_link":
+            handle_commands_link(message)
+            return
+
         # /settings
         if parsed.cmd == "settings":
             handle_settings_command(message)
@@ -10639,6 +12320,14 @@ def text_router(message):
         # /report
         if parsed.cmd == "report":
             handle_report_command(message)
+            return
+
+        # timers
+        if parsed.cmd in (
+            "timer_add_rel", "timer_add_abs", "timer_add_cycle",
+            "timer_delete", "timer_clear_all", "timer_list"
+        ):
+            handle_timer_commands(message, parsed)
             return
 
         # приватные настройки
@@ -10704,7 +12393,7 @@ def text_router(message):
             elif status == "NO_VACCINE":
                 price_txt = _fmt_bio_res(VACCINE_PRICE)
                 kb = InlineKeyboardMarkup()
-                kb.add(InlineKeyboardButton("💉 Купить вакцину", callback_data=CB_BUY_VACCINE))
+                kb.add(InlineKeyboardButton("💉 Купить вакцину", callback_data=CB_BUY_VACCINE, style="primary"))
                 bot.reply_to(
                     message,
                     f"💉 Сейчас у вас нет ни одной вакцины. Для быстрого выздоровления вы можете купить вакцину: {price_txt}, "
@@ -10728,7 +12417,7 @@ def text_router(message):
 
             if vac_cnt > 0:
                 kb = InlineKeyboardMarkup()
-                kb.add(InlineKeyboardButton("💉 Использовать вакцину", callback_data=CB_USE_VACCINE))
+                kb.add(InlineKeyboardButton("💉 Использовать вакцину", callback_data=CB_USE_VACCINE, style="primary"))
                 bot.reply_to(
                     message,
                     "💉 У вас нет необходимости покупать вакцину.  Для быстрого выздоровления используйте вакцину\n"
@@ -10766,8 +12455,8 @@ def text_router(message):
         if parsed.cmd in (
             "corp_create", "corp_delete", "corp_open", "corp_close",
             "corp_reg", "corp_info", "corp_my", "corp_join", "corp_invite",
-            "corp_req_accept", "corp_req_reject",
-            "corp_deputy", "corp_kick", "corp_leave", "corp_transfer_owner",
+            "corp_req_accept", "corp_req_reject", "corp_req_list",
+            "corp_deputy", "corp_deputy_remove", "corp_kick", "corp_leave", "corp_transfer_owner",
             "corp_send_res", "corp_send_mat"
         ):
             handle_corp_commands(message, parsed)
@@ -10776,6 +12465,7 @@ def text_router(message):
         # лаборатория
         if parsed.cmd in (
             "lab", "mylab", "labname", "pathogenname",
+            "labname_clear", "pathogenname_clear",
             "lab_delete", "restore_lab", "lab_delete_confirm_phrase"
         ):
             handle_lab_commands(message, parsed)
