@@ -121,7 +121,7 @@ def random_event_pct(qualification_level: int) -> float:
         q = int(qualification_level or 0)
     except Exception:
         q = 0
-    pct = 20.0 - (q // 10) * 0.1
+    pct = 15.0 - (q // 10) * 0.1 # шанс срабатывания случайного события
     if pct < 5.0:
         pct = 5.0
     return float(pct)
@@ -3641,29 +3641,27 @@ def _top_disease_rows(limit: int):
     return db_all(
         "SELECT "
         "  CASE "
-        "    WHEN COALESCE(NULLIF(TRIM(i.pathogen_name),''), '') <> '' "
-        "      THEN MIN(TRIM(i.pathogen_name)) "
+        "    WHEN COALESCE(NULLIF(TRIM(la.pathogen_name),''), '') <> '' "
+        "      THEN MIN(TRIM(la.pathogen_name)) "
         "    ELSE 'неизвестный патоген' "
         "  END AS pname, "
         "  CASE "
-        "    WHEN COALESCE(NULLIF(TRIM(i.pathogen_name),''), '') <> '' "
+        "    WHEN COALESCE(NULLIF(TRIM(la.pathogen_name),''), '') <> '' "
         "      THEN 0 ELSE 1 "
         "  END AS is_unknown, "
-        "  CASE "
-        "    WHEN COALESCE(NULLIF(TRIM(i.pathogen_name),''), '') <> '' "
-        "      THEN 0 ELSE i.attacker_id "
-        "  END AS owner_id, "
+        "  i.attacker_id AS owner_id, "
         "  MIN(COALESCE(u.username,'')) AS owner_username, "
         "  MIN(COALESCE(u.first_name,'')) AS owner_first_name, "
         "  MIN(COALESCE(u.last_name,'')) AS owner_last_name, "
         "  COUNT(*) AS sick "
         "FROM infections i "
+        "LEFT JOIN labs la ON la.user_id=i.attacker_id "
         "LEFT JOIN users u ON u.user_id=i.attacker_id "
-        "GROUP BY "
+        "GROUP BY i.attacker_id, "
         "  CASE "
-        "    WHEN COALESCE(NULLIF(TRIM(i.pathogen_name),''), '') <> '' "
-        "      THEN 'named:' || lower(TRIM(i.pathogen_name)) "
-        "    ELSE 'unknown:' || CAST(i.attacker_id AS TEXT) "
+        "    WHEN COALESCE(NULLIF(TRIM(la.pathogen_name),''), '') <> '' "
+        "      THEN lower(TRIM(la.pathogen_name)) "
+        "    ELSE 'unknown' "
         "  END "
         "ORDER BY sick DESC, pname COLLATE NOCASE ASC, owner_id ASC "
         "LIMIT ?",
@@ -3674,32 +3672,30 @@ def _top_disease_rows_chat(chat_id: int, limit: int):
     return db_all(
         "SELECT "
         "  CASE "
-        "    WHEN COALESCE(NULLIF(TRIM(i.pathogen_name),''), '') <> '' "
-        "      THEN MIN(TRIM(i.pathogen_name)) "
+        "    WHEN COALESCE(NULLIF(TRIM(la.pathogen_name),''), '') <> '' "
+        "      THEN MIN(TRIM(la.pathogen_name)) "
         "    ELSE 'неизвестный патоген' "
         "  END AS pname, "
         "  CASE "
-        "    WHEN COALESCE(NULLIF(TRIM(i.pathogen_name),''), '') <> '' "
+        "    WHEN COALESCE(NULLIF(TRIM(la.pathogen_name),''), '') <> '' "
         "      THEN 0 ELSE 1 "
         "  END AS is_unknown, "
-        "  CASE "
-        "    WHEN COALESCE(NULLIF(TRIM(i.pathogen_name),''), '') <> '' "
-        "      THEN 0 ELSE i.attacker_id "
-        "  END AS owner_id, "
+        "  i.attacker_id AS owner_id, "
         "  MIN(COALESCE(u.username,'')) AS owner_username, "
         "  MIN(COALESCE(u.first_name,'')) AS owner_first_name, "
         "  MIN(COALESCE(u.last_name,'')) AS owner_last_name, "
         "  COUNT(*) AS sick "
         "FROM infections i "
         "JOIN chat_members cm ON cm.user_id=i.target_id AND cm.chat_id=? "
-        "JOIN labs l ON l.user_id=i.target_id "
+        "JOIN labs lt ON lt.user_id=i.target_id "
+        "LEFT JOIN labs la ON la.user_id=i.attacker_id "
         "LEFT JOIN users u ON u.user_id=i.attacker_id "
-        "WHERE COALESCE(l.lab_active,0)=1 "
-        "GROUP BY "
+        "WHERE COALESCE(lt.lab_active,0)=1 "
+        "GROUP BY i.attacker_id, "
         "  CASE "
-        "    WHEN COALESCE(NULLIF(TRIM(i.pathogen_name),''), '') <> '' "
-        "      THEN 'named:' || lower(TRIM(i.pathogen_name)) "
-        "    ELSE 'unknown:' || CAST(i.attacker_id AS TEXT) "
+        "    WHEN COALESCE(NULLIF(TRIM(la.pathogen_name),''), '') <> '' "
+        "      THEN lower(TRIM(la.pathogen_name)) "
+        "    ELSE 'unknown' "
         "  END "
         "ORDER BY sick DESC, pname COLLATE NOCASE ASC, owner_id ASC "
         "LIMIT ?",
@@ -5180,6 +5176,22 @@ def is_bot_target(target_id: Optional[int], target_user_obj, token: str = "") ->
 
     return False
 
+def is_channel_sender_message(message) -> bool:
+    try:
+        sc = getattr(message, "sender_chat", None)
+        if sc and (getattr(sc, "type", "") or "").lower() == "channel":
+            return True
+    except Exception:
+        pass
+
+    try:
+        if bool(getattr(message, "is_automatic_forward", False)):
+            return True
+    except Exception:
+        pass
+
+    return False
+
 def bot_cannot_have(what: str) -> str:
     return f"📑 Как бы вам и мне не хотелось, но бот не может участвовать в игре. У бота не может быть {what}"
 
@@ -6358,8 +6370,14 @@ def render_lab_infected_list(owner_id: int) -> str:
 
 def render_lab_diseases_list(owner_id: int) -> str:
     rows = db_all(
-        "SELECT attacker_id, pathogen_name, end_ts, start_ts FROM infections "
-        "WHERE target_id=? ORDER BY start_ts DESC LIMIT 30",
+        "SELECT i.attacker_id, i.end_ts, i.start_ts, "
+        "COALESCE(la.pathogen_name,'') AS current_pathogen_name, "
+        "u.username, u.first_name, u.last_name "
+        "FROM infections i "
+        "LEFT JOIN labs la ON la.user_id=i.attacker_id "
+        "LEFT JOIN users u ON u.user_id=i.attacker_id "
+        "WHERE i.target_id=? "
+        "ORDER BY i.start_ts DESC LIMIT 30",
         (int(owner_id),)
     ) or []
 
@@ -6370,12 +6388,22 @@ def render_lab_diseases_list(owner_id: int) -> str:
 
     items = []
     for i, r in enumerate(rows, 1):
-        pname = (r["pathogen_name"] or "").strip()
-        disease = f"«{h(pname)}»" if pname else "неизвестный патоген" 
-        end_ts = int(r["end_ts"] or 0)
-        until = _fmt_date_ddmmyy(end_ts)
+        attacker_id = int(r["attacker_id"] or 0)
+        pname = (r["current_pathogen_name"] or "").strip()
+        disease = f"«{h(pname)}»" if pname else "неизвестный патоген"
+        until = _fmt_date_ddmmyy(int(r["end_ts"] or 0))
 
-        inf_by = "неизвестный пользователь"
+        if attacker_id != 0:
+            owner_un = (r["username"] or "").strip()
+            owner_disp = display_name(
+                r["first_name"] or "",
+                r["last_name"] or "",
+                owner_un,
+                attacker_id
+            )
+            inf_by = tg_mention(attacker_id, owner_disp, username=owner_un)
+        else:
+            inf_by = "неизвестный пользователь"
 
         items.append(f"{i}. {inf_by} | {disease} | до {until}")
 
@@ -7401,6 +7429,9 @@ def _parse_infect_request(message, parsed: "Parsed", attacker_id: int) -> dict:
     """
     args = (parsed.args or "").strip()
     toks = args.split() if args else []
+
+    if message.reply_to_message and is_channel_sender_message(message.reply_to_message):
+        return {"kind": "NONE"}
 
     if message.reply_to_message and message.reply_to_message.from_user:
         ru = message.reply_to_message.from_user
@@ -8502,6 +8533,9 @@ def cmd_start(message):
     if message.chat.type != "private":
         return
     try:
+        if not is_channel_sender_message(message):
+            upsert_user(message.from_user)
+            _merge_placeholder_to_real_user(message.from_user)
         handle_help_command(message)
     except Exception as e:
         send_error_report("cmd_start", e)
@@ -9695,9 +9729,12 @@ def handle_owner_command(message, parsed: Parsed):
     )
 
 def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = None, actor_user=None):
+    if is_channel_sender_message(message):
+        return   
     actor = actor_user or message.from_user
     attacker_id = int(actor.id)
     upsert_user(actor)
+    _merge_placeholder_to_real_user(actor)
     ensure_lab_exists(attacker_id)
     mark_lab_active(attacker_id)
 
@@ -10747,6 +10784,7 @@ def handle_sabotage_command(message, parsed: Parsed, edit_ctx: Optional[dict] = 
     actor = actor_user or message.from_user
     attacker_id = int(actor.id)
     upsert_user(actor)
+    _merge_placeholder_to_real_user(actor)
     ensure_lab_exists(attacker_id)
     mark_lab_active(attacker_id)
 
@@ -12223,6 +12261,7 @@ def inline_query_handler(inline_query):
             return
 
         upsert_user(inline_query.from_user)
+        _merge_placeholder_to_real_user(inline_query.from_user)
         ensure_creator_is_support()
         ensure_lab_exists(uid)
 
@@ -12396,6 +12435,8 @@ def on_report_media(message):
 @bot.message_handler(content_types=["text"])
 def text_router(message):
     try:
+        if is_channel_sender_message(message):
+            return        
         uid = int(message.from_user.id)
 
         if is_bot_banned(uid):
@@ -12404,6 +12445,7 @@ def text_router(message):
             return
 
         upsert_user(message.from_user)
+        _merge_placeholder_to_real_user(message.from_user)
         if getattr(message, "via_bot", None) is not None:
             return
         if message.chat.type in ("group", "supergroup"):
