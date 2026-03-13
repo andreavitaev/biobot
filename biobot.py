@@ -3639,25 +3639,69 @@ def _top_user_rows_chat(chat_id: int, limit: int):
 
 def _top_disease_rows(limit: int):
     return db_all(
-        "SELECT MIN(COALESCE(NULLIF(TRIM(i.pathogen_name),''), 'неизвестный патоген')) AS pname, "
-        "COUNT(DISTINCT i.target_id) AS sick "
+        "SELECT "
+        "  CASE "
+        "    WHEN COALESCE(NULLIF(TRIM(i.pathogen_name),''), '') <> '' "
+        "      THEN MIN(TRIM(i.pathogen_name)) "
+        "    ELSE 'неизвестный патоген' "
+        "  END AS pname, "
+        "  CASE "
+        "    WHEN COALESCE(NULLIF(TRIM(i.pathogen_name),''), '') <> '' "
+        "      THEN 0 ELSE 1 "
+        "  END AS is_unknown, "
+        "  CASE "
+        "    WHEN COALESCE(NULLIF(TRIM(i.pathogen_name),''), '') <> '' "
+        "      THEN 0 ELSE i.attacker_id "
+        "  END AS owner_id, "
+        "  MIN(COALESCE(u.username,'')) AS owner_username, "
+        "  MIN(COALESCE(u.first_name,'')) AS owner_first_name, "
+        "  MIN(COALESCE(u.last_name,'')) AS owner_last_name, "
+        "  COUNT(*) AS sick "
         "FROM infections i "
-        "GROUP BY lower(COALESCE(NULLIF(TRIM(i.pathogen_name),''), 'неизвестный патоген')) "
-        "ORDER BY sick DESC, pname COLLATE NOCASE ASC "
+        "LEFT JOIN users u ON u.user_id=i.attacker_id "
+        "GROUP BY "
+        "  CASE "
+        "    WHEN COALESCE(NULLIF(TRIM(i.pathogen_name),''), '') <> '' "
+        "      THEN 'named:' || lower(TRIM(i.pathogen_name)) "
+        "    ELSE 'unknown:' || CAST(i.attacker_id AS TEXT) "
+        "  END "
+        "ORDER BY sick DESC, pname COLLATE NOCASE ASC, owner_id ASC "
         "LIMIT ?",
         (int(limit),)
     ) or []
 
 def _top_disease_rows_chat(chat_id: int, limit: int):
     return db_all(
-        "SELECT MIN(COALESCE(NULLIF(TRIM(i.pathogen_name),''), 'неизвестный патоген')) AS pname, "
-        "COUNT(DISTINCT i.target_id) AS sick "
+        "SELECT "
+        "  CASE "
+        "    WHEN COALESCE(NULLIF(TRIM(i.pathogen_name),''), '') <> '' "
+        "      THEN MIN(TRIM(i.pathogen_name)) "
+        "    ELSE 'неизвестный патоген' "
+        "  END AS pname, "
+        "  CASE "
+        "    WHEN COALESCE(NULLIF(TRIM(i.pathogen_name),''), '') <> '' "
+        "      THEN 0 ELSE 1 "
+        "  END AS is_unknown, "
+        "  CASE "
+        "    WHEN COALESCE(NULLIF(TRIM(i.pathogen_name),''), '') <> '' "
+        "      THEN 0 ELSE i.attacker_id "
+        "  END AS owner_id, "
+        "  MIN(COALESCE(u.username,'')) AS owner_username, "
+        "  MIN(COALESCE(u.first_name,'')) AS owner_first_name, "
+        "  MIN(COALESCE(u.last_name,'')) AS owner_last_name, "
+        "  COUNT(*) AS sick "
         "FROM infections i "
         "JOIN chat_members cm ON cm.user_id=i.target_id AND cm.chat_id=? "
         "JOIN labs l ON l.user_id=i.target_id "
+        "LEFT JOIN users u ON u.user_id=i.attacker_id "
         "WHERE COALESCE(l.lab_active,0)=1 "
-        "GROUP BY lower(COALESCE(NULLIF(TRIM(i.pathogen_name),''), 'неизвестный патоген')) "
-        "ORDER BY sick DESC, pname COLLATE NOCASE ASC "
+        "GROUP BY "
+        "  CASE "
+        "    WHEN COALESCE(NULLIF(TRIM(i.pathogen_name),''), '') <> '' "
+        "      THEN 'named:' || lower(TRIM(i.pathogen_name)) "
+        "    ELSE 'unknown:' || CAST(i.attacker_id AS TEXT) "
+        "  END "
+        "ORDER BY sick DESC, pname COLLATE NOCASE ASC, owner_id ASC "
         "LIMIT ?",
         (int(chat_id), int(limit))
     ) or []
@@ -3700,7 +3744,7 @@ def render_top_users(limit: int, chat_id: int = 0) -> tuple[str, InlineKeyboardM
         lines.append("<blockquote>Нет данных.</blockquote>")
         return "\n".join(lines), kb_top_switch("U", int(chat_id), int(limit))
 
-    lines.append("<blockquote>")
+    lines.append("<blockquote expandable>")
     for i, r in enumerate(rows, 1):
         uid = int(r["user_id"])
         un = (r["username"] or "")
@@ -3719,7 +3763,7 @@ def render_top_diseases(limit: int, chat_id: int = 0) -> tuple[str, InlineKeyboa
         lines.append("<blockquote>Нет данных.</blockquote>")
         return "\n".join(lines), kb_top_switch("D", int(chat_id), int(limit))
 
-    lines.append("<blockquote>")
+    lines.append("<blockquote expandable>")
     for i, r in enumerate(rows, 1):
         pname = (r["pname"] or "").strip() or "неизвестный патоген"
         lines.append(f"{i}. {h(pname)} | {_fmt_k(int(r['sick'] or 0))} бол")
@@ -3735,7 +3779,7 @@ def render_top_corps(limit: int, chat_id: int = 0) -> tuple[str, InlineKeyboardM
         lines.append("<blockquote>Нет данных.</blockquote>")
         return "\n".join(lines), kb_top_switch("C", int(chat_id), int(limit))
 
-    lines.append("<blockquote>")
+    lines.append("<blockquote expandable>")
     for i, r in enumerate(rows, 1):
         nm = (r["name"] or "").strip()
         lines.append(f"{i}. {corp_name_display(nm)} | {_fmt_k(int(r['be'] or 0))} опыт | {_fmt_k(int(r['sick'] or 0))} бол")
@@ -4221,7 +4265,7 @@ def render_blacklist_text(page: int) -> tuple[str, Optional[InlineKeyboardMarkup
     lines = []
     lines.append("📑 ЧЁРНЫЙ СПИСОК:")
     lines.append("")
-    lines.append("<blockquote>")
+    lines.append("<blockquote expandable>")
     for idx, row in enumerate(part, start + 1):
         who = _user_display_from_any(
             int(row["user_id"]),
@@ -4554,6 +4598,39 @@ def set_lab_name(user_id: int, name: Optional[str]):
 
 def set_pathogen_name(user_id: int, name: Optional[str]):
     db_exec("UPDATE labs SET pathogen_name=? WHERE user_id=?", (name, int(user_id)), commit=True)
+
+def _normalize_owned_name(name: str) -> str:
+    return re.sub(r"\s+", " ", (name or "").strip()).lower()
+
+def is_lab_name_taken(name: str, exclude_user_id: int = 0) -> bool:
+    norm = _normalize_owned_name(name)
+    if not norm:
+        return False
+
+    row = db_one(
+        "SELECT user_id FROM labs "
+        "WHERE COALESCE(NULLIF(TRIM(lab_name),''), '') <> '' "
+        "AND lower(trim(lab_name))=? "
+        "AND user_id<>? "
+        "LIMIT 1",
+        (norm, int(exclude_user_id))
+    )
+    return row is not None
+
+def is_pathogen_name_taken(name: str, exclude_user_id: int = 0) -> bool:
+    norm = _normalize_owned_name(name)
+    if not norm:
+        return False
+
+    row = db_one(
+        "SELECT user_id FROM labs "
+        "WHERE COALESCE(NULLIF(TRIM(pathogen_name),''), '') <> '' "
+        "AND lower(trim(pathogen_name))=? "
+        "AND user_id<>? "
+        "LIMIT 1",
+        (norm, int(exclude_user_id))
+    )
+    return row is not None
 
 def get_user_row(user_id: int) -> Optional[sqlite3.Row]:
     return db_one("SELECT * FROM users WHERE user_id=?", (int(user_id),))
@@ -5099,7 +5176,7 @@ def bot_cannot_have(what: str) -> str:
 
 def _pat_for_text(name: str) -> str:
     name = (name or "").strip()
-    return f"«{h(name)}»" if name else "неизвестным патогеном"
+    return f'патогеном «{h(name)}»' if name else "неизвестным патогеном"
 
 def _pat_for_fever(name: str) -> str:
     name = (name or "").strip()
@@ -6265,7 +6342,7 @@ def render_lab_infected_list(owner_id: int) -> str:
         res_word = _ru_form(add, "био-ресурс", "био-ресурса", "био-ресурсов")
         items.append(f"{i}. {name} | 🧬 {add} {res_word} | до {until}")
 
-    lines.append("<blockquote>")
+    lines.append("<blockquote expandable>")
     lines.extend(items)
     lines.append("</blockquote>")
     return "\n".join(lines)
@@ -6293,7 +6370,7 @@ def render_lab_diseases_list(owner_id: int) -> str:
 
         items.append(f"{i}. {inf_by} | {disease} | до {until}")
 
-    lines.append("<blockquote>")
+    lines.append("<blockquote expandable>")
     lines.extend(items)
     lines.append("</blockquote>")
     return "\n".join(lines)
@@ -6324,6 +6401,16 @@ def _ru_unit(n: int, one: str, few: str, many: str) -> str:
         return few
     return many
 
+def _fmt_bio_res_after_po(n: int) -> str:
+    n = int(n)
+    w = _ru_unit(n, "био-ресурсу", "био-ресурса", "био-ресурсов")
+    return f"{n} {w}"
+
+def _fmt_bio_mater_after_po(n: int) -> str:
+    n = int(n)
+    w = _ru_unit(n, "био-материалу", "био-материала", "био-материалов")
+    return f"{n} {w}"
+
 def _format_hm_from_seconds(seconds: int) -> str:
     """Часы+минуты, без секунд (для строки 'Горячка на ...')."""
     seconds = max(0, int(seconds))
@@ -6343,11 +6430,17 @@ def _format_days(n_days: int) -> str:
 def _format_duration(seconds: int) -> str:
     seconds = max(0, int(seconds))
     m_total = (seconds + 59) // 60
+
     if m_total < 60:
-        return f"{m_total} минут"
+        return f"{m_total} {_ru_unit(m_total, 'минута', 'минуты', 'минут')}"
+
     h = m_total // 60
     m = m_total % 60
-    return f"{h} часов {m} минут"
+
+    parts = [f"{h} {_ru_unit(h, 'час', 'часа', 'часов')}"]
+    if m > 0:
+        parts.append(f"{m} {_ru_unit(m, 'минута', 'минуты', 'минут')}")
+    return " ".join(parts)
 
 def _format_hms(seconds: int) -> str:
     seconds = max(0, int(seconds))
@@ -9976,10 +10069,9 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
                             f"🤒 Заражение на {_format_days(inf_days)}"
                         )
                         if first_time:
-                            res_word = _ru_form(int(gained), "био-ресурс", "био-ресурса", "био-ресурсов")
                             target_notice += (
                                 "\n\n👨‍🔬 Вы ещё не подвергались заражению этим патогеном, поэтому каждый день, пока вы заражены, "
-                                f"игрок будет получать по {int(gained)} {res_word}"
+                                f"игрок будет получать по {_fmt_bio_res_after_po(int(gained))}"
                             )
                         
                         att_ids_lvl = int(lab_row["a_ids"] if lab_row else 1) or 1
@@ -9994,10 +10086,9 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
                                 f"☣️ +{_fmt_k(int(gained))} {exp_word}"
                             )
                             if first_time:
-                                res_word = _ru_form(int(gained), "био-ресурс", "био-ресурса", "био-ресурсов")
                                 result_text += (
-                                    "\n\n👨‍🔬 Объект ещё не подвергался заражению вашим патогеном, поэтому каждый день, пока он заражён, "
-                                    f"вы будете получать по {int(gained)} {res_word}"
+                                    "\n\n👨‍🔬 Вы ещё не подвергались заражению этим патогеном, поэтому каждый день, пока вы заражены, "
+                                    f"игрок будет получать по {_fmt_bio_res_after_po(int(gained))}"
                                 )
                         
                             ids_text = render_ids_report(
@@ -10105,10 +10196,9 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
                 f"☣️ +{gained} био-опыт"
             )
             if first_time:
-                res_word = _ru_form(int(gained), "био-ресурс", "био-ресурса", "био-ресурсов")
                 txt += (
                     "\n\n👨‍🔬 Объект ещё не подвергался заражению вашим патогеном, поэтому каждый день, пока он заражён, "
-                    f"вы будете получать по {int(gained)} {res_word}"
+                    f"вы будете получать по {_fmt_bio_res_after_po(int(gained))}"
                 )
             _emit(txt)
             if message.chat.type in ("group", "supergroup") and _chat_has_user(message.chat.id, int(target_id)):
@@ -10462,10 +10552,9 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
                     f"🤒 Заражение на {_format_days(inf_days)}"
                 )
                 if ft:
-                    res_word = _ru_form(int(gained), "био-ресурс", "био-ресурса", "био-ресурсов")
                     notice += (
                         "\n\n👨‍🔬 Вы ещё не подвергались заражению этим патогеном, поэтому каждый день, пока вы заражены, "
-                        f"игрок будет получать по {int(gained)} {res_word}"
+                        f"игрок будет получать по {_fmt_bio_res_after_po(int(gained))}"
                     )
                 tgt_ids_lvl = int(trow["t_ids"] if trow else 1) or 1
                 if ids_should_fire(att_ids_lvl, tgt_ids_lvl):
@@ -10477,10 +10566,9 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
                         f"☣️ +{_fmt_k(int(gained))} {exp_word}"
                     )
                     if ft:
-                        res_word = _ru_form(int(gained), "био-ресурс", "био-ресурса", "био-ресурсов")
                         result_text += (
                             "\n\n👨‍🔬 Объект ещё не подвергался заражению вашим патогеном, поэтому каждый день, пока он заражён, "
-                            f"вы будете получать по {int(gained)} {res_word}"
+                            f"вы будете получать по {_fmt_bio_res_after_po(int(gained))}"
                         )
                     ids_text = render_ids_report(
                         target_id=int(tid),
@@ -10539,10 +10627,9 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
                 f"☣️ +{last_gained} {bio_word}"
             )
             if last_first_time or last_dummy:
-                res_word = _ru_form(int(last_gained), "био-ресурс", "био-ресурса", "био-ресурсов")
                 txt += (
                     "\n\n👨‍🔬 Объект ещё не подвергался заражению вашим патогеном, поэтому каждый день, пока он заражён, "
-                    f"вы будете получать по {int(last_gained)} {res_word}"
+                    f"вы будете получать по {_fmt_bio_res_after_po(int(last_gained))}"
                 )
             _emit(txt)
             return
@@ -10989,7 +11076,7 @@ def handle_lab_commands(message, parsed: Parsed):
             bot.reply_to(message, f"🏢 Текущее имя лаборатории: <b>{h(current)}</b>\nЧтобы изменить его, введите:\n <code>Био имя имя лаборатории Название</code>")
             return
 
-        new_name = parsed.args.strip()
+        new_name = re.sub(r"\s+", " ", parsed.args.strip())
         lock_row = get_name_restriction_row(int(uid))
         if lock_row and int(lock_row["lab_locked"] or 0) == 1:
             bot.reply_to(message, "📑 Возможность менять имя лаборатории ограничена. Обратитесь к агенту тех.поддержки.")
@@ -10997,8 +11084,12 @@ def handle_lab_commands(message, parsed: Parsed):
         if len(new_name) > 40:
             bot.reply_to(message, "📑 Название вашей лаборатории превышает максимальные 40 символов.")
             return
+        if is_lab_name_taken(new_name, exclude_user_id=int(uid)):
+            bot.reply_to(message, "📑 Это имя лаборатории уже занято другим пользователем.")
+            return
+
         set_lab_name(uid, new_name)
-        bot.reply_to(message, f"✅ Имя лаборатории успешно изменено!")
+        bot.reply_to(message, "✅ Имя лаборатории успешно изменено!")
         return
 
     if parsed.cmd == "pathogenname":
@@ -11008,7 +11099,7 @@ def handle_lab_commands(message, parsed: Parsed):
             bot.reply_to(message, f"🦠 Текущее имя патогена: <b>{h(current)}</b>\nЧтобы изменить его, введите:\n <code>Био имя патогена Название</code>")
             return
 
-        new_name = parsed.args.strip()
+        new_name = re.sub(r"\s+", " ", parsed.args.strip())
         lock_row = get_name_restriction_row(int(uid))
         if lock_row and int(lock_row["pat_locked"] or 0) == 1:
             bot.reply_to(message, "📑 Возможность менять имя патогена ограничена. Обратитесь к агенту тех.поддержки.")
@@ -11016,8 +11107,12 @@ def handle_lab_commands(message, parsed: Parsed):
         if len(new_name) > 40:
             bot.reply_to(message, "📑 Название вашего патогена превышает максимальные 40 символов.")
             return
+        if is_pathogen_name_taken(new_name, exclude_user_id=int(uid)):
+            bot.reply_to(message, "📑 Это имя патогена уже занято другим пользователем.")
+            return
+
         set_pathogen_name(uid, new_name)
-        bot.reply_to(message, f"✅ Имя патогена успешно изменено!")
+        bot.reply_to(message, "✅ Имя патогена успешно изменено!")
         return
 
     if parsed.cmd in ("lab", "mylab"):
