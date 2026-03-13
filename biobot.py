@@ -442,8 +442,8 @@ def autoanswer_trigger(defender_id: int, organizer_id: int, chat_id: int, reply_
     )
     org_imm = int(trow["imm"] if trow else 0)
     p_success = infect_success_chance(def_inf, org_imm)
-    roll = random.randint(1, 100)
-    if roll > p_success:
+    roll = random.random() * 100.0
+    if roll >= p_success:
         txt = (
             "🛡 [Автоответчик]:\n"
             f"❎ Не удалось заразить {org_q}: иммунитет справился с заражением"
@@ -6951,8 +6951,23 @@ INF_CHAT_FILTER_SYNONYMS = {
 def _clamp(v: int, lo: int, hi: int) -> int:
     return lo if v < lo else hi if v > hi else v
 
-def infect_success_chance(att_infect: int, tgt_imm: int) -> int:
-    return _clamp(50 + (int(att_infect) - int(tgt_imm)), 0, 100)
+def _clampf(v: float, lo: float, hi: float) -> float:
+    return lo if v < lo else hi if v > hi else v
+
+def infect_success_chance(att_infect: int, tgt_imm: int) -> float:
+    z = max(1.0, float(int(att_infect or 0)))
+    i = max(1.0, float(int(tgt_imm or 0)))
+
+    if z > i:
+        bonus = min(100.0, ((z - i) / i) * 100.0)
+        p = 50.0 + bonus
+    elif z < i:
+        malus = min(100.0, ((i - z) / z) * 100.0)
+        p = 50.0 - malus
+    else:
+        p = 50.0
+
+    return _clampf(float(p), 0.1, 99.9)
 
 def _fmt_clock_hms(ts: int) -> str:
     try:
@@ -7264,9 +7279,17 @@ def _resolve_target_from_bot_reply(message, attacker_id: int) -> Optional[int]:
 def _parse_infect_request(message, parsed: "Parsed", attacker_id: int) -> dict:
     """
     Возвращает структуру запроса.
-    kind="U": фикс-цель (reply/@/id)
-    kind="M": массовое по переменной (р/+/-/чат)
+    kind="U": фикс-цель (reply/@/id/link)
+    kind="M": массовое по переменной (р/+/-/= / чат)
     kind="NONE": нет цели (ошибка)
+
+    Для фикс-цели новый формат:
+      заразить 10 @user
+      заразить 5 123456789
+      заразить 3 https://t.me/username
+
+    Reply-формат:
+      reply + "заразить 10"
     """
     args = (parsed.args or "").strip()
     toks = args.split() if args else []
@@ -7299,32 +7322,18 @@ def _parse_infect_request(message, parsed: "Parsed", attacker_id: int) -> dict:
             flt = INF_CHAT_FILTER_SYNONYMS.get(toks[2].lower(), "n")
         return {"kind": "M", "mode": "c", "count": cnt, "filter": flt}
 
-    ref_tid = _resolve_or_create_infect_target(toks[0])
-    if ref_tid is not None:
+    if len(toks) >= 2 and toks[0].isdigit():
+        cnt = int(toks[0])
+        tid = _resolve_or_create_infect_target(toks[1])
+        if tid is not None:
+            return {"kind": "U", "target": int(tid), "token": toks[1], "count": cnt}
+
+    tid0 = _resolve_or_create_infect_target(toks[0])
+    if tid0 is not None:
         cnt = 1
         if len(toks) >= 2 and toks[1].isdigit():
             cnt = int(toks[1])
-        return {"kind": "U", "target": int(ref_tid), "token": toks[0], "count": cnt}
-
-    if toks[0].isdigit():
-        tok0 = toks[0]
-        cnt = 1
-        if len(toks) >= 2 and toks[1].isdigit():
-            cnt = int(toks[1])
-
-        if len(tok0) >= 7:
-            tid = _resolve_or_create_infect_target(tok0)
-            if tid is not None:
-                return {"kind": "U", "target": int(tid), "token": tok0, "count": cnt}
-
-        return {"kind": "NONE"}
-    
-    public_ref_tid = _resolve_or_create_infect_target(toks[0])
-    if public_ref_tid is not None:
-        cnt = 1
-        if len(toks) >= 2 and toks[1].isdigit():
-            cnt = int(toks[1])
-        return {"kind": "U", "target": int(public_ref_tid), "token": toks[0], "count": cnt}
+        return {"kind": "U", "target": int(tid0), "token": toks[0], "count": cnt}
 
     key = toks[0].lower()
     mode = INF_MODE_SYNONYMS.get(key)
@@ -9838,8 +9847,8 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
                 rand_evt_text = pick_random_event_text()
                 break
 
-            roll = random.randint(1, 100)
-            if roll > p_success:
+            roll = random.random() * 100.0
+            if roll >= p_success:
                 immune_fail += 1
                 continue
             if roll <= p_success:
@@ -10050,27 +10059,6 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
                 "📋 Отчёт об операции заражения объекта:\n"
                 f"Использовано патогенов: {used}\n\n"
             )
-
-        if not success:
-            with DB_LOCK:
-                c = conn.cursor()
-                try:
-                    c.execute("BEGIN")
-                    c.execute(
-                        "UPDATE labs SET ready_pathogens=CASE WHEN COALESCE(ready_pathogens,0) >= ? "
-                        "THEN ready_pathogens-? ELSE 0 END "
-                        "WHERE user_id=?",
-                        (used, used, attacker_id)
-                    )
-                    conn.commit()
-                except Exception:
-                    conn.rollback()
-                    raise
-                finally:
-                    try:
-                        c.close()
-                    except Exception:
-                        pass
         
         if rand_evt:
             rem_row = db_one("SELECT COALESCE(ready_pathogens,0) AS rp FROM labs WHERE user_id=?", (attacker_id,))
@@ -10329,9 +10317,9 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
             continue
         
         last_evt = False
-        roll = random.randint(1, 100)
+        roll = random.random() * 100.0
 
-        if roll > p_success:
+        if roll >= p_success:
             fail += 1
             last_tid = int(tid)
             last_success = False
@@ -11934,7 +11922,7 @@ def _parse_inline_infect_query(query: str):
     if not raw:
         return None
 
-    pref_tid, pref_tok, pref_tail = _inline_strip_target_prefix(raw)
+    pref_tid, _pref_tok, pref_tail = _inline_strip_target_prefix(raw)
     if pref_tid is not None:
         if not pref_tail:
             return {"kind": "U", "target": int(pref_tid), "count": 1}
