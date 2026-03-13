@@ -5720,8 +5720,9 @@ def handle_help_command(message):
 def handle_commands_link(message):
     bot.reply_to(
         message,
-        f"📑 Список <a href={h(URL_COMMANDS)}>команд бота</a>",
-        parse_mode="HTML"
+        f'📑 Список <a href="{h(URL_COMMANDS)}">команд бота</a>',
+        parse_mode="HTML",
+        disable_web_page_preview=False
     )
 
 def handle_agents_panel_command(message):
