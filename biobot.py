@@ -3640,30 +3640,15 @@ def _top_user_rows_chat(chat_id: int, limit: int):
 def _top_disease_rows(limit: int):
     return db_all(
         "SELECT "
-        "  CASE "
-        "    WHEN COALESCE(NULLIF(TRIM(la.pathogen_name),''), '') <> '' "
-        "      THEN MIN(TRIM(la.pathogen_name)) "
-        "    ELSE 'неизвестный патоген' "
-        "  END AS pname, "
-        "  CASE "
-        "    WHEN COALESCE(NULLIF(TRIM(la.pathogen_name),''), '') <> '' "
-        "      THEN 0 ELSE 1 "
-        "  END AS is_unknown, "
-        "  i.attacker_id AS owner_id, "
-        "  MIN(COALESCE(u.username,'')) AS owner_username, "
-        "  MIN(COALESCE(u.first_name,'')) AS owner_first_name, "
-        "  MIN(COALESCE(u.last_name,'')) AS owner_last_name, "
-        "  COUNT(*) AS sick "
-        "FROM infections i "
-        "LEFT JOIN labs la ON la.user_id=i.attacker_id "
-        "LEFT JOIN users u ON u.user_id=i.attacker_id "
-        "GROUP BY i.attacker_id, "
-        "  CASE "
-        "    WHEN COALESCE(NULLIF(TRIM(la.pathogen_name),''), '') <> '' "
-        "      THEN lower(TRIM(la.pathogen_name)) "
-        "    ELSE 'unknown' "
-        "  END "
-        "ORDER BY sick DESC, pname COLLATE NOCASE ASC, owner_id ASC "
+        "l.user_id, "
+        "COALESCE(l.infected_total,0) AS sick, "
+        "COALESCE(l.pathogen_name,'') AS pname, "
+        "u.username, u.first_name, u.last_name "
+        "FROM labs l "
+        "LEFT JOIN users u ON u.user_id=l.user_id "
+        "WHERE COALESCE(l.lab_active,0)=1 "
+        "AND COALESCE(l.infected_total,0) > 0 "
+        "ORDER BY sick DESC, l.user_id ASC "
         "LIMIT ?",
         (int(limit),)
     ) or []
@@ -3671,33 +3656,17 @@ def _top_disease_rows(limit: int):
 def _top_disease_rows_chat(chat_id: int, limit: int):
     return db_all(
         "SELECT "
-        "  CASE "
-        "    WHEN COALESCE(NULLIF(TRIM(la.pathogen_name),''), '') <> '' "
-        "      THEN MIN(TRIM(la.pathogen_name)) "
-        "    ELSE 'неизвестный патоген' "
-        "  END AS pname, "
-        "  CASE "
-        "    WHEN COALESCE(NULLIF(TRIM(la.pathogen_name),''), '') <> '' "
-        "      THEN 0 ELSE 1 "
-        "  END AS is_unknown, "
-        "  i.attacker_id AS owner_id, "
-        "  MIN(COALESCE(u.username,'')) AS owner_username, "
-        "  MIN(COALESCE(u.first_name,'')) AS owner_first_name, "
-        "  MIN(COALESCE(u.last_name,'')) AS owner_last_name, "
-        "  COUNT(*) AS sick "
-        "FROM infections i "
-        "JOIN chat_members cm ON cm.user_id=i.target_id AND cm.chat_id=? "
-        "JOIN labs lt ON lt.user_id=i.target_id "
-        "LEFT JOIN labs la ON la.user_id=i.attacker_id "
-        "LEFT JOIN users u ON u.user_id=i.attacker_id "
-        "WHERE COALESCE(lt.lab_active,0)=1 "
-        "GROUP BY i.attacker_id, "
-        "  CASE "
-        "    WHEN COALESCE(NULLIF(TRIM(la.pathogen_name),''), '') <> '' "
-        "      THEN lower(TRIM(la.pathogen_name)) "
-        "    ELSE 'unknown' "
-        "  END "
-        "ORDER BY sick DESC, pname COLLATE NOCASE ASC, owner_id ASC "
+        "l.user_id, "
+        "COALESCE(l.infected_total,0) AS sick, "
+        "COALESCE(l.pathogen_name,'') AS pname, "
+        "u.username, u.first_name, u.last_name "
+        "FROM chat_members cm "
+        "JOIN labs l ON l.user_id=cm.user_id "
+        "LEFT JOIN users u ON u.user_id=l.user_id "
+        "WHERE cm.chat_id=? "
+        "AND COALESCE(l.lab_active,0)=1 "
+        "AND COALESCE(l.infected_total,0) > 0 "
+        "ORDER BY sick DESC, l.user_id ASC "
         "LIMIT ?",
         (int(chat_id), int(limit))
     ) or []
@@ -3761,8 +3730,9 @@ def render_top_diseases(limit: int, chat_id: int = 0) -> tuple[str, InlineKeyboa
 
     lines.append("<blockquote expandable>")
     for i, r in enumerate(rows, 1):
-        pname = (r["pname"] or "").strip() or "неизвестный патоген"
-        lines.append(f"{i}. {h(pname)} | {_fmt_k(int(r['sick'] or 0))} бол")
+        pname = (r["pname"] or "").strip()
+        shown_name = f"«{h(pname)}»" if pname else "неизвестный патоген"
+        lines.append(f"{i}. {shown_name} | {_fmt_k(int(r['sick'] or 0))} бол")
     lines.append("</blockquote>")
     return "\n".join(lines), kb_top_switch("D", int(chat_id), int(limit))
 
