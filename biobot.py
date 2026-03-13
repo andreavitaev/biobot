@@ -6995,7 +6995,12 @@ SYNTH_COOLDOWN_SEC = 4 * 3600 # синтезация кулдаун
 FEVER_SEC = 60                 # горячка 1 мин
 INF_DAY = 1                    # заражение период 1 день
 MAX_FEVER_SEC = 3 * 3600  # максимум горячки 3 часа
-VACCINE_PRICE = 1500 # цена вакцины
+
+VACCINE_PRICE_BASE = 50
+VACCINE_PRICE_STEP = 50
+VACCINE_PRICE_EVERY_AVG_LVLS = 20
+VACCINE_PRICE_MAX = 2500
+
 INF_DURATION_SEC = INF_DAY * 86400 # таймер заражения
 FEVER_MAX_SEC = 3 * 3600  # максимум горячки 3 часа
 REINFECT_CD_SEC = 6 * 3600     # перезаражение 6 часов
@@ -7579,8 +7584,11 @@ def _level_price(n1: int, level: int) -> int:
     level = int(level)
     if level <= 1:
         return 0
-    add = (level + 1) * level * (level - 1) * (level - 2) // 24
-    return int(n1) + int(add)
+    k = int(level) - 1
+    base = int(n1)
+    a = 2 * base + 6
+    b = base - 3
+    return int(base + a * (k - 1) + b * ((k - 1) * k) // 2)
 
 def _upgrade_cost(n1: int, cur_level: int, steps: int) -> int:
     cur_level = int(cur_level)
@@ -7601,6 +7609,36 @@ def _calc_cost_range(n1: int, from_level: int, to_level: int) -> int:
     for lvl in range(from_level + 1, to_level + 1):
         total += _level_price(n1, lvl)
     return int(total)
+
+def _avg_skill_level(uid: int) -> float:
+    ensure_lab_exists(int(uid))
+
+    cols = [
+        "infectivity", "lethality", "heaviness", "immunity",
+        "reaction", "ids", "ips", "acceleration",
+        "total_pathogens", "total_vaccines",
+    ]
+
+    select_sql = ", ".join([f"COALESCE({c},1) AS {c}" for c in cols])
+    row = db_one(f"SELECT {select_sql} FROM labs WHERE user_id=?", (int(uid),))
+
+    if not row:
+        return 1.0
+
+    vals = []
+    for c in cols:
+        try:
+            vals.append(max(1, int(row[c] or 1)))
+        except Exception:
+            vals.append(1)
+
+    return float(sum(vals)) / float(len(vals))
+
+def get_vaccine_price(uid: int) -> int:
+    avg_lvl = _avg_skill_level(int(uid))
+    add_steps = int(avg_lvl // VACCINE_PRICE_EVERY_AVG_LVLS)
+    price = VACCINE_PRICE_BASE + add_steps * VACCINE_PRICE_STEP
+    return min(int(price), int(VACCINE_PRICE_MAX))
 
 def _resolve_skill(token: str) -> Optional[str]:
     t = (token or "").strip().lower()
@@ -8211,7 +8249,7 @@ def try_buy_vaccine(user_id: int) -> tuple[str, int, int]:
             res = int(row["r"] if row else 0)
             mat = int(row["m"] if row else 0)
 
-            need = VACCINE_PRICE
+            need = get_vaccine_price(uid)
             spent_res = 0
             spent_mat = 0
 
@@ -8718,7 +8756,7 @@ def cb_use_vaccine(cq):
                 text = VACCINE_FAIL_TEXT
                 rm = kb_vaccine_retry()
             elif status == "NO_VACCINE":
-                price_txt = _fmt_bio_res(VACCINE_PRICE)
+                price_txt = _fmt_bio_res(get_vaccine_price(uid))
                 text = (
                     "💉 Сейчас у вас нет ни одной вакцины. Для быстрого выздоровления вы можете купить вакцину: "
                     f"{price_txt}, команда <code>Био купить вакцину</code>"
@@ -8786,7 +8824,7 @@ def cb_use_vaccine_x(cq):
                 text = prefix + VACCINE_FAIL_TEXT
                 rm = kb_vaccine_retry()
             elif status == "NO_VACCINE":
-                price_txt = _fmt_bio_res(VACCINE_PRICE)
+                price_txt = _fmt_bio_res(get_vaccine_price(uid))
                 text = prefix + (
                     "💉 Сейчас у вас нет ни одной вакцины. Для быстрого выздоровления вы можете купить вакцину: "
                     f"{price_txt}, команда <code>Био купить вакцину</code>"
@@ -9757,7 +9795,7 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
                 reply_markup=kb
             )
         else:
-            price_txt = _fmt_bio_res(VACCINE_PRICE)
+            price_txt = _fmt_bio_res(get_vaccine_price(attacker_id))
             kb = InlineKeyboardMarkup()
             kb.add(InlineKeyboardButton("💉 Купить вакцину", callback_data=CB_BUY_VACCINE, style="primary"))
             _emit(
@@ -12496,7 +12534,7 @@ def text_router(message):
             elif status == "FAIL":
                 bot.reply_to(message, VACCINE_FAIL_TEXT, disable_web_page_preview=True, reply_markup=kb_vaccine_retry())
             elif status == "NO_VACCINE":
-                price_txt = _fmt_bio_res(VACCINE_PRICE)
+                price_txt = _fmt_bio_res(get_vaccine_price(uid))
                 kb = InlineKeyboardMarkup()
                 kb.add(InlineKeyboardButton("💉 Купить вакцину", callback_data=CB_BUY_VACCINE, style="primary"))
                 bot.reply_to(
