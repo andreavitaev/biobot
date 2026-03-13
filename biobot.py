@@ -5111,6 +5111,15 @@ def sync_chat_admins(chat_id: int):
         except Exception:
             pass
 
+def _known_chat_member_count(chat_id: int, exclude_user_id: int = 0) -> int:
+    row = db_one(
+        "SELECT COUNT(*) AS c "
+        "FROM chat_members "
+        "WHERE chat_id=? AND user_id>0 AND user_id<>?",
+        (int(chat_id), int(exclude_user_id))
+    )
+    return int(row["c"] or 0) if row else 0
+
 def capture_user_context(message, tg_user):
     """
     Универсально: фиксируем пользователя в users,
@@ -7175,6 +7184,7 @@ def _pick_target_from_db(attacker_id: int, mode: str, chat_id: int, chat_filter:
     if mode == "c":
         if chat_id == 0:
             return None
+        sync_chat_admins(int(chat_id))
 
         att_exp_row = db_one("SELECT COALESCE(bio_exp,0) AS e FROM labs WHERE user_id=?", (int(attacker_id),))
         att_exp = int(att_exp_row["e"] if att_exp_row else 0)
@@ -7184,7 +7194,7 @@ def _pick_target_from_db(attacker_id: int, mode: str, chat_id: int, chat_filter:
             "FROM chat_members cm "
             "LEFT JOIN labs l ON l.user_id = cm.user_id "
             "LEFT JOIN infection_cooldowns ic ON ic.attacker_id=? AND ic.target_id=cm.user_id "
-            "WHERE cm.chat_id=? AND cm.user_id!=? "
+            "WHERE cm.chat_id=? AND cm.user_id!=? AND cm.user_id>0 "
             "AND (ic.until_ts IS NULL OR ic.until_ts<=?)"
         )
         params = [int(attacker_id), int(chat_id), int(attacker_id), int(now)]
@@ -10586,7 +10596,18 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
             pass
 
     if used <= 0:
-        _emit("📑 Цель для заражения не найдена.")
+        if mode == "c":
+            known_cnt = _known_chat_member_count(int(chat_id), int(attacker_id))
+            if known_cnt <= 0:
+                _emit(
+                    "📑 Бот пока не знает участников этого чата для команды <code>заразить чат</code>.\n\n"
+                    "d связи с ограничениями Telegram Bot API.\n"
+                    "💬 Для большей эффективности в запоминании новых пользователей, рекомаендую использовать команду <code>заразить</code> в ответ на сообщение другого игрока."
+                )
+            else:
+                _emit("📑 Подходящая цель в этом чате не найдена.")
+        else:
+            _emit("📑 Цель для заражения не найдена.")
         return
     
     if cnt == 1 and used == 1:
