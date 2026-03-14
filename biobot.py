@@ -10245,7 +10245,7 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
         if success:
             txt = (
                 header +
-                f"🦠 {attacker_tag} подверг заражению {pat_txt} {target_tag}\n"
+                f"🦠 {attacker_tag} подверг заражению {_pat_for_text((pathogen_name or '').strip())} {target_tag}\n"
                 f"☠️ Горячка на {_format_hm_from_seconds(fever_add)}\n"
                 f"🤒 Заражение на {_format_days(inf_days)}\n"
                 f"☣️ +{gained} био-опыт"
