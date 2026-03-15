@@ -7406,45 +7406,52 @@ INF_CHAT_FILTER_SYNONYMS = {
     "=": "e", "равный": "e",
 }
 
-def _clamp(v: int, lo: int, hi: int) -> int:
-    return lo if v < lo else hi if v > hi else v
-
-def _clampf(v: float, lo: float, hi: float) -> float:
-    return lo if v < lo else hi if v > hi else v
+# коэфициент кривизны
+INFECT_BOUND_K = 0.7
 
 def infect_success_chance(att_infect: int, tgt_imm: int) -> float:
     """
-      M = max(Z, I)
-      Pmin(M) = 0.1 + 9.9 / M
-      Pmax(M) = 99.9 - 9.9 / M
-      D = min(100, |Z - I| / min(Z, I) * 100)
+        N = max(Z, I)
+        M = min(Z, I)
+        r = min(1, |Z - I| / M)
 
-      если Z > I:
-          Pусп = min(Pmax(M), 50 + D)
-      если Z = I:
-          Pусп = 50
-      если Z < I:
-          Pусп = max(Pmin(M), 50 - D)
+        Pmin = 0.1 + 9.9 / sqrt(N)
+        Pmax = 99.9 - 9.9 / sqrt(N)
 
-      Pпров = 100 - Pусп
+        если Z > I:
+            Pусп = 50 + r * (Pmax - 50)
+        если Z = I:
+            Pусп = 50
+        если Z < I:
+            Pусп = 50 - r * (50 - Pmin)
     """
     z = max(1.0, float(int(att_infect or 0)))
     i = max(1.0, float(int(tgt_imm or 0)))
 
-    m = max(z, i)
-    mn = min(z, i)
+    n = max(z, i)
+    m = min(z, i)
+    k = float(INFECT_BOUND_K)
 
-    p_min = 0.1 + (9.9 / m)
-    p_max = 99.9 - (9.9 / m)
+    denom = pow(n, k)
+    if denom <= 0:
+        denom = 1.0
 
-    d = min(100.0, (abs(z - i) / mn) * 100.0)
+    p_min = 0.1 + 19.9 / denom
+    p_max = 99.9 - 19.9 / denom
+
+    r = min(1.0, abs(z - i) / m)
 
     if z > i:
-        p = min(p_max, 50.0 + d)
+        p = 50.0 + r * (p_max - 50.0)
     elif z < i:
-        p = max(p_min, 50.0 - d)
+        p = 50.0 - r * (50.0 - p_min)
     else:
         p = 50.0
+
+    if p < 0.1:
+        p = 0.1
+    elif p > 99.9:
+        p = 99.9
 
     return float(p)
 
