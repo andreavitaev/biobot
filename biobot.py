@@ -87,6 +87,11 @@ os.makedirs(DATA_DIR, exist_ok=True)
 RANDOM_EVENTS_PATH = os.path.join(DATA_DIR, "random_events.txt")
 _RANDOM_EVENTS_CACHE: Optional[list[str]] = None
 
+# RP actions
+RP_ACTIONS_PATH = os.path.join(DATA_DIR, "rp_actions.txt")
+_RP_ACTIONS_CACHE: Optional[dict] = None
+_RP_ACTIONS_CACHE_MTIME: float = -1.0
+
 def load_random_events() -> list[str]:
     global _RANDOM_EVENTS_CACHE
     if _RANDOM_EVENTS_CACHE is not None:
@@ -115,6 +120,93 @@ def pick_random_event_text() -> str:
         return random.choice(items)
     except Exception:
         return "Произошёл непредвиденный сбой во время операции."
+
+def _split_stat_tail(tail: str) -> tuple[str, str]:
+    s = (tail or "").strip()
+    if not s:
+        return "", ""
+
+    if "|" in s:
+        parts = [x.strip() for x in s.split("|")]
+        if len(parts) >= 2:
+            return parts[0], parts[1]
+        return parts[0], ""
+
+    for sep in (" / ", " ; ", " — ", " - "):
+        if sep in s:
+            a, b = s.split(sep, 1)
+            return a.strip(), b.strip()
+
+    return s.strip(), ""
+
+def load_rp_actions() -> dict:
+    global _RP_ACTIONS_CACHE, _RP_ACTIONS_CACHE_MTIME
+
+    try:
+        mtime = float(os.path.getmtime(RP_ACTIONS_PATH))
+    except Exception:
+        mtime = -1.0
+
+    if _RP_ACTIONS_CACHE is not None and mtime == _RP_ACTIONS_CACHE_MTIME:
+        return _RP_ACTIONS_CACHE
+
+    out = {}
+    try:
+        with open(RP_ACTIONS_PATH, "r", encoding="utf-8") as f:
+            for raw in f:
+                s = (raw or "").strip()
+                if not s or s.startswith("#"):
+                    continue
+
+                main = s
+                stat1 = ""
+                stat2 = ""
+
+                if "|" in s:
+                    parts = s.split("|")
+                    main = parts[0].strip()
+                    if len(parts) >= 2:
+                        if len(parts) >= 3:
+                            stat1 = parts[1].strip()
+                            stat2 = parts[2].strip()
+                        else:
+                            stat1, stat2 = _split_stat_tail(parts[1].strip())
+
+                m = re.match(
+                    r"^(?P<emoji>\S+):(?P<premium>\S+)\s+(?P<trigger>\S+)\s+(?P<action>.+)$",
+                    main,
+                    flags=re.UNICODE
+                )
+                if not m:
+                    continue
+
+                emoji = m.group("emoji").strip()
+                premium_id = m.group("premium").strip()
+                trigger = m.group("trigger").strip()
+                action_text = m.group("action").strip()
+
+                if not trigger or not action_text:
+                    continue
+
+                key = trigger.lower()
+                out[key] = {
+                    "emoji": emoji,
+                    "premium_id": premium_id,
+                    "trigger": trigger,
+                    "trigger_key": key,
+                    "action_text": action_text,
+                    "stat1": stat1.strip(),
+                    "stat2": stat2.strip(),
+                }
+    except Exception:
+        out = {}
+
+    _RP_ACTIONS_CACHE = out
+    _RP_ACTIONS_CACHE_MTIME = mtime
+    return out
+
+def get_rp_action(trigger: str):
+    return load_rp_actions().get((trigger or "").strip().lower())
 
 def random_event_pct(qualification_level: int) -> float:
     try:
@@ -286,7 +378,8 @@ def render_autoanswer_status(uid: int) -> str:
         "Функция ответного заражения\n\n"
         f"Статус: {status_icon}\n"
         f"✅Доступно авто-ответов: {avail}\n"
-        f"⏱️Сбросится через {_format_hm_from_seconds(left)}"
+        f"⏱️Сбросится через {_format_hm_from_seconds(left)}\n\n"
+        "💬Для увеличения лимита автоответов, используйте команду <code>Био +предотвращение</code>"
     )
 
 def _auto_mark_used_report(uid: int, chat_id: int, msg_id: int) -> bool:
@@ -777,8 +870,10 @@ PREMIUM_EMOJI_IDS: Dict[str, str] = {
     "🏷️": "5255806717689631058",
     "✉️": "",
     "📑": "",
-    "📋": "",
+    "📋": "5197269100878907942",
+    "🧾": "5444860552310457690",
     "📝": "5334882760735598374",
+    "📊": "5431577498364158238",
     "✅": "5260416304224936047",
     "❌": "5260342697075416641",
     "⚠️": "5447381715293074599",
@@ -1891,6 +1986,27 @@ def init_db():
         username  TEXT,
         last_seen INTEGER NOT NULL,
         PRIMARY KEY(chat_id, user_id)
+    );
+    """, commit=True)
+
+    db_exec("""
+    CREATE TABLE IF NOT EXISTS rp_offers (
+        offer_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+        actor_id     INTEGER NOT NULL,
+        action_key   TEXT NOT NULL,
+        target_id    INTEGER NOT NULL DEFAULT 0,
+        status       TEXT NOT NULL DEFAULT 'pending',
+        created_at   INTEGER NOT NULL DEFAULT 0
+    );
+    """, commit=True)
+
+    db_exec("""
+    CREATE TABLE IF NOT EXISTS rp_events (
+        event_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+        action_key    TEXT NOT NULL,
+        actor_id      INTEGER NOT NULL,
+        target_id     INTEGER NOT NULL,
+        created_at    INTEGER NOT NULL DEFAULT 0
     );
     """, commit=True)
 
@@ -3942,11 +4058,132 @@ def public_user_tag(user_id: int) -> str:
 
     return "неизвестный пользователь"
 
+def rp_premium_emoji_html(emoji: str, premium_id: str) -> str:
+    emo = str(emoji or "")
+    pid = str(premium_id or "").strip()
+    if PREMIUM_EMOJI_ENABLED and pid:
+        return f'<tg-emoji emoji-id="{h(pid)}">{h(emo)}</tg-emoji>'
+    return h(emo)
+
+def _rp_actor_tag(user_obj) -> str:
+    uid = int(user_obj.id)
+    un = (getattr(user_obj, "username", None) or "").strip()
+    disp = display_name(
+        getattr(user_obj, "first_name", "") or "",
+        getattr(user_obj, "last_name", "") or "",
+        un,
+        uid
+    )
+    return tg_mention(uid, disp, username=un)
+
+def resolve_rp_target(message, actor_id: int, args_text: str):
+    if message.reply_to_message:
+        if getattr(message.reply_to_message, "from_user", None):
+            u = message.reply_to_message.from_user
+            if not bool(getattr(u, "is_bot", False)):
+                capture_user_context(message, u)
+                return int(u.id), u
+
+        tid = _resolve_target_from_bot_reply(message, int(actor_id))
+        if tid is not None:
+            return int(tid), None
+
+    token = (args_text or "").strip().split()[0] if (args_text or "").strip() else ""
+    if not token:
+        return None, None
+
+    tid = _resolve_or_create_infect_target(token)
+    if tid is not None:
+        return int(tid), None
+
+    return None, None
+
+def _parse_rp_message(text: str):
+    raw = strip_bio_prefix((text or "").strip())
+    if not raw:
+        return None, ""
+
+    first, _, _ = raw.partition("\n")
+    parts = first.strip().split(None, 1)
+    if not parts:
+        return None, ""
+
+    action = get_rp_action(parts[0])
+    if not action:
+        return None, ""
+
+    tail = parts[1].strip() if len(parts) > 1 else ""
+    return action, tail
+
+def _rp_emit_action_text(action: dict, actor_tag: str, target_tag: str) -> str:
+    emo = rp_premium_emoji_html(action["emoji"], action["premium_id"])
+    return f"{emo}| {actor_tag} {h(action['action_text'])} {target_tag}"
+
+def _rp_insert_event(action_key: str, actor_id: int, target_id: int):
+    db_exec(
+        "INSERT INTO rp_events(action_key, actor_id, target_id, created_at) VALUES (?,?,?,?)",
+        (str(action_key), int(actor_id), int(target_id), int(now_ts())),
+        commit=True
+    )
+
+def render_rp_stats_text(uid: int) -> str:
+    actions = load_rp_actions()
+
+    lines = ["🧾 Чеклист"]
+    added = False
+
+    for key, action in actions.items():
+        stat1 = (action.get("stat1") or "").strip()
+        stat2 = (action.get("stat2") or "").strip()
+
+        if not stat1 and not stat2:
+            continue
+
+        emo = rp_premium_emoji_html(action["emoji"], action["premium_id"])
+
+        if stat1:
+            row = db_one(
+                "SELECT COUNT(*) AS c FROM rp_events WHERE action_key=? AND actor_id=?",
+                (str(key), int(uid))
+            )
+            cnt = int(row["c"] or 0) if row else 0
+            lines.append(f"{emo}| {h(stat1)}: {cnt}")
+            added = True
+
+        if stat2:
+            row = db_one(
+                "SELECT COUNT(*) AS c FROM rp_events WHERE action_key=? AND target_id=?",
+                (str(key), int(uid))
+            )
+            cnt = int(row["c"] or 0) if row else 0
+            lines.append(f"{emo}| {h(stat2)}: {cnt}")
+            added = True
+
+    if not added:
+        lines.append("<blockquote>Нет данных.</blockquote>")
+
+    return "\n".join(lines)
+
+def _create_rp_offer(actor_id: int, action_key: str) -> int:
+    with DB_LOCK:
+        c = conn.cursor()
+        try:
+            c.execute(
+                "INSERT INTO rp_offers(actor_id, action_key, target_id, status, created_at) VALUES (?,?,?,?,?)",
+                (int(actor_id), str(action_key), 0, "pending", int(now_ts()))
+            )
+            conn.commit()
+            return int(c.lastrowid)
+        finally:
+            try:
+                c.close()
+            except Exception:
+                pass
+
 def _merge_placeholder_to_real_user(tg_user):
     real_uid = int(tg_user.id)
     uname = ((getattr(tg_user, "username", None) or "").strip().lower())
 
-    # positive uid-placeholder: просто снимаем флаг
     db_exec("UPDATE users SET is_placeholder=0 WHERE user_id=?", (real_uid,), commit=True)
 
     if not uname:
@@ -4340,8 +4577,8 @@ def build_agents_panel_text(user_id: int) -> str:
     lines.append("/bot_ban — заблокировать пользователя")
     lines.append("/bot_unban — разблокировать пользователя")
     lines.append("/remake_lab — восстановить лабораторию")
-    lines.append("/+lab_name | /-lab_name — разрешает/запрещает имена лаборатории для пользователя")
-    lines.append("/+pat_name | /-pat_name — разрешает/запрещает имена патогена для пользователя")
+    lines.append("<code>/+lab_name</code> | <code>/-lab_name</code> — разрешает/запрещает имена лаборатории для пользователя")
+    lines.append("<code>/+pat_name</code> | <code>/-pat_name</code> — разрешает/запрещает имена патогена для пользователя")
     lines.append("/blacklist — список пользователей с ограничениями")
 
     return "\n".join(lines)
@@ -5360,6 +5597,9 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
     if low in ("команды", "commands"):
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="commands_link", args="")
 
+    if low in ("рпстат", "рпстата", "рп стата"):
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="rp_stats", args="")
+
     # агент команды
     if low == "bot_ban" or low.startswith("bot_ban "):
         rest = ""
@@ -5431,12 +5671,26 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="autoanswer_status", args="")
 
     # калькулятор
-    if low == "к" or low == "калькулятор":
-        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="calc", args="")
+    if low in ("к", "калькулятор", "ку", "кпк", "кш", "кпц"):
+        calc_cmd = "calc"
+        if low in ("ку", "кпк"):
+            calc_cmd = "calc_upg"
+        elif low in ("кш", "кпц"):
+            calc_cmd = "calc_chance"
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd=calc_cmd, args="")
+
     if low.startswith("калькулятор "):
-        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="calc", args=low.split(" ", 1)[1].strip())
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="calc", args=t.split(" ", 1)[1].strip())
     if low.startswith("к "):
-        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="calc", args=low.split(" ", 1)[1].strip())
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="calc", args=t.split(" ", 1)[1].strip())
+    if low.startswith("ку "):
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="calc_upg", args=t.split(" ", 1)[1].strip())
+    if low.startswith("кпк "):
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="calc_upg", args=t.split(" ", 1)[1].strip())
+    if low.startswith("кш "):
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="calc_chance", args=t.split(" ", 1)[1].strip())
+    if low.startswith("кпц "):
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="calc_chance", args=t.split(" ", 1)[1].strip())
 
     # заразить
     if low == "заразить" or low.startswith("заразить "):
@@ -5792,6 +6046,49 @@ def handle_commands_link(message):
         parse_mode="HTML",
         disable_web_page_preview=False
     )
+
+def handle_rp_stats_command(message):
+    uid = int(message.from_user.id)
+    upsert_user(message.from_user)
+    bot.reply_to(
+        message,
+        render_rp_stats_text(uid),
+        parse_mode="HTML",
+        disable_web_page_preview=True
+    )
+
+def try_handle_rp_action_message(message) -> bool:
+    actor = getattr(message, "from_user", None)
+    if actor is None:
+        return False
+
+    action, tail = _parse_rp_message(message.text or "")
+    if not action:
+        return False
+
+    actor_id = int(actor.id)
+    upsert_user(actor)
+
+    target_id, target_user_obj = resolve_rp_target(message, actor_id, tail)
+    if target_id is None:
+        return False
+
+    if target_user_obj is not None:
+        capture_user_context(message, target_user_obj)
+
+    actor_tag = _rp_actor_tag(actor)
+    target_tag = public_user_tag(int(target_id))
+    text = _rp_emit_action_text(action, actor_tag, target_tag)
+
+    bot.reply_to(
+        message,
+        text,
+        parse_mode="HTML",
+        disable_web_page_preview=True
+    )
+
+    _rp_insert_event(action["trigger_key"], int(actor_id), int(target_id))
+    return True
 
 def handle_agents_panel_command(message):
     if message.chat.type != "private":
@@ -6315,23 +6612,16 @@ def render_lab_infected_list(owner_id: int) -> str:
         tid = int(r["target_id"])
 
         if tid < 0:
-            add = "1"
+            add = 1
         else:
             add = int(r["add_bio_res"] or 0)
-        
+
         end_ts = int(r["end_ts"] or 0)
         until = _fmt_date_ddmmyy(end_ts)
 
-        u = get_user_row(tid)
-        disp = display_name(u["first_name"] or "", u["last_name"] or "", u["username"] or "", tid) if u else str(tid)
-        un = (u["username"] or "") if u else ""
-        if tid < 0:
-            name = "неизвестный пользователь"
-        else:
-            name = tg_mention(tid, disp, username=un)
-
-        res_word = _ru_form(add, "био-ресурс", "био-ресурса", "био-ресурсов")
-        items.append(f"{i}. {name} | 🧬 {add} {res_word} | до {until}")
+        name = public_user_tag(int(tid))
+        res_word = _ru_form(int(add), "био-ресурс", "био-ресурса", "био-ресурсов")
+        items.append(f"{i}. {name} | 🧬 {int(add)} {res_word} | до {until}")
 
     lines.append("<blockquote expandable>")
     lines.extend(items)
@@ -7017,6 +7307,8 @@ CB_CORP_REQ_APPROVE = "corp:req:ok"
 CB_CORP_REQ_REJECT = "corp:req:no"
 CB_CORP_INV_ACCEPT = "corp:inv:ok"
 CB_CORP_INV_REJECT = "corp:inv:no"
+CB_RP_ACCEPT = "rp:ok"
+CB_RP_DECLINE = "rp:no"
 #            callback_data
 LABUI_TAG = "L"   
 BALUI_TAG = "C"
@@ -7027,6 +7319,7 @@ TOPUI_TAG = "T"
 SETUI_TAG = "W"
 REPORTUI_TAG = "Y"
 BLUI_TAG = "K"
+RPUI_TAG = "RP"
 
 # хендлеры и хэлперы
 #           report
@@ -7060,19 +7353,40 @@ def _clampf(v: float, lo: float, hi: float) -> float:
     return lo if v < lo else hi if v > hi else v
 
 def infect_success_chance(att_infect: int, tgt_imm: int) -> float:
+    """
+      M = max(Z, I)
+      Pmin(M) = 0.1 + 9.9 / M
+      Pmax(M) = 99.9 - 9.9 / M
+      D = min(100, |Z - I| / min(Z, I) * 100)
+
+      если Z > I:
+          Pусп = min(Pmax(M), 50 + D)
+      если Z = I:
+          Pусп = 50
+      если Z < I:
+          Pусп = max(Pmin(M), 50 - D)
+
+      Pпров = 100 - Pусп
+    """
     z = max(1.0, float(int(att_infect or 0)))
     i = max(1.0, float(int(tgt_imm or 0)))
 
+    m = max(z, i)
+    mn = min(z, i)
+
+    p_min = 0.1 + (9.9 / m)
+    p_max = 99.9 - (9.9 / m)
+
+    d = min(100.0, (abs(z - i) / mn) * 100.0)
+
     if z > i:
-        bonus = min(100.0, ((z - i) / i) * 100.0)
-        p = 50.0 + bonus
+        p = min(p_max, 50.0 + d)
     elif z < i:
-        malus = min(100.0, ((i - z) / z) * 100.0)
-        p = 50.0 - malus
+        p = max(p_min, 50.0 - d)
     else:
         p = 50.0
 
-    return _clampf(float(p), 0.1, 99.9)
+    return float(p)
 
 def _fmt_clock_hms(ts: int) -> str:
     try:
@@ -7759,9 +8073,15 @@ def _build_upgrade_preview(uid: int, code: str, steps: int) -> str:
         bv, _ = _craft_params(VACCINE_CRAFT_SEC, VACCINE_MIN_SEC, cur)
         av, _ = _craft_params(VACCINE_CRAFT_SEC, VACCINE_MIN_SEC, final_lvl)
         if bp != ap:
-            extra_lines += f"🧪: {_format_hms(bp)} → {_format_hms(ap)}\n"
+            extra_lines += f"🧪 Время произв.: {_format_hms(bp)} → {_format_hms(ap)}\n"
         if bv != av:
-            extra_lines += f"💉: {_format_hms(bv)} → {_format_hms(av)}\n"
+            extra_lines += f"💉 Время произв.: {_format_hms(bv)} → {_format_hms(av)}\n"
+
+    if code == "LET":
+        bfev = _calc_fever_sec(cur)
+        afev = _calc_fever_sec(final_lvl)
+        if bfev != afev and afev < FEVER_MAX_SEC and bfev < FEVER_MAX_SEC:
+            extra_lines += f"🌡️ Горячка: {_format_hm_from_seconds(bfev)} → {_format_hm_from_seconds(afev)}\n"
 
     return (
         f"{skill['emoji']} {h(skill['title_1'])} на {steps} ур ({final_lvl})\n"
@@ -7870,38 +8190,406 @@ def handle_upgrade_command(message, parsed: Parsed, edit_ctx: Optional[dict] = N
     else:
         _emit(txt, reply_markup=None)
 
+CALC_UPGRADE_MODE_ALIASES = {"улучшение", "улучш", "у", "прокачка", "прокач", "пк"}
+CALC_CHANCE_MODE_ALIASES = {"шанс", "шансы", "ш", "проценты", "процент", "проц", "пц"}
+
+CALC_CHANCE_METRIC_ALIASES = {
+    "заражения": "INFECT", "зар": "INFECT",
+    "обнаружения": "IDS", "обн": "IDS", "ids": "IDS",
+    "диверсии": "SAB", "див": "SAB",
+    "тяжести": "HEA", "тяж": "HEA",
+}
+
+CALC_UPGRADE_PUBLIC_VARS = [
+    "заразность", "летальность", "тяжесть", "ускорение",
+    "патоген", "вакцина", "реагирование", "обнаружение", "предотвращение"
+]
+
+CALC_CHANCE_PUBLIC_VARS = [
+    "заражения", "обнаружения", "диверсии", "тяжести"
+]
+
+def _calc_inline_hint_keyboard(prefix: str):
+    kb = InlineKeyboardMarkup()
+    kb.add(
+        InlineKeyboardButton(
+            "Подставить в строку ввода",
+            switch_inline_query_current_chat=str(prefix or "").strip()
+        )
+    )
+    return kb
+
+def _calc_inline_error_text(mode_label: str, hint_text: str) -> str:
+    return (
+        "🧮 Калькулятор: При вводе параметров вы допустили ошибки синтаксиса. Попробуйте повторить запрос.\n"
+        f"{hint_text}"
+    )
+
+def _calc_upgrade_hint_text() -> str:
+    vars_txt = "\n".join([f"<code>{h(x)}</code>" for x in CALC_UPGRADE_PUBLIC_VARS])
+    return (
+        "📋 Доступные переменные для подсчёта улучшения:\n"
+        "<blockquote expandable>"
+        f"{vars_txt}\n"
+        "</blockquote>"
+    )
+
+def _calc_chance_hint_text() -> str:
+    vars_txt = "\n".join([f"<code>{h(x)}</code>" for x in CALC_CHANCE_PUBLIC_VARS])
+    return (
+        "📋 Доступные переменные для подсчёта шансов:\n"
+        "<blockquote expandable>"
+        f"{vars_txt}\n"
+        "</blockquote>"
+    )
+
+
+def _fmt_pct_text(v: float) -> str:
+    x = float(v)
+    if abs(x - round(x)) < 1e-9:
+        return f"{int(round(x))}%"
+    return f"{x:.1f}%"
+
+def _calc_sabotage_success_pct(reaction_level: int, ips_level: int) -> float:
+    p = int(reaction_level) - int(ips_level)
+    if p < 0:
+        p = 0
+    if p > 90:
+        p = 90
+    return float(p)
+
+def _calc_heaviness_success_pct(heaviness_level: int, qualification_level: int) -> float:
+    hea = int(heaviness_level)
+    qual = int(qualification_level)
+    if hea <= qual:
+        return 0.0
+    p = (hea - qual) * 2.0
+    if p > 90.0:
+        p = 90.0
+    if p < 0.0:
+        p = 0.0
+    return float(p)
+
+def _calc_chance_payload(metric_token: str, lvl1: int, lvl2: int):
+    metric_key = CALC_CHANCE_METRIC_ALIASES.get((metric_token or "").strip().lower())
+    if not metric_key:
+        return None
+
+    l1 = int(lvl1)
+    l2 = int(lvl2)
+
+    if metric_key == "INFECT":
+        success = float(infect_success_chance(l1, l2))
+        fail = 100.0 - success
+        label = "заражения"
+        levels_txt = f"🦠 {l1} ур → 🛡️ {l2} ур"
+    elif metric_key == "IDS":
+        success = float(ids_report_pct(l1, l2))
+        fail = 100.0 - success
+        label = "обнаружения"
+        levels_txt = f"\n🛰️ защита {l1} ур \n🛰️ нападение {l2} ур"
+    elif metric_key == "SAB":
+        success = float(_calc_sabotage_success_pct(l1, l2))
+        fail = 100.0 - success
+        label = "диверсии"
+        levels_txt = f"👮 {l1} ур → 📟 {l2} ур"
+    else:
+        success = float(_calc_heaviness_success_pct(l1, l2))
+        fail = 100.0 - success
+        label = "тяжести"
+        levels_txt = f"🧿 {l1} ур → 👨‍🔬 {l2} ур"
+
+    return {
+        "metric_key": metric_key,
+        "label": label,
+        "levels_txt": levels_txt,
+        "success": success,
+        "fail": fail,
+        "text": (
+            f"🧮 Калькулятор: 📊 Шансы {label} {levels_txt}\n"
+            f"✅ Успех: <b>{_fmt_pct_text(success)}</b>\n"
+            f"❌ Провал: <b>{_fmt_pct_text(fail)}</b>"
+        )
+    }
+
+def _inline_plain_target_name(target_id: int) -> str:
+    row = get_user_row(int(target_id))
+    if not row:
+        return "неизвестного пользователя"
+
+    if int(row["is_placeholder"] or 0) == 1:
+        un = (row["username"] or "").strip()
+        return f"@{un}" if un else "неизвестного пользователя"
+
+    un = (row["username"] or "").strip()
+    return display_name(row["first_name"] or "", row["last_name"] or "", un, int(target_id))
+
+def _attempts_phrase_acc(count: int) -> str:
+    cnt = int(count)
+    if cnt <= 1:
+        return "одну попытку"
+    return f"{cnt} {_ru_unit(cnt, 'попытку', 'попытки', 'попыток')}"
+
+def _inline_infect_desc(req: dict) -> str:
+    if (req.get("kind") or "") == "U":
+        tid = int(req["target"])
+        cnt = max(1, int(req.get("count") or 1))
+        who = _inline_plain_target_name(tid)
+        return f"Провести {_attempts_phrase_acc(cnt)} заражения {who}"
+
+    mode = str(req.get("mode") or "r")
+    cnt = max(1, int(req.get("count") or 1))
+    mode_txt = {
+        "r": "случайного объекта",
+        "p": "объекта с большим био-опытом",
+        "m": "объекта с меньшим био-опытом",
+        "e": "объекта с равным био-опытом",
+    }.get(mode, "объекта")
+    return f"Провести {_attempts_phrase_acc(cnt)} заражения {mode_txt}"
+
+def _inline_calc_req_from_query(query: str):
+    raw = (query or "").strip()
+    if not raw:
+        return None
+
+    toks_raw = raw.split()
+    toks = [t.lower() for t in toks_raw]
+    if not toks:
+        return None
+
+    explicit = False
+    mode = "UPG"
+    prefix_for_button = ""
+
+    if toks[0] in CALC_UPGRADE_MODE_ALIASES:
+        explicit = True
+        mode = "UPG"
+        prefix_for_button = toks_raw[0]
+        toks_raw = toks_raw[1:]
+        toks = toks[1:]
+    elif toks[0] in CALC_CHANCE_MODE_ALIASES:
+        explicit = True
+        mode = "CHANCE"
+        prefix_for_button = toks_raw[0]
+        toks_raw = toks_raw[1:]
+        toks = toks[1:]
+    elif toks[0] in ("ку", "кпк"):
+        explicit = True
+        mode = "UPG"
+        prefix_for_button = toks_raw[0]
+        toks_raw = toks_raw[1:]
+        toks = toks[1:]
+    elif toks[0] in ("кш", "кпц"):
+        explicit = True
+        mode = "CHANCE"
+        prefix_for_button = toks_raw[0]
+        toks_raw = toks_raw[1:]
+        toks = toks[1:]
+
+    if mode == "UPG":
+        if not explicit:
+            if len(toks) != 3:
+                return None
+
+            code = _resolve_skill(toks[0])
+            if not code or not toks[1].isdigit() or not toks[2].isdigit():
+                return None
+
+            n1 = int(toks[1]); n2 = int(toks[2])
+            if n1 >= n2:
+                return None
+
+            cost = _calc_cost_range(SKILL_N1[code], n1, n2)
+            skill = SKILLS[code]
+            return {
+                "kind": "UPG",
+                "ready": True,
+                "title": "Калькулятор улучшения",
+                "desc": "Расчёты выполнены",
+                "text": (
+                    f"🧮 Калькулятор: {skill['emoji']} {h(skill['title_1'])} <b>{n1}</b> → <b>{n2}</b>\n"
+                    f"Стоимость 🧬 <b>{_ru_dots(cost)}</b> ({_fmt_k(cost)})"
+                ),
+                "reply_markup": None,
+            }
+
+        hint_text = _calc_upgrade_hint_text()
+        err_text = _calc_inline_error_text("улучшение", hint_text)
+
+        if len(toks) < 3:
+            return {
+                "kind": "UPG",
+                "ready": False,
+                "title": "Калькулятор улучшения",
+                "desc": "Введите название навыка, минимальный и максимальный уровни",
+                "text": err_text,
+                "reply_markup": _calc_inline_hint_keyboard(prefix_for_button),
+            }
+
+        code = _resolve_skill(toks[0])
+        if not code or not toks[1].isdigit() or not toks[2].isdigit():
+            return {
+                "kind": "UPG",
+                "ready": False,
+                "title": "Калькулятор улучшения",
+                "desc": "Введите название навыка, минимальный и максимальный уровни",
+                "text": err_text,
+                "reply_markup": _calc_inline_hint_keyboard(prefix_for_button),
+            }
+
+        n1 = int(toks[1]); n2 = int(toks[2])
+        if n1 >= n2:
+            return {
+                "kind": "UPG",
+                "ready": False,
+                "title": "Калькулятор улучшения",
+                "desc": "Введите название навыка, минимальный и максимальный уровни",
+                "text": err_text,
+                "reply_markup": _calc_inline_hint_keyboard(prefix_for_button),
+            }
+
+        cost = _calc_cost_range(SKILL_N1[code], n1, n2)
+        skill = SKILLS[code]
+        return {
+            "kind": "UPG",
+            "ready": True,
+            "title": "Калькулятор улучшения",
+            "desc": "Расчёты выполнены",
+            "text": (
+                f"🧮 Калькулятор: {skill['emoji']} {h(skill['title_1'])} <b>{n1}</b> → <b>{n2}</b>\n"
+                f"Стоимость 🧬 <b>{_ru_dots(cost)}</b> ({_fmt_k(cost)})"
+            ),
+            "reply_markup": None,
+        }
+
+    hint_text = _calc_chance_hint_text()
+    err_text = _calc_inline_error_text("шансы", hint_text)
+
+    if len(toks) < 1:
+        return {
+            "kind": "CHANCE",
+            "ready": False,
+            "title": "Калькулятор шансов",
+            "desc": "Введите интересующий параметр",
+            "text": err_text,
+            "reply_markup": _calc_inline_hint_keyboard(prefix_for_button),
+        }
+
+    metric_key = CALC_CHANCE_METRIC_ALIASES.get(toks[0])
+    if not metric_key:
+        return {
+            "kind": "CHANCE",
+            "ready": False,
+            "title": "Калькулятор шансов",
+            "desc": "Введите интересующий параметр",
+            "text": err_text,
+            "reply_markup": _calc_inline_hint_keyboard(prefix_for_button),
+        }
+
+    metric_hint = {
+        "INFECT": "Введите уровень заразности и уровень иммунитета",
+        "IDS": "Введите два уровня системы обнаружения угроз (IDS)",
+        "SAB": "Введите уровень группы быстрого реагирования и уровень системы предотвращения угроз (IPS)",
+        "HEA": "Введите уровень тяжести патогена и уровень квалификации учёных",
+    }[metric_key]
+
+    if len(toks) < 3 or not toks[1].isdigit() or not toks[2].isdigit():
+        return {
+            "kind": "CHANCE",
+            "ready": False,
+            "title": "Калькулятор шансов",
+            "desc": metric_hint,
+            "text": err_text,
+            "reply_markup": _calc_inline_hint_keyboard(prefix_for_button),
+        }
+
+    payload = _calc_chance_payload(toks[0], int(toks[1]), int(toks[2]))
+    if not payload:
+        return {
+            "kind": "CHANCE",
+            "ready": False,
+            "title": "Калькулятор шансов",
+            "desc": "Введите интересующий параметр",
+            "text": err_text,
+            "reply_markup": _calc_inline_hint_keyboard(prefix_for_button),
+        }
+
+    return {
+        "kind": "CHANCE",
+        "ready": True,
+        "title": "Калькулятор шансов",
+        "desc": "Расчёты выполнены",
+        "text": payload["text"],
+        "reply_markup": None,
+    }
+
 def handle_calc_command(message, parsed: Parsed):
     uid = int(message.from_user.id)
     upsert_user(message.from_user)
     ensure_lab_exists(uid)
 
-    parts = (parsed.args or "").strip().split()
-    if len(parts) < 3:
-        bot.reply_to(
+    def _emit(text: str):
+        _REAL_BOT_REPLY_TO(
             message,
+            premiumize_html_text(text),
+            parse_mode="HTML",
             disable_web_page_preview=True
+        )
+
+    parts = (parsed.args or "").strip().split()
+    if not parts:
+        return
+
+    mode = "UPG"
+    if parsed.cmd == "calc_upg":
+        mode = "UPG"
+    elif parsed.cmd == "calc_chance":
+        mode = "CHANCE"
+    else:
+        first = parts[0].lower()
+        if first in CALC_UPGRADE_MODE_ALIASES:
+            mode = "UPG"
+            parts = parts[1:]
+        elif first in CALC_CHANCE_MODE_ALIASES:
+            mode = "CHANCE"
+            parts = parts[1:]
+        else:
+            mode = "UPG"
+
+    if mode == "UPG":
+        if len(parts) < 3:
+            return
+
+        code = _resolve_skill(parts[0])
+        if not code or code not in SKILLS:
+            return
+
+        try:
+            n1 = int(parts[1])
+            n2 = int(parts[2])
+        except Exception:
+            return
+
+        if n1 >= n2:
+            return
+
+        cost = _calc_cost_range(SKILL_N1[code], n1, n2)
+        skill = SKILLS[code]
+
+        _emit(
+            f"🧮 Калькулятор: {skill['emoji']} {h(skill['title_1'])} <b>{n1}</b> → <b>{n2}</b>\n"
+            f"Стоимость 🧬 <b>{_ru_dots(cost)}</b> ({_fmt_k(cost)})"
         )
         return
 
-    code = _resolve_skill(parts[0])
-    if not code or code not in SKILLS:
+    if len(parts) < 3:
         return
 
-    try:
-        n1 = int(parts[1])
-        n2 = int(parts[2])
-    except Exception:
+    payload = _calc_chance_payload(parts[0], parts[1], parts[2])
+    if not payload:
         return
 
-    cost = _calc_cost_range(SKILL_N1[code], n1, n2)
-    skill = SKILLS[code]
-
-    bot.reply_to(
-        message,
-        f"🧮 Калькулятор: {skill['emoji']} {h(skill['title_1'])} <b>{n1}</b> → <b>{n2}</b>\n"
-        f"Стоимость 🧬 <b>{_ru_dots(cost)}</b> ({_fmt_k(cost)})",
-        disable_web_page_preview=True
-    )
+    _emit(payload["text"])
 
 @bot.callback_query_handler(func=lambda cq: (cq.data or "").startswith(f"{UPGUI_TAG}:"))
 def cb_upgrade(cq):
@@ -9603,6 +10291,141 @@ def cb_blacklist_ui(cq):
         except Exception:
             pass
 
+@bot.callback_query_handler(func=lambda cq: (cq.data or "").startswith(f"{CB_RP_ACCEPT}:"))
+def cb_rp_accept(cq):
+    try:
+        parts = (cq.data or "").split(":")
+        if len(parts) != 3:
+            bot.answer_callback_query(cq.id)
+            return
+
+        offer_id = int(parts[2])
+        row = db_one(
+            "SELECT offer_id, actor_id, action_key, target_id, status, created_at "
+            "FROM rp_offers WHERE offer_id=? LIMIT 1",
+            (int(offer_id),)
+        )
+        if not row:
+            bot.answer_callback_query(cq.id)
+            return
+
+        actor_id = int(row["actor_id"])
+        if int(cq.from_user.id) == actor_id:
+            bot.answer_callback_query(cq.id, "Вы не можете нажимать чужие кнопки!")
+            return
+
+        if str(row["status"] or "") != "pending":
+            bot.answer_callback_query(cq.id, "Кто не успел, тот опоздал.")
+            return
+
+        action = load_rp_actions().get(str(row["action_key"]))
+        if not action:
+            bot.answer_callback_query(cq.id)
+            return
+
+        db_exec(
+            "UPDATE rp_offers SET target_id=?, status='accepted' WHERE offer_id=?",
+            (int(cq.from_user.id), int(offer_id)),
+            commit=True
+        )
+
+        upsert_user(cq.from_user)
+        actor_tag = public_user_tag(actor_id)
+        target_tag = _rp_actor_tag(cq.from_user)
+        final_text = _rp_emit_action_text(action, actor_tag, target_tag)
+
+        _rp_insert_event(action["trigger_key"], actor_id, int(cq.from_user.id))
+
+        if cq.inline_message_id:
+            limited_edit_message_text(
+                text=final_text,
+                inline_id=cq.inline_message_id,
+                parse_mode="HTML",
+                reply_markup=None,
+                disable_web_page_preview=True
+            )
+        elif cq.message:
+            limited_edit_message_text(
+                text=final_text,
+                chat_id=cq.message.chat.id,
+                msg_id=cq.message.message_id,
+                parse_mode="HTML",
+                reply_markup=None,
+                disable_web_page_preview=True
+            )
+
+        bot.answer_callback_query(cq.id)
+    except Exception as e:
+        send_error_report("cb_rp_accept", e)
+        try:
+            bot.answer_callback_query(cq.id)
+        except Exception:
+            pass
+
+@bot.callback_query_handler(func=lambda cq: (cq.data or "").startswith(f"{CB_RP_DECLINE}:"))
+def cb_rp_decline(cq):
+    try:
+        parts = (cq.data or "").split(":")
+        if len(parts) != 3:
+            bot.answer_callback_query(cq.id)
+            return
+
+        offer_id = int(parts[2])
+        row = db_one(
+            "SELECT offer_id, actor_id, action_key, target_id, status, created_at "
+            "FROM rp_offers WHERE offer_id=? LIMIT 1",
+            (int(offer_id),)
+        )
+        if not row:
+            bot.answer_callback_query(cq.id)
+            return
+
+        actor_id = int(row["actor_id"])
+        if int(cq.from_user.id) == actor_id:
+            bot.answer_callback_query(cq.id, "Вы не можете нажимать чужие кнопки!")
+            return
+
+        if str(row["status"] or "") != "pending":
+            bot.answer_callback_query(cq.id, "Вы не успели.")
+            return
+
+        db_exec(
+            "UPDATE rp_offers SET target_id=?, status='declined' WHERE offer_id=?",
+            (int(cq.from_user.id), int(offer_id)),
+            commit=True
+        )
+
+        upsert_user(cq.from_user)
+        actor_tag = public_user_tag(actor_id)
+        target_tag = _rp_actor_tag(cq.from_user)
+        text = f"❌ {target_tag} отклонил(а) предложение {actor_tag}."
+
+        if cq.inline_message_id:
+            limited_edit_message_text(
+                text=text,
+                inline_id=cq.inline_message_id,
+                parse_mode="HTML",
+                reply_markup=None,
+                disable_web_page_preview=True
+            )
+        elif cq.message:
+            limited_edit_message_text(
+                text=text,
+                chat_id=cq.message.chat.id,
+                msg_id=cq.message.message_id,
+                parse_mode="HTML",
+                reply_markup=None,
+                disable_web_page_preview=True
+            )
+
+        bot.answer_callback_query(cq.id, "Мои сожаления, вам отказали 😔")
+    except Exception as e:
+        send_error_report("cb_rp_decline", e)
+        try:
+            bot.answer_callback_query(cq.id)
+        except Exception:
+            pass
+
 @bot.callback_query_handler(func=lambda cq: (cq.data or "").startswith(f"{CB_LAB_DELETE_OK}:"))
 def cb_lab_delete_ok(cq):
     try:
@@ -11109,14 +11932,14 @@ def handle_lab_commands(message, parsed: Parsed):
             if int(target_id) == int(uid):
                 bot.reply_to(
                     message,
-                    f"✅ Имя лаборатории удалено. Установлено стандартное имя: <b>{h(default_name)}</b>",
+                    f"✅ Имя лаборатории удалено.",
                     parse_mode="HTML",
                     disable_web_page_preview=True
                 )
             else:
                 bot.reply_to(
                     message,
-                    f"✅ Имя лаборатории у пользователя {_corp_actor_tag(int(target_id))} удалено. Установлено стандартное имя: <b>{h(default_name)}</b>",
+                    f"✅ Имя лаборатории у пользователя {_corp_actor_tag(int(target_id))} удалено.",
                     parse_mode="HTML",
                     disable_web_page_preview=True
                 )
@@ -11124,11 +11947,11 @@ def handle_lab_commands(message, parsed: Parsed):
 
         set_pathogen_name(int(target_id), None)
         if int(target_id) == int(uid):
-            bot.reply_to(message, "✅ Имя патогена удалено. Установлено стандартное имя: <b>неизвестный патоген</b>", parse_mode="HTML")
+            bot.reply_to(message, "✅ Имя патогена удалено.", parse_mode="HTML")
         else:
             bot.reply_to(
                 message,
-                f"✅ Имя патогена у пользователя {_corp_actor_tag(int(target_id))} удалено. Установлено стандартное имя: <b>неизвестный патоген</b>",
+                f"✅ Имя патогена у пользователя {_corp_actor_tag(int(target_id))} удалено.",
                 parse_mode="HTML",
                 disable_web_page_preview=True
             )
@@ -11156,7 +11979,7 @@ def handle_lab_commands(message, parsed: Parsed):
             return
 
         set_lab_name(uid, new_name)
-        bot.reply_to(message, "✅ Имя лаборатории успешно изменено!")
+        bot.reply_to(message, f"✅ Имя лаборатории успешно изменено на {h(new_name)}!")
         return
 
     if parsed.cmd == "pathogenname":
@@ -11179,7 +12002,7 @@ def handle_lab_commands(message, parsed: Parsed):
             return
 
         set_pathogen_name(uid, new_name)
-        bot.reply_to(message, "✅ Имя патогена успешно изменено!")
+        bot.reply_to(message, f"✅ Имя патогена успешно изменено на {h(new_name)}!")
         return
 
     if parsed.cmd in ("lab", "mylab"):
@@ -12079,6 +12902,14 @@ def kb_inline_infect_execute_mass(attacker_id: int, mode: str, count: int) -> In
     kb.add(_ikb("Заразить", callback_data=f"{INFUI_TAG}:M:{int(attacker_id)}:{str(mode)}:n:{int(count)}", style="success"))
     return kb
 
+def kb_inline_rp_offer(offer_id: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup()
+    kb.row(
+        _ikb("Принять", callback_data=f"{CB_RP_ACCEPT}:{int(offer_id)}", style="success"),
+        _ikb("Отклонить", callback_data=f"{CB_RP_DECLINE}:{int(offer_id)}", style="danger")
+    )
+    return kb
+
 def _parse_inline_infect_query(query: str):
     raw = (query or "").strip()
     if not raw:
@@ -12239,6 +13070,8 @@ def inline_query_handler(inline_query):
         q = q_raw.lower()
 
         results = []
+        iq_chat_type = str(getattr(inline_query, "chat_type", "") or "").lower()
+
 
         my_cid, _ = get_user_corp_resolved(uid)
         my_corp = corp_by_id(my_cid) if my_cid > 0 else None
@@ -12254,7 +13087,7 @@ def inline_query_handler(inline_query):
                     results.append(_inline_article(
                         article_id=f"lab_{uid}_{int(inline_target_id)}",
                         title="Досье лаборатории",
-                        desc="",
+                        desc=f"Отправить в чат досье лаборатории {_inline_plain_target_name(int(inline_target_id))}",
                         text=text,
                         reply_markup=rm if int(inline_target_id) == int(uid) else None,
                         thumb_url=INLINE_THUMB_LAB_URL
@@ -12265,7 +13098,7 @@ def inline_query_handler(inline_query):
                     results.append(_inline_article(
                         article_id=f"bal_{uid}_{int(inline_target_id)}",
                         title="Баланс",
-                        desc="",
+                        desc=f"Отправить в чат информацию баланса {_inline_plain_target_name(int(inline_target_id))}",
                         text=text,
                         reply_markup=rm if int(inline_target_id) == int(uid) else None,
                         thumb_url=INLINE_THUMB_BAL_URL
@@ -12276,7 +13109,7 @@ def inline_query_handler(inline_query):
                     results.append(_inline_article(
                         article_id=f"corp_{uid}_{int(inline_target_id)}",
                         title="Досье корпорации",
-                        desc="",
+                        desc=f"Отправить в чат досье корпорации {_inline_plain_target_name(int(inline_target_id))}",
                         text=text,
                         reply_markup=rm,
                         thumb_url=INLINE_THUMB_CORP_URL
@@ -12289,7 +13122,7 @@ def inline_query_handler(inline_query):
                 results.append(_inline_article(
                     article_id=f"lab_{uid}",
                     title="Досье лаборатории",
-                    desc="",
+                    desc="Отправить в чат досье вашей лаборатории",
                     text=text,
                     reply_markup=kb_lab_dossier_inline(uid),
                     thumb_url=INLINE_THUMB_LAB_URL
@@ -12301,7 +13134,7 @@ def inline_query_handler(inline_query):
                 results.append(_inline_article(
                     article_id=f"bal_{uid}",
                     title="Баланс",
-                    desc="",
+                    desc="Отправить в чат информацию вашего баланса",
                     text=text,
                     reply_markup=kb_balance_self(uid),
                     thumb_url=INLINE_THUMB_BAL_URL
@@ -12317,7 +13150,7 @@ def inline_query_handler(inline_query):
                 results.append(_inline_article(
                     article_id=f"corp_{uid}_{my_cid}",
                     title="Досье корпорации",
-                    desc="",
+                    desc="Отправить в чать досье вашей корпорации",
                     text=text,
                     reply_markup=rm,
                     thumb_url=INLINE_THUMB_CORP_URL
@@ -12332,7 +13165,7 @@ def inline_query_handler(inline_query):
                 results.append(_inline_article(
                     article_id=f"infect_u_{uid}_{tid}_{cnt}",
                     title="Заразить",
-                    desc="",
+                    desc=_inline_infect_desc(inf_req),
                     text=_inline_infect_preview_text(inf_req),
                     reply_markup=kb_inline_infect_execute_user(uid, tid, cnt),
                     thumb_url=INLINE_THUMB_INFECT_URL
@@ -12343,35 +13176,47 @@ def inline_query_handler(inline_query):
                 results.append(_inline_article(
                     article_id=f"infect_m_{uid}_{mode}_{cnt}",
                     title="Заразить",
-                    desc="",
+                    desc=_inline_infect_desc(inf_req),
                     text=_inline_infect_preview_text(inf_req),
                     reply_markup=kb_inline_infect_execute_mass(uid, mode, cnt),
                     thumb_url=INLINE_THUMB_INFECT_URL
                 ))
 
-        # калькулятор улучшения
+        # inline RP — только из приватного чата
+        if iq_chat_type == "private":
+            rp_action = get_rp_action(q)
+            if rp_action:
+                offer_id = _create_rp_offer(uid, rp_action["trigger_key"])
+                actor_tag = public_user_tag(uid)
+                offer_text = f"Пользователь {actor_tag} предлагает вам действие..."
+
+                results.append(_inline_article(
+                    article_id=f"rp_{uid}_{rp_action['trigger_key']}_{offer_id}",
+                    title=f"{rp_action['emoji']}{rp_action['trigger']}",
+                    desc=f"Предложить собеседнику {rp_action['trigger']}",
+                    text=offer_text,
+                    reply_markup=kb_inline_rp_offer(int(offer_id)),
+                    thumb_url=INLINE_THUMB_DEFAULT_URL
+                ))
+
+        # калькулятор
         if not inline_target_token:
-            mcalc = re.match(r"^([^\s]+)\s+(\d+)\s+(\d+)$", q)
-            if mcalc:
-                token = mcalc.group(1)
-                n1 = int(mcalc.group(2))
-                n2 = int(mcalc.group(3))
-                code = _resolve_skill(token)
-                if code and code in SKILLS:
-                    cost = _calc_cost_range(SKILL_N1[code], n1, n2)
-                    skill = SKILLS[code]
-                    text = (
-                        f"🧮 Калькулятор: {skill['emoji']} {h(skill['title_1'])} <b>{n1}</b> → <b>{n2}</b>\n"
-                        f"Стоимость 🧬 <b>{_ru_dots(cost)}</b> ({_fmt_k(cost)})"
-                    )
-                    results.append(_inline_article(
-                        article_id=f"calc_{uid}_{code}_{n1}_{n2}",
-                        title="Калькулятор улучшения",
-                        desc="",
-                        text=text,
-                        reply_markup=None,
-                        thumb_url=INLINE_THUMB_CALC_URL
-                    ))
+            calc_req = _inline_calc_req_from_query(q_raw)
+            if calc_req:
+                calc_title = calc_req["title"]
+                calc_desc = calc_req["desc"]
+                calc_text = calc_req["text"]
+                calc_rm = calc_req.get("reply_markup")
+                ready_suffix = "ready" if calc_req.get("ready") else "hint"
+
+                results.append(_inline_article(
+                    article_id=f"calc_{uid}_{ready_suffix}_{abs(hash(q_raw))}",
+                    title=calc_title,
+                    desc=calc_desc,
+                    text=calc_text,
+                    reply_markup=calc_rm,
+                    thumb_url=INLINE_THUMB_CALC_URL
+                ))
 
         if results:
             _safe_answer_inline_query(inline_query.id, results[:8], cache_time=0, is_personal=True)
@@ -12427,6 +13272,8 @@ def text_router(message):
 
         parsed = parse_message_as_command(message.text)
         if not parsed:
+            if try_handle_rp_action_message(message):
+                return
             return
 
         # /owner
@@ -12447,6 +13294,11 @@ def text_router(message):
         # помощь
         if parsed.cmd == "help":
             handle_help_command(message)
+            return
+
+        # рп стата
+        if parsed.cmd == "rp_stats":
+            handle_rp_stats_command(message)
             return
 
         # admin service
@@ -12526,7 +13378,7 @@ def text_router(message):
             return
 
         # калькулятор
-        if parsed.cmd == "calc":
+        if parsed.cmd in ("calc", "calc_upg", "calc_chance"):
             handle_calc_command(message, parsed)
             return
 
