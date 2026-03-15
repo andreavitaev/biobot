@@ -71,6 +71,7 @@ INLINE_THUMB_BAL_URL = "https://raw.githubusercontent.com/andreavitaev/biobot/im
 INLINE_THUMB_CALC_URL = "https://raw.githubusercontent.com/andreavitaev/biobot/image/calculate.png"  
 INLINE_THUMB_CORP_URL = "https://raw.githubusercontent.com/andreavitaev/biobot/image/corp.png"
 INLINE_THUMB_INFECT_URL = "https://raw.githubusercontent.com/andreavitaev/biobot/image/infect.png"
+INLINE_THUMB_RP_URL = "https://raw.githubusercontent.com/andreavitaev/biobot/image/rp.png"
 # запасной вариант
 INLINE_THUMB_DEFAULT_URL = "https://raw.githubusercontent.com/andreavitaev/boss-rush-assets/main/thumb_1.jpg"
 
@@ -1306,7 +1307,7 @@ conn.row_factory = sqlite3.Row
 conn.execute("PRAGMA journal_mode=WAL;")
 conn.execute("PRAGMA synchronous=NORMAL;")
 conn.execute("PRAGMA busy_timeout=8000;")
-conn.execute("PRAGMA wal_autocheckpoint=2000;")  # ~8MB при page_size=4096
+conn.execute("PRAGMA wal_autocheckpoint=256;")   # ~1MB при page_size=4096
 
 def integrity_ok(c: sqlite3.Connection) -> bool:
     try:
@@ -1319,6 +1320,16 @@ with DB_LOCK:
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
     except Exception:
         pass
+
+_DB_COMMITS_SINCE_CKPT = 0
+
+def _maybe_checkpoint_passive():
+    global _DB_COMMITS_SINCE_CKPT
+    try:
+        conn.execute("PRAGMA wal_checkpoint(PASSIVE);")
+    except Exception:
+        pass
+    _DB_COMMITS_SINCE_CKPT = 0
 
 def db_one(sql: str, params=()):
     with DB_LOCK:
@@ -1341,6 +1352,8 @@ def db_all(sql: str, params=()):
             except Exception: pass
 
 def db_exec(sql: str, params=(), commit: bool = False):
+    global _DB_COMMITS_SINCE_CKPT
+
     with DB_LOCK:
         c = conn.cursor()
         try:
@@ -1348,10 +1361,21 @@ def db_exec(sql: str, params=(), commit: bool = False):
             rc = c.rowcount
             if commit:
                 conn.commit()
+                _DB_COMMITS_SINCE_CKPT += 1
+
+                if _DB_COMMITS_SINCE_CKPT >= 40:
+                    try:
+                        conn.execute("PRAGMA wal_checkpoint(PASSIVE);")
+                    except Exception:
+                        pass
+                    _DB_COMMITS_SINCE_CKPT = 0
+
             return rc
         finally:
-            try: c.close()
-            except Exception: pass
+            try:
+                c.close()
+            except Exception:
+                pass
 
 def table_exists(name: str) -> bool:
     try:
@@ -1362,13 +1386,22 @@ def table_exists(name: str) -> bool:
 
 # демоны
 def _checkpoint_daemon():
+    tick = 0
     while True:
-        time.sleep(1800)  # раз в 30 минут
+        time.sleep(60)  # раз в минуту
+        tick += 1
+
         with DB_LOCK:
             try:
-                conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                conn.execute("PRAGMA wal_checkpoint(PASSIVE);")
             except Exception:
                 pass
+
+            if tick % 10 == 0:  # раз в 10 минут
+                try:
+                    conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                except Exception:
+                    pass
 
 threading.Thread(target=_checkpoint_daemon, daemon=True).start()
 
@@ -4078,6 +4111,9 @@ def _rp_actor_tag(user_obj) -> str:
 
 def resolve_rp_target(message, actor_id: int, args_text: str):
     if message.reply_to_message:
+        if is_channel_sender_message(message.reply_to_message):
+            return None, None
+
         if getattr(message.reply_to_message, "from_user", None):
             u = message.reply_to_message.from_user
             if not bool(getattr(u, "is_bot", False)):
@@ -6048,16 +6084,34 @@ def handle_commands_link(message):
     )
 
 def handle_rp_stats_command(message):
+    chat_type = (getattr(message.chat, "type", "") or "").lower()
+    if chat_type not in ("private", "group", "supergroup"):
+        return
+    if is_channel_sender_message(message):
+        return
+    if getattr(message, "from_user", None) is None:
+        return
+
     uid = int(message.from_user.id)
     upsert_user(message.from_user)
-    bot.reply_to(
-        message,
-        render_rp_stats_text(uid),
-        parse_mode="HTML",
-        disable_web_page_preview=True
-    )
+
+    try:
+        _REAL_BOT_REPLY_TO(
+            message,
+            premiumize_html_text(render_rp_stats_text(uid)),
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
+    except Exception:
+        return
 
 def try_handle_rp_action_message(message) -> bool:
+    chat_type = (getattr(message.chat, "type", "") or "").lower()
+    if chat_type not in ("private", "group", "supergroup"):
+        return False
+    if is_channel_sender_message(message):
+        return False
+
     actor = getattr(message, "from_user", None)
     if actor is None:
         return False
@@ -6073,6 +6127,9 @@ def try_handle_rp_action_message(message) -> bool:
     if target_id is None:
         return False
 
+    if int(target_id) == int(actor_id):
+        return False
+
     if target_user_obj is not None:
         capture_user_context(message, target_user_obj)
 
@@ -6080,12 +6137,15 @@ def try_handle_rp_action_message(message) -> bool:
     target_tag = public_user_tag(int(target_id))
     text = _rp_emit_action_text(action, actor_tag, target_tag)
 
-    bot.reply_to(
-        message,
-        text,
-        parse_mode="HTML",
-        disable_web_page_preview=True
-    )
+    try:
+        _REAL_BOT_REPLY_TO(
+            message,
+            premiumize_html_text(text),
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
+    except Exception:
+        return False
 
     _rp_insert_event(action["trigger_key"], int(actor_id), int(target_id))
     return True
@@ -13196,7 +13256,7 @@ def inline_query_handler(inline_query):
                     desc=f"Предложить собеседнику {rp_action['trigger']}",
                     text=offer_text,
                     reply_markup=kb_inline_rp_offer(int(offer_id)),
-                    thumb_url=INLINE_THUMB_DEFAULT_URL
+                    thumb_url=INLINE_THUMB_RP_URL
                 ))
 
         # калькулятор
@@ -13250,8 +13310,14 @@ def on_report_media(message):
 @bot.message_handler(content_types=["text"])
 def text_router(message):
     try:
+        if (getattr(message.chat, "type", "") or "").lower() == "channel":
+            return
         if is_channel_sender_message(message):
-            return        
+            return
+
+        if getattr(message, "from_user", None) is None:
+            return
+
         uid = int(message.from_user.id)
 
         if is_bot_banned(uid):
