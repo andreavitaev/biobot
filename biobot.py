@@ -4073,21 +4073,69 @@ def is_placeholder_user(user_id: int) -> bool:
         return False
     return int(row["is_placeholder"] or 0) == 1
 
+def _best_known_username_by_uid(user_id: int) -> str:
+    uid = int(user_id)
+
+    row = db_one("SELECT username FROM users WHERE user_id=? LIMIT 1", (uid,))
+    if row:
+        un = _normalize_username_for_link((row["username"] or ""))
+        if un:
+            return un
+
+    row = db_one(
+        "SELECT username FROM chat_members "
+        "WHERE user_id=? AND COALESCE(username,'')<>'' "
+        "ORDER BY COALESCE(last_seen,0) DESC "
+        "LIMIT 1",
+        (uid,)
+    )
+    if row:
+        un = _normalize_username_for_link((row["username"] or ""))
+        if un:
+            return un
+
+    return ""
+
+def _best_known_display_by_uid(user_id: int) -> tuple[str, str, int]:
+    uid = int(user_id)
+    row = get_user_row(uid)
+
+    if row:
+        un = _normalize_username_for_link((row["username"] or ""))
+        disp = display_name(row["first_name"] or "", row["last_name"] or "", un, uid)
+
+        if disp == str(uid):
+            cm_un = _best_known_username_by_uid(uid)
+            if cm_un:
+                return cm_un, cm_un, uid
+
+        return disp, un, uid
+
+    cm_un = _best_known_username_by_uid(uid)
+    if cm_un:
+        return cm_un, cm_un, uid
+
+    return "неизвестный пользователь", "", uid
+
 def public_user_tag(user_id: int) -> str:
     uid = int(user_id)
     row = get_user_row(uid)
 
     if row and int(row["is_placeholder"] or 0) == 1:
         un = (row["username"] or "").strip()
-        return tg_mention(uid, "неизвестный пользователь", username=un)
+        if un:
+            return tg_mention(uid, "неизвестный пользователь", username=un)
+        if uid > 0:
+            return tg_mention(uid, "неизвестный пользователь")
+        return "неизвестный пользователь"
 
-    if row:
-        un = (row["username"] or "").strip()
-        disp = display_name(row["first_name"] or "", row["last_name"] or "", un, uid)
-        return tg_mention(uid, disp, username=un)
+    disp, un, real_uid = _best_known_display_by_uid(uid)
 
-    if uid > 0:
-        return tg_mention(uid, "неизвестный пользователь")
+    if real_uid > 0:
+        return tg_mention(real_uid, disp, username=un)
+
+    if un:
+        return tg_mention(real_uid, "неизвестный пользователь", username=un)
 
     return "неизвестный пользователь"
 
@@ -6670,12 +6718,7 @@ def render_lab_infected_list(owner_id: int) -> str:
     items = []
     for i, r in enumerate(rows, 1):
         tid = int(r["target_id"])
-
-        if tid < 0:
-            add = 1
-        else:
-            add = int(r["add_bio_res"] or 0)
-
+        add = 1 if tid < 0 else int(r["add_bio_res"] or 0)
         end_ts = int(r["end_ts"] or 0)
         until = _fmt_date_ddmmyy(end_ts)
 
@@ -7681,11 +7724,16 @@ def _resolve_target_from_bot_reply(message, attacker_id: int) -> Optional[int]:
     ents = getattr(rm, "entities", None) or getattr(rm, "caption_entities", None) or []
     for e in ents:
         et = getattr(e, "type", "") or ""
+
         if et == "text_mention":
             u = getattr(e, "user", None)
             if u and getattr(u, "id", None):
                 uid = int(u.id)
                 if uid != int(attacker_id):
+                    try:
+                        capture_user_context(message, u)
+                    except Exception:
+                        pass
                     return uid
 
         if et in ("text_link", "url"):
@@ -7704,7 +7752,7 @@ def _resolve_target_from_bot_reply(message, attacker_id: int) -> Optional[int]:
             if m:
                 uid = int(m.group(1))
                 if uid != int(attacker_id):
-                    return uid
+                    return _ensure_placeholder_user_by_uid(uid)
 
             m2 = re.search(r"https?://t\.me/([A-Za-z0-9_]+)", url)
             if m2:
@@ -7717,6 +7765,8 @@ def _resolve_target_from_bot_reply(message, attacker_id: int) -> Optional[int]:
                     )
                     if r:
                         uid = int(r["user_id"])
+                if uid is None:
+                    uid = _ensure_placeholder_user_by_username(uname)
                 if uid is not None and int(uid) != int(attacker_id):
                     return int(uid)
 
@@ -7737,6 +7787,8 @@ def _resolve_target_from_bot_reply(message, attacker_id: int) -> Optional[int]:
                             )
                             if r:
                                 uid = int(r["user_id"])
+                        if uid is None:
+                            uid = _ensure_placeholder_user_by_username(uname)
                         if uid is not None and int(uid) != int(attacker_id):
                             return int(uid)
             except Exception:
@@ -7746,7 +7798,7 @@ def _resolve_target_from_bot_reply(message, attacker_id: int) -> Optional[int]:
     for m in re.finditer(r"tg://user\?id=(\d+)", raw):
         uid = int(m.group(1))
         if uid != int(attacker_id):
-            return uid
+            return _ensure_placeholder_user_by_uid(uid)
 
     for m in re.finditer(r"@([A-Za-z0-9_]{5,32})", raw):
         uname = m.group(1).lower()
@@ -7758,6 +7810,8 @@ def _resolve_target_from_bot_reply(message, attacker_id: int) -> Optional[int]:
             )
             if r:
                 uid = int(r["user_id"])
+        if uid is None:
+            uid = _ensure_placeholder_user_by_username(uname)
         if uid is not None and int(uid) != int(attacker_id):
             return int(uid)
 
@@ -7794,6 +7848,7 @@ def _parse_infect_request(message, parsed: "Parsed", attacker_id: int) -> dict:
                     cnt = int(toks[0])
                 return {"kind": "U", "target": tid, "count": cnt}
         else:
+            capture_user_context(message, ru)
             tid = int(ru.id)
             cnt = 1
             if toks and toks[0].isdigit():
