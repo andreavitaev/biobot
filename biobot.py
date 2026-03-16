@@ -4096,6 +4096,12 @@ def _best_known_username_by_uid(user_id: int) -> str:
 
     return ""
 
+def _raw_name_fallback(first_name: str, last_name: str) -> str:
+    fn = _strip_invisible(first_name or "").strip()
+    ln = _strip_invisible(last_name or "").strip()
+    full = (fn + " " + ln).strip()
+    return full
+
 def _best_known_display_by_uid(user_id: int) -> tuple[str, str, int]:
     uid = int(user_id)
     row = get_user_row(uid)
@@ -4108,6 +4114,10 @@ def _best_known_display_by_uid(user_id: int) -> tuple[str, str, int]:
             cm_un = _best_known_username_by_uid(uid)
             if cm_un:
                 return cm_un, cm_un, uid
+
+            raw_disp = _raw_name_fallback(row["first_name"] or "", row["last_name"] or "")
+            if raw_disp:
+                return raw_disp, un, uid
 
         return disp, un, uid
 
@@ -4132,6 +4142,14 @@ def public_user_tag(user_id: int) -> str:
     disp, un, real_uid = _best_known_display_by_uid(uid)
 
     if real_uid > 0:
+        if not disp or disp == str(real_uid):
+            raw_row = get_user_row(real_uid)
+            if raw_row:
+                raw_disp = _raw_name_fallback(raw_row["first_name"] or "", raw_row["last_name"] or "")
+                if raw_disp:
+                    disp = raw_disp
+            if not disp or disp == str(real_uid):
+                disp = "неизвестный пользователь"
         return tg_mention(real_uid, disp, username=un)
 
     if un:
