@@ -2233,6 +2233,15 @@ def init_db():
     );
     """, commit=True)
 
+    for sql in (
+        "ALTER TABLE rp_offers ADD COLUMN extra_tail TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE rp_offers ADD COLUMN comment_text TEXT NOT NULL DEFAULT ''",
+    ):
+        try:
+            db_exec(sql, commit=True)
+        except Exception:
+            pass
+
     db_exec("""
     CREATE TABLE IF NOT EXISTS rp_events (
         event_id      INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4459,6 +4468,35 @@ def _parse_rp_message(text: str, actor_id: int):
 
     return None, "", ""
 
+def _parse_inline_rp_query(text: str, actor_id: int):
+    raw = (text or "").strip()
+    if not raw:
+        return None, "", ""
+
+    first, _, comment = raw.partition("\n")
+    first = first.strip()
+    comment = comment.strip()
+
+    actions = _all_rp_actions_for_user(int(actor_id))
+    if not actions:
+        return None, "", ""
+
+    low = first.lower()
+
+    for action in actions:
+        trig = (action["trigger"] or "").strip().lower()
+        if not trig:
+            continue
+
+        if low == trig:
+            return action, "", comment
+
+        if low.startswith(trig + " "):
+            tail = first[len(action["trigger"]):].strip()
+            return action, tail, comment
+
+    return None, "", ""
+
 def _rp_emit_action_text(action: dict, actor_tag: str, target_tag: str, extra_tail: str = "", comment_text: str = "") -> str:
     emo = rp_premium_emoji_html(action["emoji"], action["premium_id"])
     extra_tail = (extra_tail or "").strip()
@@ -4516,13 +4554,22 @@ def render_rp_stats_text(uid: int) -> str:
 
     return "\n".join(lines)
 
-def _create_rp_offer(actor_id: int, action_key: str) -> int:
+def _create_rp_offer(actor_id: int, action_key: str, extra_tail: str = "", comment_text: str = "") -> int:
     with DB_LOCK:
         c = conn.cursor()
         try:
             c.execute(
-                "INSERT INTO rp_offers(actor_id, action_key, target_id, status, created_at) VALUES (?,?,?,?,?)",
-                (int(actor_id), str(action_key), 0, "pending", int(now_ts()))
+                "INSERT INTO rp_offers(actor_id, action_key, target_id, status, created_at, extra_tail, comment_text) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (
+                    int(actor_id),
+                    str(action_key),
+                    0,
+                    "pending",
+                    int(now_ts()),
+                    str(extra_tail or "").strip(),
+                    str(comment_text or "").strip(),
+                )
             )
             conn.commit()
             return int(c.lastrowid)
@@ -5825,10 +5872,11 @@ def _strict_single_target_token(token: str):
     return None
 
 def strict_single_target_args_ok(message, parsed: Optional["Parsed"], *, allow_empty: bool) -> bool:
-    if message.reply_to_message and message.reply_to_message.from_user:
-        return True
-
     args = (parsed.args or "").strip() if parsed else ""
+
+    if message.reply_to_message and message.reply_to_message.from_user:
+        return not bool(args)
+
     if not args:
         return bool(allow_empty)
 
@@ -6884,7 +6932,7 @@ def handle_mrp_list_command(message):
         return
 
     try:
-        _REAL_BOT_SEND_MESSAGE(uid, premiumize_html_text(text), parse_mode="HTML", disable_web_page_preview=True)
+        _REAL_BOT_SEND_MESSAGE(uid, text, parse_mode="HTML", disable_web_page_preview=True)
         bot.reply_to(message, "📋 Список личных рп команд отправлен в личные сообщения.")
     except Exception:
         bot.reply_to(message, "📑 Не удалось отправить список в личные сообщения. Напишите боту в л/с.")
@@ -6920,15 +6968,18 @@ def try_handle_rp_action_message(message) -> bool:
     actor_tag = _rp_actor_tag(actor)
     target_tag = public_user_tag(int(target_id))
 
-    tail_parts = (tail or "").strip().split(None, 1)
-    extra_tail = tail_parts[1].strip() if len(tail_parts) > 1 else ""
+    if getattr(message, "reply_to_message", None):
+        extra_tail = (tail or "").strip()
+    else:
+        tail_parts = (tail or "").strip().split(None, 1)
+        extra_tail = tail_parts[1].strip() if len(tail_parts) > 1 else ""
 
     text = _rp_emit_action_text(action, actor_tag, target_tag, extra_tail=extra_tail, comment_text=comment_text)
 
     try:
         _REAL_BOT_REPLY_TO(
             message,
-            premiumize_html_text(text),
+            text,
             parse_mode="HTML",
             disable_web_page_preview=True
         )
@@ -11282,7 +11333,7 @@ def cb_rp_accept(cq):
 
         offer_id = int(parts[2])
         row = db_one(
-            "SELECT offer_id, actor_id, action_key, target_id, status, created_at "
+            "SELECT offer_id, actor_id, action_key, target_id, status, created_at, extra_tail, comment_text "
             "FROM rp_offers WHERE offer_id=? LIMIT 1",
             (int(offer_id),)
         )
@@ -11313,8 +11364,17 @@ def cb_rp_accept(cq):
         upsert_user(cq.from_user)
         actor_tag = public_user_tag(actor_id)
         target_tag = _rp_actor_tag(cq.from_user)
-        final_text = _rp_emit_action_text(action, actor_tag, target_tag)
 
+        extra_tail = str(row["extra_tail"] or "").strip()
+        comment_text = str(row["comment_text"] or "").strip()
+
+        final_text = _rp_emit_action_text(
+            action,
+            actor_tag,
+            target_tag,
+            extra_tail=extra_tail,
+            comment_text=comment_text
+        )
         _rp_insert_event(action["trigger_key"], actor_id, int(cq.from_user.id))
         _inc_personal_rp_use(action)
 
@@ -14166,10 +14226,10 @@ def inline_query_handler(inline_query):
 
         # inline RP — только из приватного чата
         if iq_chat_type == "private":
-            rp_action = get_any_rp_action(uid, q)
+            rp_action, rp_extra_tail, rp_comment_text = _parse_inline_rp_query(q_raw, uid)
             if rp_action:
                 action_ref = _encode_rp_action_ref(rp_action)
-                offer_id = _create_rp_offer(uid, action_ref)
+                offer_id = _create_rp_offer(uid, action_ref, extra_tail=rp_extra_tail, comment_text=rp_comment_text)
                 actor_tag = public_user_tag(uid)
                 offer_text = f"Пользователь {actor_tag} предлагает вам действие..."
 
