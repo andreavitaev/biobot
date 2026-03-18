@@ -411,7 +411,7 @@ def random_event_pct(qualification_level: int) -> float:
         q = int(qualification_level or 0)
     except Exception:
         q = 0
-    pct = 15.0 - (q // 10) * 0.1 # шанс срабатывания случайного события
+    pct = 10.0 - (q // 10) * 0.1 # шанс срабатывания случайного события
     if pct < 5.0:
         pct = 5.0
     return float(pct)
@@ -2219,6 +2219,16 @@ def init_db():
         username  TEXT,
         last_seen INTEGER NOT NULL,
         PRIMARY KEY(chat_id, user_id)
+    );
+    """, commit=True)
+
+    db_exec("""
+    CREATE TABLE IF NOT EXISTS bot_group_chats (
+        chat_id      INTEGER PRIMARY KEY,
+        title        TEXT NOT NULL DEFAULT '',
+        chat_type    TEXT NOT NULL DEFAULT '',
+        is_active    INTEGER NOT NULL DEFAULT 1,
+        updated_at   INTEGER NOT NULL DEFAULT 0
     );
     """, commit=True)
 
@@ -4961,10 +4971,11 @@ def _users_collect_rows() -> list[dict]:
         fn = (r["first_name"] or "").strip()
         ln = (r["last_name"] or "").strip()
 
-        if fn or ln:
+        nm = "no name"
+        if fn or ln or un:
             nm = display_name(fn, ln, un, uid)
-        else:
-            nm = "no name"
+            if not nm or nm == str(uid):
+                nm = _raw_name_fallback(fn, ln) or (f"@{un}" if un else "no name")
 
         out.append({
             "user_id": uid,
@@ -4986,14 +4997,22 @@ def render_users_text(page: int) -> tuple[str, Optional[InlineKeyboardMarkup]]:
     start = (page - 1) * USERS_PAGE_SIZE
     part = rows[start:start + USERS_PAGE_SIZE]
 
+    total_users = _users_total_count()
+    total_chats = _bot_group_chat_count()
+
     lines = []
     lines.append("📑 Список пользователей")
     lines.append("")
+    lines.append(f"👤 Кол-во пользователей: {total_users}")
+    lines.append(f"👥 Кол-во чатов: {total_chats}")
+    lines.append("")
     lines.append("<blockquote expandable>")
+
     for idx, row in enumerate(part, start + 1):
         lines.append(
             f"{idx}. {h(row['name'])}|{int(row['user_id'])}|{h(row['username'])}|{h(row['lab_text'])}"
         )
+
     lines.append("</blockquote>")
 
     kb = None
@@ -5006,16 +5025,17 @@ def render_users_text(page: int) -> tuple[str, Optional[InlineKeyboardMarkup]]:
         if page > 1:
             row_btns.append(InlineKeyboardButton("<", callback_data=_users_cb(page - 1)))
 
-        page_nums = [page]
-        if page == 1:
-            page_nums.extend([p for p in (2, 3, 4) if p <= total_pages])
+        page_nums = []
+        if total_pages <= 4:
+            page_nums = list(range(1, total_pages + 1))
+        elif page == 1:
+            page_nums = [1, 2, 3, 4]
         elif page == total_pages:
-            page_nums = [p for p in (max(1, page - 3), max(1, page - 2), max(1, page - 1), page) if p <= total_pages]
+            page_nums = [total_pages - 3, total_pages - 2, total_pages - 1, total_pages]
         else:
-            candidates = [page - 1, page, page + 1, page + 2]
-            page_nums = [p for p in candidates if 1 <= p <= total_pages]
+            page_nums = [max(1, page - 1), page, min(total_pages, page + 1), min(total_pages, page + 2)]
+            page_nums = sorted(dict.fromkeys([p for p in page_nums if 1 <= p <= total_pages]))
 
-        page_nums = sorted(dict.fromkeys(page_nums))
         for p in page_nums:
             if p == page:
                 row_btns.append(InlineKeyboardButton(f"·{p}·", callback_data=_users_cb(page)))
@@ -5793,6 +5813,34 @@ def remember_chat_member(chat_id: int, tg_user):
         (int(chat_id), int(tg_user.id), uname, now_ts()),
         commit=True
     )
+
+def remember_bot_group_chat(chat_id: int, title: str = "", chat_type: str = "group", is_active: int = 1):
+    db_exec(
+        "INSERT INTO bot_group_chats(chat_id, title, chat_type, is_active, updated_at) VALUES (?,?,?,?,?) "
+        "ON CONFLICT(chat_id) DO UPDATE SET "
+        "title=excluded.title, chat_type=excluded.chat_type, is_active=excluded.is_active, updated_at=excluded.updated_at",
+        (
+            int(chat_id),
+            str(title or ""),
+            str(chat_type or ""),
+            int(is_active),
+            int(now_ts())
+        ),
+        commit=True
+    )
+
+def _users_total_count() -> int:
+    row = db_one("SELECT COUNT(*) AS c FROM users")
+    return int(row["c"] or 0) if row else 0
+
+def _bot_group_chat_count() -> int:
+    row = db_one("SELECT COUNT(*) AS c FROM bot_group_chats WHERE COALESCE(is_active,0)=1")
+    cnt = int(row["c"] or 0) if row else 0
+    if cnt > 0:
+        return cnt
+
+    row = db_one("SELECT COUNT(DISTINCT chat_id) AS c FROM chat_members")
+    return int(row["c"] or 0) if row else 0
 
 def sync_chat_admins(chat_id: int):
     """
@@ -10232,7 +10280,8 @@ def on_my_chat_member_update(update):
     """
     Ловит изменения статуса БОТА в чате/ЛС.
     - В ЛС: фиксируем user_id (chat.id == user_id)
-    - В группе/супергруппе: если бота удалили/он вышел — сбрасываем notify_chat_id всем, кто был привязан к этому чату
+    - В группе/супергруппе: ведём список чатов, куда бот добавлен
+    - Если бота удалили/он вышел — помечаем чат неактивным и сбрасываем привязки
     """
     try:
         chat = getattr(update, "chat", None)
@@ -10241,24 +10290,35 @@ def on_my_chat_member_update(update):
 
         chat_id = int(getattr(chat, "id", 0) or 0)
         chat_type = (getattr(chat, "type", "") or "").lower()
+        chat_title = (
+            getattr(chat, "title", None)
+            or getattr(chat, "full_name", None)
+            or getattr(chat, "first_name", None)
+            or ""
+        )
 
         new_cm = getattr(update, "new_chat_member", None)
         status = (getattr(new_cm, "status", "") or "").lower() if new_cm else ""
 
-        if chat_type in ("group", "supergroup") and status in ("left", "kicked"):
-            try:
-                db_exec("DELETE FROM chat_members WHERE chat_id=?", (chat_id,), commit=True)
-            except Exception:
-                pass
-            try:
-                db_exec(
-                    "UPDATE users SET notify_chat_id=0, notify_off=0 WHERE notify_chat_id=?",
-                    (chat_id,),
-                    commit=True
-                )
-            except Exception:
-                pass
-            return
+        if chat_type in ("group", "supergroup"):
+            if status in ("left", "kicked"):
+                remember_bot_group_chat(chat_id, title=chat_title, chat_type=chat_type, is_active=0)
+                try:
+                    db_exec("DELETE FROM chat_members WHERE chat_id=?", (chat_id,), commit=True)
+                except Exception:
+                    pass
+                try:
+                    db_exec(
+                        "UPDATE users SET notify_chat_id=0, notify_off=0 WHERE notify_chat_id=?",
+                        (chat_id,),
+                        commit=True
+                    )
+                except Exception:
+                    pass
+                return
+
+            if status in ("member", "administrator"):
+                remember_bot_group_chat(chat_id, title=chat_title, chat_type=chat_type, is_active=1)
 
         if chat_type == "private":
             fake_user = type("U", (), {})()
@@ -11273,7 +11333,7 @@ def cb_users_ui(cq):
     except Exception as e:
         send_error_report("cb_users_ui", e)
         try:
-            bot.answer_callback_query(cq.id)
+            bot.answer_callback_query(cq.id, "Не удалось переключить страницу.")
         except Exception:
             pass
 
