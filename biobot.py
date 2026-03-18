@@ -17,6 +17,7 @@ from datetime import datetime, timedelta
 from typing import Optional, Tuple, List, Dict
 
 import telebot
+from telebot.handler_backends import ContinueHandling
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, InlineQueryResultArticle, InputTextMessageContent
 
 # CONFIGS
@@ -93,6 +94,10 @@ RP_ACTIONS_PATH = os.path.join(DATA_DIR, "rp_actions.txt")
 _RP_ACTIONS_CACHE: Optional[dict] = None
 _RP_ACTIONS_CACHE_MTIME: float = -1.0
 
+# emoji pack viewer cache
+EMOJI_PACK_PAGE_SIZE = 50
+_EMOJI_PACK_VIEW_CACHE: Dict[str, dict] = {}
+
 def load_random_events() -> list[str]:
     global _RANDOM_EVENTS_CACHE
     if _RANDOM_EVENTS_CACHE is not None:
@@ -159,32 +164,39 @@ def load_rp_actions() -> dict:
                 if not s or s.startswith("#"):
                     continue
 
-                main = s
+                parts = [p.strip() for p in s.split("|")]
+
+                emoji = ""
+                premium_id = ""
+                trigger = ""
+                action_text = ""
                 stat1 = ""
                 stat2 = ""
+                if len(parts) >= 4 and (parts[1].isdigit() or parts[1] == ""):
+                    while len(parts) < 6:
+                        parts.append("")
+                    emoji = parts[0]
+                    premium_id = parts[1]
+                    trigger = parts[2]
+                    action_text = parts[3]
+                    stat1 = parts[4]
+                    stat2 = parts[5]
+                else:
+                    while len(parts) < 5:
+                        parts.append("")
+                    emoji = parts[0]
+                    premium_id = ""
+                    trigger = parts[1]
+                    action_text = parts[2]
+                    stat1 = parts[3]
+                    stat2 = parts[4]
 
-                if "|" in s:
-                    parts = s.split("|")
-                    main = parts[0].strip()
-                    if len(parts) >= 2:
-                        if len(parts) >= 3:
-                            stat1 = parts[1].strip()
-                            stat2 = parts[2].strip()
-                        else:
-                            stat1, stat2 = _split_stat_tail(parts[1].strip())
-
-                m = re.match(
-                    r"^(?P<emoji>\S+):(?P<premium>\S+)\s+(?P<trigger>\S+)\s+(?P<action>.+)$",
-                    main,
-                    flags=re.UNICODE
-                )
-                if not m:
-                    continue
-
-                emoji = m.group("emoji").strip()
-                premium_id = m.group("premium").strip()
-                trigger = m.group("trigger").strip()
-                action_text = m.group("action").strip()
+                emoji = (emoji or "").strip()
+                premium_id = (premium_id or "").strip()
+                trigger = re.sub(r"\s+", " ", (trigger or "").strip())
+                action_text = re.sub(r"\s+", " ", (action_text or "").strip())
+                stat1 = re.sub(r"\s+", " ", (stat1 or "").strip())
+                stat2 = re.sub(r"\s+", " ", (stat2 or "").strip())
 
                 if not trigger or not action_text:
                     continue
@@ -196,8 +208,8 @@ def load_rp_actions() -> dict:
                     "trigger": trigger,
                     "trigger_key": key,
                     "action_text": action_text,
-                    "stat1": stat1.strip(),
-                    "stat2": stat2.strip(),
+                    "stat1": stat1,
+                    "stat2": stat2,
                 }
     except Exception:
         out = {}
@@ -208,6 +220,191 @@ def load_rp_actions() -> dict:
 
 def get_rp_action(trigger: str):
     return load_rp_actions().get((trigger or "").strip().lower())
+
+def _normalize_rp_trigger(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip()).lower()
+
+def load_personal_rp_actions(user_id: int) -> dict:
+    rows = db_all(
+        "SELECT action_id, user_id, trigger, trigger_key, emoji, premium_id, action_text, uses_count, created_at "
+        "FROM personal_rp_actions WHERE user_id=? ORDER BY action_id ASC",
+        (int(user_id),)
+    ) or []
+
+    out = {}
+    for r in rows:
+        key = (r["trigger_key"] or "").strip().lower()
+        if not key:
+            continue
+        out[key] = {
+            "source": "personal",
+            "action_id": int(r["action_id"]),
+            "user_id": int(r["user_id"]),
+            "emoji": (r["emoji"] or "").strip(),
+            "premium_id": (r["premium_id"] or "").strip(),
+            "trigger": (r["trigger"] or "").strip(),
+            "trigger_key": key,
+            "action_text": (r["action_text"] or "").strip(),
+            "stat1": "",
+            "stat2": "",
+            "uses_count": int(r["uses_count"] or 0),
+        }
+    return out
+
+def get_any_rp_action(user_id: int, trigger: str):
+    key = _normalize_rp_trigger(trigger)
+    if not key:
+        return None
+
+    personal = load_personal_rp_actions(int(user_id)).get(key)
+    if personal:
+        return personal
+
+    global_action = get_rp_action(key)
+    if global_action:
+        out = dict(global_action)
+        out["source"] = "global"
+        return out
+
+    return None
+
+def _all_rp_actions_for_user(user_id: int) -> list[dict]:
+    actions = []
+    actions.extend(load_personal_rp_actions(int(user_id)).values())
+    for a in load_rp_actions().values():
+        row = dict(a)
+        row["source"] = "global"
+        actions.append(row)
+
+    actions.sort(key=lambda a: len((a.get("trigger") or "").strip()), reverse=True)
+    return actions
+
+def _encode_rp_action_ref(action: dict) -> str:
+    if str(action.get("source") or "") == "personal":
+        return f"p:{int(action['action_id'])}"
+    return f"g:{str(action['trigger_key'])}"
+
+def _resolve_rp_action_ref(action_ref: str, actor_id: int):
+    ref = str(action_ref or "").strip()
+    if ref.startswith("p:"):
+        try:
+            aid = int(ref.split(":", 1)[1])
+        except Exception:
+            return None
+        row = db_one(
+            "SELECT action_id, user_id, trigger, trigger_key, emoji, premium_id, action_text, uses_count "
+            "FROM personal_rp_actions WHERE action_id=? AND user_id=? LIMIT 1",
+            (aid, int(actor_id))
+        )
+        if not row:
+            return None
+        return {
+            "source": "personal",
+            "action_id": int(row["action_id"]),
+            "user_id": int(row["user_id"]),
+            "emoji": (row["emoji"] or "").strip(),
+            "premium_id": (row["premium_id"] or "").strip(),
+            "trigger": (row["trigger"] or "").strip(),
+            "trigger_key": (row["trigger_key"] or "").strip(),
+            "action_text": (row["action_text"] or "").strip(),
+            "stat1": "",
+            "stat2": "",
+            "uses_count": int(row["uses_count"] or 0),
+        }
+
+    if ref.startswith("g:"):
+        key = ref.split(":", 1)[1].strip().lower()
+        action = get_rp_action(key)
+        if action:
+            out = dict(action)
+            out["source"] = "global"
+            return out
+        return None
+
+    action = get_rp_action(ref)
+    if action:
+        out = dict(action)
+        out["source"] = "global"
+        return out
+    return None
+
+def _inc_personal_rp_use(action: dict):
+    if str(action.get("source") or "") != "personal":
+        return
+    db_exec(
+        "UPDATE personal_rp_actions SET uses_count=COALESCE(uses_count,0)+1 WHERE action_id=?",
+        (int(action["action_id"]),),
+        commit=True
+    )
+
+def _parse_mrp_create_from_text(text: str):
+    raw = strip_bio_prefix((text or "").strip())
+    if not raw:
+        return None
+
+    first, _, _ = raw.partition("\n")
+    first = first.strip()
+
+    if first.startswith("+"):
+        first = first[1:].lstrip()
+
+    low = first.lower()
+    if not low.startswith("мрп "):
+        return None
+
+    body = first[4:].strip()
+    parts = [p.strip() for p in body.split("/")]
+    if len(parts) != 3:
+        return None
+
+    trigger = re.sub(r"\s+", " ", parts[0].strip())
+    emoji_part = re.sub(r"\s+", " ", parts[1].strip())
+    action_text = re.sub(r"\s+", " ", parts[2].strip())
+
+    if not trigger or not action_text:
+        return None
+
+    emoji = ""
+    premium_id = ""
+
+    ep = emoji_part.split()
+    if ep:
+        emoji = ep[0].strip()
+    if len(ep) >= 2:
+        premium_id = ep[1].strip()
+
+    return {
+        "trigger": trigger,
+        "trigger_key": _normalize_rp_trigger(trigger),
+        "emoji": emoji,
+        "premium_id": premium_id,
+        "action_text": action_text,
+    }
+
+def render_personal_rp_list_text(user_id: int) -> str:
+    rows = db_all(
+        "SELECT action_id, trigger, emoji, premium_id, uses_count "
+        "FROM personal_rp_actions WHERE user_id=? ORDER BY action_id ASC",
+        (int(user_id),)
+    ) or []
+
+    lines = ["📋 Ваш список личных рп команд:", ""]
+
+    if not rows:
+        lines.append("<blockquote expandable>Список пока пуст.</blockquote>")
+    else:
+        lines.append("<blockquote expandable>")
+        for idx, r in enumerate(rows, 1):
+            emo = rp_premium_emoji_html((r["emoji"] or "").strip(), (r["premium_id"] or "").strip())
+            lines.append(
+                f"{idx}.{emo}| <code>{h((r['trigger'] or '').strip())}</code> → {int(r['uses_count'] or 0)}"
+            )
+        lines.append("</blockquote>")
+
+    lines.append("💬 Чтобы создать личную рп команду, введите\n<code>+Мрп</code> <b>[название] / [эмодзи] [айди премиум эмодзи (не обязятельно)] / [текст рп действия]</b>")
+    lines.append("Чтобы удалить личную рп команду — <code>-Мрп</code> <b>[название / номер]</b>")
+
+    return "\n".join(lines)
 
 def random_event_pct(qualification_level: int) -> float:
     try:
@@ -378,7 +575,7 @@ def render_autoanswer_status(uid: int) -> str:
         "🦠 [Автоответчик]:\n"
         "Функция ответного заражения\n\n"
         f"Статус: {status_icon}\n"
-        f"✅Доступно авто-ответов: {avail}\n"
+        f"✅Доступно авто-ответов: {avail}/{limit}\n"
         f"⏱️Сбросится через {_format_hm_from_seconds(left)}\n\n"
         "💬Для увеличения лимита автоответов, используйте команду <code>Био +предотвращение</code>"
     )
@@ -857,14 +1054,15 @@ PREMIUM_EMOJI_IDS: Dict[str, str] = {
     "🌡️": "5470049770997292425",    
     "💥": "5197414236413786044",
     "🦠": "5451936901772616837",
-    "☠️": "",
+    "☠️": "5370842086658546991",
     "🧿": "5296426834748002089",
     "🛡️": "5210988351703771812",
     "⚗️": "5262680005393025261",
     "💉": "5472317878801800869",
     "🧪": "5411512278740640309",
-    "📟": "5197423165650795840",
-    "🛰️": "5195361551283942795",
+    "📟": "5195361551283942795",
+    "🛰️": "5447213996820168272",
+    "🤖": "5355051922862653659",
     "🧮": "5190741648237161191",
     "⏱️": "5258258882022612173",
     "⛑️": "5264892613630111886",
@@ -875,7 +1073,9 @@ PREMIUM_EMOJI_IDS: Dict[str, str] = {
     "🧾": "5444860552310457690",
     "📝": "5334882760735598374",
     "📊": "5431577498364158238",
-    "✅": "5260416304224936047",
+    "✅": "5447298551841322535",
+    "❎": "5445283164207479914",
+    "⭕": "5260416304224936047",
     "❌": "5260342697075416641",
     "⚠️": "5447381715293074599",
     "🔒": "5258458340303866282",
@@ -2042,6 +2242,29 @@ def init_db():
         created_at    INTEGER NOT NULL DEFAULT 0
     );
     """, commit=True)
+
+    db_exec("""
+    CREATE TABLE IF NOT EXISTS personal_rp_actions (
+        action_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id        INTEGER NOT NULL,
+        trigger        TEXT NOT NULL,
+        trigger_key    TEXT NOT NULL,
+        emoji          TEXT NOT NULL DEFAULT '',
+        premium_id     TEXT NOT NULL DEFAULT '',
+        action_text    TEXT NOT NULL,
+        uses_count     INTEGER NOT NULL DEFAULT 0,
+        created_at     INTEGER NOT NULL DEFAULT 0
+    );
+    """, commit=True)
+
+    db_exec(
+        "CREATE INDEX IF NOT EXISTS idx_personal_rp_user ON personal_rp_actions(user_id, action_id);",
+        commit=True
+    )
+    db_exec(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_personal_rp_user_trigger ON personal_rp_actions(user_id, trigger_key);",
+        commit=True
+    )
 
     # индексы для топов/болезней
     try:
@@ -4110,7 +4333,7 @@ def _best_known_display_by_uid(user_id: int) -> tuple[str, str, int]:
         un = _normalize_username_for_link((row["username"] or ""))
         disp = display_name(row["first_name"] or "", row["last_name"] or "", un, uid)
 
-        if disp == str(uid):
+        if disp == str(uid) or disp == "no name":
             cm_un = _best_known_username_by_uid(uid)
             if cm_un:
                 return cm_un, cm_un, uid
@@ -4121,9 +4344,16 @@ def _best_known_display_by_uid(user_id: int) -> tuple[str, str, int]:
 
         return disp, un, uid
 
-    cm_un = _best_known_username_by_uid(uid)
-    if cm_un:
-        return cm_un, cm_un, uid
+    cm = db_one(
+        "SELECT username FROM chat_members "
+        "WHERE user_id=? "
+        "ORDER BY COALESCE(last_seen,0) DESC LIMIT 1",
+        (uid,)
+    )
+    if cm:
+        cm_un = _normalize_username_for_link((cm["username"] or ""))
+        if cm_un:
+            return cm_un, cm_un, uid
 
     return "неизвестный пользователь", "", uid
 
@@ -4200,26 +4430,46 @@ def resolve_rp_target(message, actor_id: int, args_text: str):
 
     return None, None
 
-def _parse_rp_message(text: str):
+def _parse_rp_message(text: str, actor_id: int):
     raw = strip_bio_prefix((text or "").strip())
     if not raw:
-        return None, ""
+        return None, "", ""
 
-    first, _, _ = raw.partition("\n")
-    parts = first.strip().split(None, 1)
-    if not parts:
-        return None, ""
+    first, _, comment = raw.partition("\n")
+    first = first.strip()
+    comment = comment.strip()
 
-    action = get_rp_action(parts[0])
-    if not action:
-        return None, ""
+    actions = _all_rp_actions_for_user(int(actor_id))
+    if not actions:
+        return None, "", ""
 
-    tail = parts[1].strip() if len(parts) > 1 else ""
-    return action, tail
+    low = first.lower()
 
-def _rp_emit_action_text(action: dict, actor_tag: str, target_tag: str) -> str:
+    for action in actions:
+        trig = (action["trigger"] or "").strip().lower()
+        if not trig:
+            continue
+
+        if low == trig:
+            return action, "", comment
+
+        if low.startswith(trig + " "):
+            tail = first[len(action["trigger"]):].strip()
+            return action, tail, comment
+
+    return None, "", ""
+
+def _rp_emit_action_text(action: dict, actor_tag: str, target_tag: str, extra_tail: str = "", comment_text: str = "") -> str:
     emo = rp_premium_emoji_html(action["emoji"], action["premium_id"])
-    return f"{emo}| {actor_tag} {h(action['action_text'])} {target_tag}"
+    extra_tail = (extra_tail or "").strip()
+    comment_text = (comment_text or "").strip()
+
+    text = f"{emo}| {actor_tag} {h(action['action_text'])} {target_tag}"
+    if extra_tail:
+        text += f" {h(extra_tail)}"
+    if comment_text:
+        text += f"\n💬 Комментарий: {h(comment_text)}"
+    return text
 
 def _rp_insert_event(action_key: str, actor_id: int, target_id: int):
     db_exec(
@@ -4634,6 +4884,106 @@ def render_blacklist_text(page: int) -> tuple[str, Optional[InlineKeyboardMarkup
 
     return "\n".join(lines), kb
 
+USERS_PAGE_SIZE = 30
+
+def _users_cb(page: int) -> str:
+    return f"{USERSUI_TAG}:{int(page)}"
+
+def _users_parse_cb(data: str) -> Optional[int]:
+    try:
+        p = (data or "").split(":")
+        if len(p) != 2 or p[0] != USERSUI_TAG:
+            return None
+        return int(p[1])
+    except Exception:
+        return None
+
+def _users_collect_rows() -> list[dict]:
+    rows = db_all(
+        "SELECT u.user_id, u.username, u.first_name, u.last_name, u.last_seen, u.is_placeholder, "
+        "COALESCE(l.lab_active,0) AS lab_active "
+        "FROM users u "
+        "LEFT JOIN labs l ON l.user_id=u.user_id "
+        "ORDER BY COALESCE(u.last_seen,0) DESC, u.user_id ASC"
+    ) or []
+
+    out = []
+    for r in rows:
+        uid = int(r["user_id"])
+        un = (r["username"] or "").strip()
+        fn = (r["first_name"] or "").strip()
+        ln = (r["last_name"] or "").strip()
+
+        if fn or ln:
+            nm = display_name(fn, ln, un, uid)
+        else:
+            nm = "no name"
+
+        out.append({
+            "user_id": uid,
+            "name": nm,
+            "username": f"@{un}" if un else "—",
+            "lab_text": "есть лаба" if int(r["lab_active"] or 0) == 1 else "нет лабы",
+        })
+    return out
+
+def render_users_text(page: int) -> tuple[str, Optional[InlineKeyboardMarkup]]:
+    rows = _users_collect_rows()
+    total = len(rows)
+
+    if total <= 0:
+        return "📑 Список пользователей пуст.", None
+
+    total_pages = max(1, (total + USERS_PAGE_SIZE - 1) // USERS_PAGE_SIZE)
+    page = max(1, min(int(page), total_pages))
+    start = (page - 1) * USERS_PAGE_SIZE
+    part = rows[start:start + USERS_PAGE_SIZE]
+
+    lines = []
+    lines.append("📑 Список пользователей")
+    lines.append("")
+    lines.append("<blockquote expandable>")
+    for idx, row in enumerate(part, start + 1):
+        lines.append(
+            f"{idx}. {h(row['name'])}|{int(row['user_id'])}|{h(row['username'])}|{h(row['lab_text'])}"
+        )
+    lines.append("</blockquote>")
+
+    kb = None
+    if total_pages > 1:
+        kb = InlineKeyboardMarkup(row_width=8)
+        row_btns = []
+
+        if page > 2:
+            row_btns.append(InlineKeyboardButton("<<", callback_data=_users_cb(1)))
+        if page > 1:
+            row_btns.append(InlineKeyboardButton("<", callback_data=_users_cb(page - 1)))
+
+        page_nums = [page]
+        if page == 1:
+            page_nums.extend([p for p in (2, 3, 4) if p <= total_pages])
+        elif page == total_pages:
+            page_nums = [p for p in (max(1, page - 3), max(1, page - 2), max(1, page - 1), page) if p <= total_pages]
+        else:
+            candidates = [page - 1, page, page + 1, page + 2]
+            page_nums = [p for p in candidates if 1 <= p <= total_pages]
+
+        page_nums = sorted(dict.fromkeys(page_nums))
+        for p in page_nums:
+            if p == page:
+                row_btns.append(InlineKeyboardButton(f"·{p}·", callback_data=_users_cb(page)))
+            else:
+                row_btns.append(InlineKeyboardButton(str(p), callback_data=_users_cb(p)))
+
+        if page < total_pages:
+            row_btns.append(InlineKeyboardButton(">", callback_data=_users_cb(page + 1)))
+        if page < total_pages - 1:
+            row_btns.append(InlineKeyboardButton(">>", callback_data=_users_cb(total_pages)))
+
+        kb.row(*row_btns)
+
+    return "\n".join(lines), kb
+
 def build_agents_panel_text(user_id: int) -> str:
     uid = int(user_id)
     self_row = get_user_row(uid)
@@ -4671,11 +5021,10 @@ def build_agents_panel_text(user_id: int) -> str:
 
     lines.append("")
     lines.append("💬 Следующие доступные Вам команды:")
-
     if uid == int(CREATOR_ID):
         lines.append("/owner — назначить агента")
         lines.append("/owner_remove — снять права с агента")
-
+        lines.append("/users — список всех пользователей")
     lines.append("/bot_ban — заблокировать пользователя")
     lines.append("/bot_unban — разблокировать пользователя")
     lines.append("/remake_lab — восстановить лабораторию")
@@ -5442,7 +5791,9 @@ def resolve_target_from_reply_or_args(message, parsed: Optional["Parsed"]):
     """
     Возвращает (target_id, target_user_obj_or_None).
     При reply — всегда берём user из reply_to_message и сразу фиксируем его.
-    При args — поддерживает @username / число / (для группы) chat_members.username.
+    При args — поддерживает РОВНО ОДИН target token:
+        @username / uid / ссылка
+    Если токенов больше одного — считаем ввод невалидным.
     """
     if message.reply_to_message and message.reply_to_message.from_user:
         u = message.reply_to_message.from_user
@@ -5450,22 +5801,42 @@ def resolve_target_from_reply_or_args(message, parsed: Optional["Parsed"]):
         return int(u.id), u
 
     if parsed and parsed.args:
-        token = parsed.args.split()[0].strip()
-        if token.startswith("@"):
-            uname = token.lstrip("@").strip().lower()
-            tid = find_user_id_by_username(token)
-            if tid is None and message.chat.type in ("group", "supergroup"):
-                r = db_one(
-                    "SELECT user_id FROM chat_members WHERE chat_id=? AND username=? LIMIT 1",
-                    (int(message.chat.id), uname)
-                )
-                if r:
-                    tid = int(r["user_id"])
-            return (int(tid), None) if tid is not None else (None, None)
-        if token.isdigit():
-            return int(token), None
+        args = (parsed.args or "").strip()
+        toks = args.split()
+        if len(toks) != 1:
+            return None, None
+
+        token = toks[0].strip()
+        tid = _strict_single_target_token(token)
+        if tid is not None:
+            return int(tid), None
 
     return None, None
+
+def _strict_single_target_token(token: str):
+    tok = (token or "").strip()
+    if not tok:
+        return None
+
+    tid = _resolve_or_create_infect_target(tok)
+    if tid is not None:
+        return int(tid)
+
+    return None
+
+def strict_single_target_args_ok(message, parsed: Optional["Parsed"], *, allow_empty: bool) -> bool:
+    if message.reply_to_message and message.reply_to_message.from_user:
+        return True
+
+    args = (parsed.args or "").strip() if parsed else ""
+    if not args:
+        return bool(allow_empty)
+
+    toks = args.split()
+    if len(toks) != 1:
+        return False
+
+    return _strict_single_target_token(toks[0]) is not None
 
 def is_bot_target(target_id: Optional[int], target_user_obj, token: str = "") -> bool:
     try:
@@ -5557,13 +5928,14 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
         c = parts[0].lower()
         a = parts[1].strip() if len(parts) > 1 else ""
 
-        if c in ("owner", "агент", "owner_remove", "agents", "blacklist", "bot_ban", "bot_unban", "remake_lab"):
+        if c in ("owner", "агент", "owner_remove", "agents", "blacklist", "users", "bot_ban", "bot_unban", "remake_lab"):
             cmd_map = {
                 "owner": "owner",
                 "агент": "owner",
                 "owner_remove": "owner_remove",
                 "agents": "agents_panel",
                 "blacklist": "blacklist",
+                "users": "users_list",
                 "bot_ban": "bot_ban",
                 "bot_unban": "bot_unban",
                 "remake_lab": "remake_lab",
@@ -5702,6 +6074,13 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
     if low in ("рпстат", "рпстата", "рп стата"):
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="rp_stats", args="")
 
+    if low.startswith("пак айди ") or low.startswith("пак ид ") or low.startswith("пак id ") \
+       or low.startswith("эмодзипак айди ") or low.startswith("эмодзипак ид ") or low.startswith("эмодзипак id "):
+        parts = t.split(" ", 2)
+        if len(parts) >= 3:
+            if parts[0].lower() in ("пак", "эмодзипак"):
+                return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="emoji_pack_ids", args=parts[2].strip())
+
     # агент команды
     if low == "bot_ban" or low.startswith("bot_ban "):
         rest = ""
@@ -5764,6 +6143,22 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
     if sign in ("+", "-") and low in ("уведомления", "уведы"):
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None,
                       cmd=("notify_on" if sign == "+" else "notify_off"), args="")
+
+    # мрп
+    if sign == "+" and (low == "мрп" or low.startswith("мрп ")):
+        rest = ""
+        if " " in t:
+            rest = t.split(" ", 1)[1].strip()
+        return Parsed(raw=raw_multiline, has_prefix_char=False, prefix_char=None, cmd="mrp_add", args=rest)
+
+    if sign == "-" and (low == "мрп" or low.startswith("мрп ")):
+        rest = ""
+        if " " in t:
+            rest = t.split(" ", 1)[1].strip()
+        return Parsed(raw=raw_multiline, has_prefix_char=False, prefix_char=None, cmd="mrp_delete", args=rest)
+
+    if low == "мрп":
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="mrp_list", args="")
 
     # автоответчик
     if sign in ("+", "-") and low in ("автоответчик", "ао", "заражалка", "автозаражалка", "авто заражалка", "аз"):
@@ -6065,6 +6460,41 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
 
     return None
 
+# MRP FILTER
+def is_reserved_bot_or_rp_trigger(text: str) -> bool:
+    s = strip_bio_prefix((text or "").strip())
+    if not s:
+        return False
+
+    first, _, _ = s.partition("\n")
+    probe = first.strip()
+    if not probe:
+        return False
+
+    parsed = parse_message_as_command(probe)
+    if parsed is not None:
+        return True
+
+    action = get_rp_action(probe)
+    if action is not None:
+        return True
+
+    return False
+
+def is_reserved_for_personal_rp(user_id: int, trigger: str) -> bool:
+    probe = _normalize_rp_trigger(trigger)
+    if not probe:
+        return True
+
+    if is_reserved_bot_or_rp_trigger(probe):
+        return True
+
+    row = db_one(
+        "SELECT 1 FROM personal_rp_actions WHERE user_id=? AND trigger_key=? LIMIT 1",
+        (int(user_id), probe)
+    )
+    return row is not None
+
 # START MESSAGE / SUPPORT LIST
 def split_agents_by_online(agents: List[sqlite3.Row]) -> Tuple[List[sqlite3.Row], List[sqlite3.Row]]:
     online, offline = [], []
@@ -6093,10 +6523,10 @@ def build_start_text(user) -> str:
 
     lines = []
     lines.append(f'👋 Приветствуем вас, <b>{h(u_name)}</b>, в {h(BOT_TITLE)}')
-    lines.append(f'Я создан на основе старой игры бота <a href="{h(IRIS_BOT_LINK)}">Iris | Чат-менеджер</a> с некоторыми доработками.\n\n')
-    lines.append("Что вас интересует?\n")
-    lines.append(f'1. <code>Био настройки</code> — более гибкая настройка параметров уведомлений и прочего.\n')
-    lines.append(f'2. <code>Био репорт</code> — если заметили, что в моей работе что-то не так, уведомите агентов.\n\n')
+    lines.append(f'Я создан на основе старой игры бота <a href="{h(IRIS_BOT_LINK)}">Iris | Чат-менеджер</a> с некоторыми доработками.\n')
+    lines.append("Что вас интересует?")
+    lines.append(f'1. <code>Био настройки</code> — более гибкая настройка параметров уведомлений и прочего.')
+    lines.append(f'2. <code>Био репорт</code> — если заметили, что в моей работе что-то не так, уведомите агентов.\n')
 
     lines.append('👨‍⚕️ <b>Агенты поддержки</b>, которые могут ответить на ваши вопросы')
 
@@ -6149,6 +6579,162 @@ def handle_commands_link(message):
         disable_web_page_preview=False
     )
 
+# EMOJI 
+def _extract_emoji_pack_name_and_url(text: str) -> tuple[str, str]:
+    s = (text or "").strip()
+    if not s:
+        return "", ""
+
+    toks = s.split()
+    if len(toks) != 1:
+        return "", ""
+
+    token = toks[0].strip()
+
+    m = re.match(r"^(?:https?://)?t\.me/addemoji/([A-Za-z0-9_]{1,64})/?$", token, flags=re.IGNORECASE)
+    if m:
+        short_name = m.group(1)
+        return short_name, token if token.startswith(("http://", "https://")) else f"https://t.me/addemoji/{short_name}"
+
+    m = re.match(r"^(?:https?://)?t\.me/addstickers/([A-Za-z0-9_]{1,64})/?$", token, flags=re.IGNORECASE)
+    if m:
+        short_name = m.group(1)
+        return short_name, token if token.startswith(("http://", "https://")) else f"https://t.me/addstickers/{short_name}"
+
+    # fallback: allow plain short name
+    if re.fullmatch(r"[A-Za-z0-9_]{1,64}", token):
+        return token, f"https://t.me/addemoji/{token}"
+
+    return "", ""
+
+def _custom_pack_emoji_html(emoji_fallback: str, custom_emoji_id: str) -> str:
+    emo = (emoji_fallback or "🙂").strip() or "🙂"
+    ceid = (custom_emoji_id or "").strip()
+    if PREMIUM_EMOJI_ENABLED and ceid:
+        return f'<tg-emoji emoji-id="{h(ceid)}">{h(emo)}</tg-emoji>'
+    return h(emo)
+
+def render_emoji_pack_ids_text(pack_title: str, pack_url: str, stickers: list) -> str:
+    title_link = f'<a href="{h(pack_url)}">{h(pack_title)}</a>' if pack_url else h(pack_title)
+
+    lines = [f"📋 Список всех премиум эмодзи пака {title_link}", ""]
+    if not stickers:
+        lines.append("<blockquote expandable>Список пуст.</blockquote>")
+        return "\n".join(lines)
+
+    lines.append("<blockquote expandable>")
+    idx = 0
+    for st in stickers:
+        ceid = str(getattr(st, "custom_emoji_id", "") or "").strip()
+        if not ceid:
+            continue
+
+        idx += 1
+        emo = _custom_pack_emoji_html(str(getattr(st, "emoji", "") or "🙂"), ceid)
+        lines.append(f"{idx}|{emo}|<code>{h(ceid)}</code>")
+
+    if idx == 0:
+        lines.append("В паке не найдено premium/custom emoji.")
+    lines.append("</blockquote>")
+    return "\n".join(lines)
+
+def _emoji_pack_cache_key(short_name: str) -> str:
+    s = re.sub(r"[^A-Za-z0-9_]", "", (short_name or "").strip())
+    return s[:40] if s else "pack"
+
+def _emoji_pack_cb(cache_key: str, page: int) -> str:
+    return f"{EMPACKUI_TAG}:{cache_key}:{int(page)}"
+
+def _emoji_pack_parse_cb(data: str) -> tuple[str, Optional[int]]:
+    try:
+        p = (data or "").split(":")
+        if len(p) != 3 or p[0] != EMPACKUI_TAG:
+            return "", None
+        return p[1], int(p[2])
+    except Exception:
+        return "", None
+
+def _collect_custom_emoji_items(stickers: list) -> list[tuple[str, str]]:
+    items = []
+    for st in (stickers or []):
+        ceid = str(getattr(st, "custom_emoji_id", "") or "").strip()
+        if not ceid:
+            continue
+        fallback_emoji = str(getattr(st, "emoji", "") or "🙂")
+        items.append((fallback_emoji, ceid))
+    return items
+
+def kb_emoji_pack_pages(cache_key: str, page: int, total_pages: int) -> Optional[InlineKeyboardMarkup]:
+    if total_pages <= 1:
+        return None
+
+    page = max(1, min(int(page), int(total_pages)))
+    kb = InlineKeyboardMarkup(row_width=8)
+    row_btns = []
+
+    if page > 2:
+        row_btns.append(InlineKeyboardButton("<<", callback_data=_emoji_pack_cb(cache_key, 1)))
+    if page > 1:
+        row_btns.append(InlineKeyboardButton("<", callback_data=_emoji_pack_cb(cache_key, page - 1)))
+
+    page_nums = [page]
+    if page == 1:
+        page_nums.extend([p for p in (2, 3, 4) if p <= total_pages])
+    elif page == total_pages:
+        page_nums = [p for p in (max(1, page - 3), max(1, page - 2), max(1, page - 1), page) if p <= total_pages]
+    else:
+        candidates = [page - 1, page, page + 1, page + 2]
+        page_nums = [p for p in candidates if 1 <= p <= total_pages]
+
+    page_nums = sorted(dict.fromkeys(page_nums))
+    for p in page_nums:
+        if p == page:
+            row_btns.append(InlineKeyboardButton(f"·{p}·", callback_data=_emoji_pack_cb(cache_key, page)))
+        else:
+            row_btns.append(InlineKeyboardButton(str(p), callback_data=_emoji_pack_cb(cache_key, p)))
+
+    if page < total_pages:
+        row_btns.append(InlineKeyboardButton(">", callback_data=_emoji_pack_cb(cache_key, page + 1)))
+    if page < total_pages - 1:
+        row_btns.append(InlineKeyboardButton(">>", callback_data=_emoji_pack_cb(cache_key, total_pages)))
+
+    kb.row(*row_btns)
+    return kb
+
+def render_emoji_pack_ids_page(pack_title: str, pack_url: str, items: list, page: int) -> tuple[str, Optional[InlineKeyboardMarkup]]:
+    title_link = f'<a href="{h(pack_url)}">{h(pack_title)}</a>' if pack_url else h(pack_title)
+
+    total = len(items)
+    total_pages = max(1, (total + EMOJI_PACK_PAGE_SIZE - 1) // EMOJI_PACK_PAGE_SIZE)
+    page = max(1, min(int(page), total_pages))
+    start = (page - 1) * EMOJI_PACK_PAGE_SIZE
+    part = items[start:start + EMOJI_PACK_PAGE_SIZE]
+
+    lines = [f"📋 Список всех премиум эмодзи пака {title_link}", ""]
+
+    if not items:
+        lines.append("<blockquote expandable>Список пуст.</blockquote>")
+        return "\n".join(lines), None
+
+    lines.append("<blockquote expandable>")
+    for idx, (fallback_emoji, ceid) in enumerate(part, start + 1):
+        emo = _custom_pack_emoji_html(fallback_emoji, ceid)
+        lines.append(f"{idx}|{emo}|<code>{h(ceid)}</code>")
+
+    lines.append("</blockquote>")
+
+    kb = None
+    if total_pages > 1:
+        cache_key = ""
+        for k, v in _EMOJI_PACK_VIEW_CACHE.items():
+            if v.get("title") == pack_title and v.get("url") == pack_url and v.get("items") == items:
+                cache_key = k
+                break
+        if cache_key:
+            kb = kb_emoji_pack_pages(cache_key, page, total_pages)
+
+    return "\n".join(lines), kb
+
 def handle_rp_stats_command(message):
     chat_type = (getattr(message.chat, "type", "") or "").lower()
     if chat_type not in ("private", "group", "supergroup"):
@@ -6171,6 +6757,138 @@ def handle_rp_stats_command(message):
     except Exception:
         return
 
+def handle_emoji_pack_ids_command(message, parsed: Parsed):
+    short_name, pack_url = _extract_emoji_pack_name_and_url((parsed.args or "").strip())
+    if not short_name:
+        bot.reply_to(
+            message,
+            "📑 Укажите одну ссылку на эмодзи-пак Telegram после команды.",
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
+        return
+
+    try:
+        st_set = bot.get_sticker_set(short_name)
+    except Exception:
+        bot.reply_to(
+            message,
+            "📑 Не удалось открыть указанный эмодзи-пак.",
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
+        return
+
+    title = str(getattr(st_set, "title", "") or short_name)
+    stickers = list(getattr(st_set, "stickers", None) or [])
+    items = _collect_custom_emoji_items(stickers)
+
+    cache_key = _emoji_pack_cache_key(short_name)
+    _EMOJI_PACK_VIEW_CACHE[cache_key] = {
+        "short_name": short_name,
+        "title": title,
+        "url": pack_url,
+        "items": items,
+        "updated_at": int(now_ts())
+    }
+
+    text, rm = render_emoji_pack_ids_page(title, pack_url, items, 1)
+
+    bot.reply_to(
+        message,
+        text,
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+        reply_markup=rm
+    )
+
+def handle_mrp_add_command(message):
+    uid = int(message.from_user.id)
+    upsert_user(message.from_user)
+
+    parsed_payload = _parse_mrp_create_from_text(message.text or "")
+    if not parsed_payload:
+        bot.reply_to(
+            message,
+            "📑 Неверный формат.\nИспользуйте <code>+Мрп</code> [название] / [эмодзи] [айди премиум эмодзи (не обязятельно)] / [текст рп действия].",
+            parse_mode="HTML"
+        )
+        return
+
+    trigger = parsed_payload["trigger"]
+    trigger_key = parsed_payload["trigger_key"]
+    emoji = parsed_payload["emoji"]
+    premium_id = parsed_payload["premium_id"]
+    action_text = parsed_payload["action_text"]
+
+    cnt_row = db_one("SELECT COUNT(*) AS c FROM personal_rp_actions WHERE user_id=?", (uid,))
+    cnt = int(cnt_row["c"] or 0) if cnt_row else 0
+    if cnt >= 50:
+        bot.reply_to(message, "📑 Достигнут лимит личных рп команд.\n💬 Чтобы освободить место под новые команды, введи\n <code>-Мрп</code> <b>[название / номер]</b>", parse_mode="HTML")
+        return
+
+    if is_reserved_for_personal_rp(uid, trigger):
+        bot.reply_to(message, "📑 Этот триггер уже занят командой бота, глобальной рп-командой или вашей личной рп-командой.")
+        return
+
+    db_exec(
+        "INSERT INTO personal_rp_actions(user_id, trigger, trigger_key, emoji, premium_id, action_text, uses_count, created_at) "
+        "VALUES (?,?,?,?,?,?,0,?)",
+        (uid, trigger, trigger_key, emoji, premium_id, action_text, int(now_ts())),
+        commit=True
+    )
+
+    bot.reply_to(message, f"✅ Личная рп команда <code>{h(trigger)}</code> успешно создана.", parse_mode="HTML")
+
+def handle_mrp_delete_command(message, parsed: Parsed):
+    uid = int(message.from_user.id)
+    upsert_user(message.from_user)
+
+    arg = (parsed.args or "").strip()
+    if not arg:
+        return
+
+    rows = db_all(
+        "SELECT action_id, trigger, trigger_key FROM personal_rp_actions WHERE user_id=? ORDER BY action_id ASC",
+        (uid,)
+    ) or []
+
+    target_id = None
+
+    if arg.isdigit():
+        idx = int(arg)
+        if 1 <= idx <= len(rows):
+            target_id = int(rows[idx - 1]["action_id"])
+    else:
+        probe = _normalize_rp_trigger(arg)
+        for r in rows:
+            if _normalize_rp_trigger(r["trigger"] or "") == probe:
+                target_id = int(r["action_id"])
+                break
+
+    if target_id is None:
+        bot.reply_to(message, "📑 Личная рп команда не найдена.")
+        return
+
+    db_exec("DELETE FROM personal_rp_actions WHERE action_id=? AND user_id=?", (int(target_id), uid), commit=True)
+    bot.reply_to(message, "✅ Личная рп команда удалена.")
+
+def handle_mrp_list_command(message):
+    uid = int(message.from_user.id)
+    upsert_user(message.from_user)
+
+    text = render_personal_rp_list_text(uid)
+
+    if message.chat.type == "private":
+        bot.reply_to(message, text, parse_mode="HTML", disable_web_page_preview=True)
+        return
+
+    try:
+        _REAL_BOT_SEND_MESSAGE(uid, premiumize_html_text(text), parse_mode="HTML", disable_web_page_preview=True)
+        bot.reply_to(message, "📋 Список личных рп команд отправлен в личные сообщения.")
+    except Exception:
+        bot.reply_to(message, "📑 Не удалось отправить список в личные сообщения. Напишите боту в л/с.")
+
 def try_handle_rp_action_message(message) -> bool:
     chat_type = (getattr(message.chat, "type", "") or "").lower()
     if chat_type not in ("private", "group", "supergroup"):
@@ -6182,12 +6900,12 @@ def try_handle_rp_action_message(message) -> bool:
     if actor is None:
         return False
 
-    action, tail = _parse_rp_message(message.text or "")
-    if not action:
-        return False
-
     actor_id = int(actor.id)
     upsert_user(actor)
+
+    action, tail, comment_text = _parse_rp_message(message.text or "", actor_id)
+    if not action:
+        return False
 
     target_id, target_user_obj = resolve_rp_target(message, actor_id, tail)
     if target_id is None:
@@ -6201,7 +6919,11 @@ def try_handle_rp_action_message(message) -> bool:
 
     actor_tag = _rp_actor_tag(actor)
     target_tag = public_user_tag(int(target_id))
-    text = _rp_emit_action_text(action, actor_tag, target_tag)
+
+    tail_parts = (tail or "").strip().split(None, 1)
+    extra_tail = tail_parts[1].strip() if len(tail_parts) > 1 else ""
+
+    text = _rp_emit_action_text(action, actor_tag, target_tag, extra_tail=extra_tail, comment_text=comment_text)
 
     try:
         _REAL_BOT_REPLY_TO(
@@ -6210,6 +6932,7 @@ def try_handle_rp_action_message(message) -> bool:
             parse_mode="HTML",
             disable_web_page_preview=True
         )
+        _inc_personal_rp_use(action)
     except Exception:
         return False
 
@@ -6310,6 +7033,19 @@ def handle_blacklist_command(message):
         return
 
     text, rm = render_blacklist_text(1)
+    bot.reply_to(message, text, parse_mode="HTML", disable_web_page_preview=True, reply_markup=rm)
+
+def handle_users_list_command(message):
+    if message.chat.type != "private":
+        bot.reply_to(message, "📑 Эта команда работает только в личных сообщениях бота.")
+        return
+
+    uid = int(message.from_user.id)
+    if not is_support(uid):
+        bot.reply_to(message, "📑 Эта команда доступна только агентам техподдержки и владельцу бота.")
+        return
+
+    text, rm = render_users_text(1)
     bot.reply_to(message, text, parse_mode="HTML", disable_web_page_preview=True, reply_markup=rm)
 
 def handle_timer_commands(message, parsed: Parsed):
@@ -7440,6 +8176,8 @@ TOPUI_TAG = "T"
 SETUI_TAG = "W"
 REPORTUI_TAG = "Y"
 BLUI_TAG = "K"
+USERSUI_TAG = "U"
+EMPACKUI_TAG = "EP"
 RPUI_TAG = "RP"
 
 # хендлеры и хэлперы
@@ -8223,6 +8961,12 @@ def _build_upgrade_preview(uid: int, code: str, steps: int) -> str:
         if bfev != afev and afev < FEVER_MAX_SEC and bfev < FEVER_MAX_SEC:
             extra_lines += f"🌡️ Горячка: {_format_hm_from_seconds(bfev)} → {_format_hm_from_seconds(afev)}\n"
 
+    if code == "IPS":
+        bauto = _auto_limit_from_ips(cur)
+        aauto = _auto_limit_from_ips(final_lvl)
+        if bauto != aauto:
+            extra_lines += f"🤖 Автоответы: {bauto} → {aauto}\n"
+
     return (
         f"{skill['emoji']} {h(skill['title_1'])} на {steps} ур ({final_lvl})\n"
         f"{extra_lines}"
@@ -8338,6 +9082,17 @@ CALC_CHANCE_METRIC_ALIASES = {
     "обнаружения": "IDS", "обн": "IDS", "ids": "IDS",
     "диверсии": "SAB", "див": "SAB",
     "тяжести": "HEA", "тяж": "HEA",
+}
+
+STRICT_NO_EXTRA_ARGS_CMDS = {
+    "help", "commands_link", "report", "settings",
+    "autoanswer_status", "autoanswer_on", "autoanswer_off",
+    "buy_vaccine", "use_vaccine",
+    "lab_delete", "restore_lab",
+    "corp_delete", "corp_open", "corp_close",
+    "corp_req_list", "corp_leave",
+    "rp_stats",
+    "blacklist", "users_list", "agents_panel",
 }
 
 CALC_UPGRADE_PUBLIC_VARS = [
@@ -10431,6 +11186,92 @@ def cb_blacklist_ui(cq):
         except Exception:
             pass
 
+@bot.callback_query_handler(func=lambda cq: (cq.data or "").startswith(f"{USERSUI_TAG}:"))
+def cb_users_ui(cq):
+    try:
+        page = _users_parse_cb(cq.data or "")
+        if page is None:
+            bot.answer_callback_query(cq.id)
+            return
+
+        if not is_support(int(cq.from_user.id)):
+            bot.answer_callback_query(cq.id)
+            return
+
+        text, rm = render_users_text(int(page))
+
+        if cq.inline_message_id:
+            limited_edit_message_text(
+                text=text,
+                inline_id=cq.inline_message_id,
+                parse_mode="HTML",
+                reply_markup=rm,
+                disable_web_page_preview=True
+            )
+        elif cq.message:
+            limited_edit_message_text(
+                text=text,
+                chat_id=cq.message.chat.id,
+                msg_id=cq.message.message_id,
+                parse_mode="HTML",
+                reply_markup=rm,
+                disable_web_page_preview=True
+            )
+
+        bot.answer_callback_query(cq.id)
+    except Exception as e:
+        send_error_report("cb_users_ui", e)
+        try:
+            bot.answer_callback_query(cq.id)
+        except Exception:
+            pass
+
+@bot.callback_query_handler(func=lambda cq: (cq.data or "").startswith(f"{EMPACKUI_TAG}:"))
+def cb_emoji_pack_ui(cq):
+    try:
+        cache_key, page = _emoji_pack_parse_cb(cq.data or "")
+        if not cache_key or page is None:
+            bot.answer_callback_query(cq.id)
+            return
+
+        cached = _EMOJI_PACK_VIEW_CACHE.get(cache_key)
+        if not cached:
+            bot.answer_callback_query(cq.id, "Список эмодзи пака устарел. Вызовите команду снова.")
+            return
+
+        text, rm = render_emoji_pack_ids_page(
+            str(cached.get("title") or ""),
+            str(cached.get("url") or ""),
+            list(cached.get("items") or []),
+            int(page)
+        )
+
+        if cq.inline_message_id:
+            limited_edit_message_text(
+                text=text,
+                inline_id=cq.inline_message_id,
+                parse_mode="HTML",
+                reply_markup=rm,
+                disable_web_page_preview=True
+            )
+        elif cq.message:
+            limited_edit_message_text(
+                text=text,
+                chat_id=cq.message.chat.id,
+                msg_id=cq.message.message_id,
+                parse_mode="HTML",
+                reply_markup=rm,
+                disable_web_page_preview=True
+            )
+
+        bot.answer_callback_query(cq.id)
+    except Exception as e:
+        send_error_report("cb_emoji_pack_ui", e)
+        try:
+            bot.answer_callback_query(cq.id)
+        except Exception:
+            pass
+
 @bot.callback_query_handler(func=lambda cq: (cq.data or "").startswith(f"{CB_RP_ACCEPT}:"))
 def cb_rp_accept(cq):
     try:
@@ -10458,7 +11299,7 @@ def cb_rp_accept(cq):
             bot.answer_callback_query(cq.id, "Кто не успел, тот опоздал.")
             return
 
-        action = load_rp_actions().get(str(row["action_key"]))
+        action = _resolve_rp_action_ref(str(row["action_key"]), actor_id)
         if not action:
             bot.answer_callback_query(cq.id)
             return
@@ -10475,6 +11316,7 @@ def cb_rp_accept(cq):
         final_text = _rp_emit_action_text(action, actor_tag, target_tag)
 
         _rp_insert_event(action["trigger_key"], actor_id, int(cq.from_user.id))
+        _inc_personal_rp_use(action)
 
         if cq.inline_message_id:
             limited_edit_message_text(
@@ -13324,14 +14166,15 @@ def inline_query_handler(inline_query):
 
         # inline RP — только из приватного чата
         if iq_chat_type == "private":
-            rp_action = get_rp_action(q)
+            rp_action = get_any_rp_action(uid, q)
             if rp_action:
-                offer_id = _create_rp_offer(uid, rp_action["trigger_key"])
+                action_ref = _encode_rp_action_ref(rp_action)
+                offer_id = _create_rp_offer(uid, action_ref)
                 actor_tag = public_user_tag(uid)
                 offer_text = f"Пользователь {actor_tag} предлагает вам действие..."
 
                 results.append(_inline_article(
-                    article_id=f"rp_{uid}_{rp_action['trigger_key']}_{offer_id}",
+                    article_id=f"rp_{uid}_{abs(hash(action_ref))}_{offer_id}",
                     title=f"{rp_action['emoji']}{rp_action['trigger']}",
                     desc=f"Предложить собеседнику {rp_action['trigger']}",
                     text=offer_text,
@@ -13386,6 +14229,35 @@ def on_report_media(message):
     except Exception as e:
         send_error_report("on_report_media", e)
 
+@bot.message_handler(
+    content_types=[
+        "text", "photo", "video", "document", "audio", "voice", "sticker",
+        "animation", "video_note", "location", "contact", "poll", "dice"
+    ],
+    func=lambda m: True
+)
+def observe_seen_users(message):
+    try:
+        if (getattr(message.chat, "type", "") or "").lower() in ("group", "supergroup"):
+            if not is_channel_sender_message(message):
+                u = getattr(message, "from_user", None)
+                if u and not bool(getattr(u, "is_bot", False)):
+                    remember_chat_member(int(message.chat.id), u)
+
+                rm = getattr(message, "reply_to_message", None)
+                if rm and getattr(rm, "from_user", None):
+                    ru = rm.from_user
+                    if not bool(getattr(ru, "is_bot", False)):
+                        remember_chat_member(int(message.chat.id), ru)
+
+                for nu in (getattr(message, "new_chat_members", None) or []):
+                    if nu and not bool(getattr(nu, "is_bot", False)):
+                        remember_chat_member(int(message.chat.id), nu)
+    except Exception:
+        pass
+
+    return ContinueHandling()
+
 # MAIN ROUTER
 @bot.message_handler(content_types=["text"])
 def text_router(message):
@@ -13422,6 +14294,22 @@ def text_router(message):
                 return
             return
 
+        if parsed.cmd in STRICT_NO_EXTRA_ARGS_CMDS and (parsed.args or "").strip():
+            return
+        if parsed.cmd in ("balance", "lab", "mylab", "corp_info"):
+            bad = not strict_single_target_args_ok(message, parsed, allow_empty=True)
+            if bad:
+                if (parsed.args or "").strip() and try_handle_rp_action_message(message):
+                    return
+                return
+
+        if parsed.cmd in ("corp_invite",):
+            bad = not strict_single_target_args_ok(message, parsed, allow_empty=False)
+            if bad:
+                if (parsed.args or "").strip() and try_handle_rp_action_message(message):
+                    return
+                return
+
         # /owner
         if parsed.cmd == "owner":
             handle_owner_command(message, parsed)
@@ -13446,6 +14334,19 @@ def text_router(message):
         if parsed.cmd == "rp_stats":
             handle_rp_stats_command(message)
             return
+        
+        # мрп
+        if parsed.cmd == "mrp_add":
+            handle_mrp_add_command(message)
+            return
+
+        if parsed.cmd == "mrp_delete":
+            handle_mrp_delete_command(message, parsed)
+            return
+
+        if parsed.cmd == "mrp_list":
+            handle_mrp_list_command(message)
+            return
 
         # admin service
         if parsed.cmd in ("bot_ban", "bot_unban", "remake_lab"):
@@ -13459,10 +14360,19 @@ def text_router(message):
         if parsed.cmd == "blacklist":
             handle_blacklist_command(message)
             return
+        
+        if parsed.cmd == "users_list":
+            handle_users_list_command(message)
+            return
 
         # список команд
         if parsed.cmd == "commands_link":
             handle_commands_link(message)
+            return
+        
+        # айди помошник
+        if parsed.cmd == "emoji_pack_ids":
+            handle_emoji_pack_ids_command(message, parsed)
             return
 
         # /settings
