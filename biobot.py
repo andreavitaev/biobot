@@ -616,6 +616,21 @@ def _auto_send_reply(chat_id: int, reply_to: int, text: str):
         except Exception:
             pass
 
+def _auto_header(defender_id: int, chat_id: int, icon: str) -> str:
+    if int(chat_id) < 0:
+        row = get_user_row(int(defender_id))
+        if row:
+            nm = display_name(
+                row["first_name"] or "",
+                row["last_name"] or "",
+                row["username"] or "",
+                int(defender_id)
+            )
+        else:
+            nm = str(int(defender_id))
+        return f"{icon} [Автоответчик <b>{h(nm)}</b>]:\n"
+    return f"{icon} [Автоответчик]:\n"
+
 def autoanswer_trigger(defender_id: int, organizer_id: int, chat_id: int, reply_to_msg_id: int, source: str):
     """
     IPS автоответ: defender пытается заразить organizer в ответ.
@@ -630,6 +645,14 @@ def autoanswer_trigger(defender_id: int, organizer_id: int, chat_id: int, reply_
         return
 
     if defender_id <= 0 or organizer_id <= 0 or defender_id == organizer_id:
+        return
+
+    cd_row = db_one(
+        "SELECT COALESCE(until_ts,0) AS u FROM infection_cooldowns WHERE attacker_id=? AND target_id=?",
+        (int(defender_id), int(organizer_id))
+    )
+    cd_until = int(cd_row["u"] if cd_row else 0)
+    if cd_until > now_ts():
         return
 
     now = now_ts()
@@ -688,11 +711,11 @@ def autoanswer_trigger(defender_id: int, organizer_id: int, chat_id: int, reply_
     fever_pat = (fr["fp"] if fr else "") or ""
     if fever_until > now:
         left = fever_until - now
-        txt = (
-            "🌡️ [Автоответчик]:\n"
+        txt = ( 
+            _auto_header(defender_id, chat_id, "🌡️"),
             f"❎ Не удалось заразить {org_q}: Горячка, вызванная {_pat_for_fever(fever_pat)}, "
             f"время выздоровления {_format_hms(left)}"
-        )
+            )
         _auto_send_reply(chat_id, reply_to_msg_id, txt)
         db_exec("UPDATE autoanswer_state SET waiting_hot=1, waiting_hot_since=? WHERE user_id=?",
                 (int(now), defender_id), commit=True)
@@ -701,7 +724,7 @@ def autoanswer_trigger(defender_id: int, organizer_id: int, chat_id: int, reply_
     ready = int(lab_def["ready_pathogens"] or 0)
     if ready <= 0:
         txt = (
-            "🧪 [Автоответчик]:\n"
+            _auto_header(defender_id, chat_id, "🧪"),
             f"❎ Не удалось заразить {org_q}: не осталось патогенов"
         )
         _auto_send_reply(chat_id, reply_to_msg_id, txt)
@@ -720,7 +743,7 @@ def autoanswer_trigger(defender_id: int, organizer_id: int, chat_id: int, reply_
     if random.random() * 100.0 < random_event_pct(qual):
         ev = pick_random_event_text()
         txt = (
-            "💢 [Автоответчик]:\n"
+            _auto_header(defender_id, chat_id, "💢"),
             f"❎ Не удалось заразить {org_q}: {h(ev)}"
         )
         _auto_send_reply(chat_id, reply_to_msg_id, txt)
@@ -736,7 +759,7 @@ def autoanswer_trigger(defender_id: int, organizer_id: int, chat_id: int, reply_
     roll = random.random() * 100.0
     if roll >= p_success:
         txt = (
-            "🛡 [Автоответчик]:\n"
+            _auto_header(defender_id, chat_id, "🛡"),
             f"❎ Не удалось заразить {org_q}: иммунитет справился с заражением"
         )
         _auto_send_reply(chat_id, reply_to_msg_id, txt)
@@ -820,7 +843,7 @@ def autoanswer_trigger(defender_id: int, organizer_id: int, chat_id: int, reply_
 
     exp_word = _ru_form(int(gained), "био-опыт", "био-опыта", "био-опыта")
     txt = (
-        "🦠 [Автоответчик]:\n"
+        _auto_header(defender_id, chat_id, "🦠"),
         f"✅ Успешное заражение {org_q}\n"
         f"☣️‍ +{_fmt_k(int(gained))} {exp_word}"
     )
@@ -7154,12 +7177,12 @@ def handle_timer_commands(message, parsed: Parsed):
     ensure_creator_is_support()
 
     if parsed.cmd == "timer_list":
-        bot.reply_to(message, render_timer_list_text(uid, chat_id), parse_mode="HTML", disable_web_page_preview=True)
+        bot.reply_to(message, render_timer_list_text(uid), parse_mode="HTML", disable_web_page_preview=True)
         return
 
     if parsed.cmd == "timer_clear_all":
-        db_exec("DELETE FROM user_timers WHERE chat_id=?", (int(chat_id),), commit=True)
-        bot.reply_to(message, "✅ Все таймеры успешно удалены.")
+        db_exec("DELETE FROM user_timers WHERE user_id=?", (int(uid),), commit=True)
+        bot.reply_to(message, "✅ Все ваши таймеры успешно удалены.")
         return
 
     if parsed.cmd == "timer_delete":
@@ -7169,13 +7192,13 @@ def handle_timer_commands(message, parsed: Parsed):
             return
 
         idx = int(arg)
-        rows = _timer_rows_for_chat(chat_id)
+        rows = _timer_rows_for_user(uid)
         if idx < 1 or idx > len(rows):
             bot.reply_to(message, "📑 Таймер с таким номером не найден.")
             return
 
         timer_id = int(rows[idx - 1]["timer_id"])
-        db_exec("DELETE FROM user_timers WHERE timer_id=? AND chat_id=?", (timer_id, int(chat_id)), commit=True)
+        db_exec("DELETE FROM user_timers WHERE timer_id=? AND user_id=?", (timer_id, int(uid)), commit=True)
         bot.reply_to(message, "✅ Таймер успешно удалён.")
         return
 
@@ -7184,9 +7207,9 @@ def handle_timer_commands(message, parsed: Parsed):
         bot.reply_to(message, "📑 Со следующей строки укажите текст команды бота для исполнения.")
         return
 
-    current_rows = _timer_rows_for_chat(chat_id)
+    current_rows = _timer_rows_for_user(uid)
     if len(current_rows) >= 10:
-        bot.reply_to(message, "📑 В этом чате уже установлено максимальное количество таймеров: 10.")
+        bot.reply_to(message, "📑 У вас уже установлено максимальное количество таймеров: 10.")
         return
 
     if parsed.cmd == "timer_add_rel":
@@ -7201,7 +7224,7 @@ def handle_timer_commands(message, parsed: Parsed):
 
         bot.reply_to(
             message,
-            f"✅ Таймер создан.\nСработает <code>{h(_fmt_ts(next_run_ts))}</code>\nПериод: {_timer_spec_to_text(spec)}",
+            f"✅ Таймер создан.\nСработает: <code>{h(_fmt_ts(next_run_ts))}</code>\nПериод: {_timer_spec_to_text(spec)}",
             parse_mode="HTML",
             disable_web_page_preview=True
         )
@@ -7213,7 +7236,7 @@ def handle_timer_commands(message, parsed: Parsed):
             (int(uid),)
         ) or []
         if len(cycle_rows) >= 2:
-            bot.reply_to(message, "📑 У вас уже установлено максимальное количество циклических таймеров.")
+            bot.reply_to(message, "📑 У вас уже установлено максимальное количество циклических таймеров: 2.")
             return
 
         runs_total, spec, err = _timer_parse_cycle_args((parsed.args or "").strip())
@@ -7940,12 +7963,12 @@ def _timer_body_command(text: str) -> str:
     _first, body = _timer_first_line_and_body(text)
     return (body or "").strip()
 
-def _timer_rows_for_chat(chat_id: int) -> List[sqlite3.Row]:
+def _timer_rows_for_user(user_id: int) -> List[sqlite3.Row]:
     return db_all(
         "SELECT timer_id, user_id, chat_id, created_at, next_run_ts, is_cycle, repeat_spec, cycle_total, cycle_left, command_text "
-        "FROM user_timers WHERE chat_id=? "
+        "FROM user_timers WHERE user_id=? "
         "ORDER BY next_run_ts ASC, timer_id ASC",
-        (int(chat_id),)
+        (int(user_id),)
     ) or []
 
 def _timer_create(
@@ -8001,24 +8024,20 @@ def _timer_row_to_display(index_num: int, row: sqlite3.Row) -> str:
 
     return f"{index_num}. {mark} {_fmt_ts(next_ts)}{suffix}\n<code>{h(first_cmd)}</code>"
 
-def render_timer_list_text(user_id: int, chat_id: int) -> str:
+def render_timer_list_text(user_id: int) -> str:
     uid = int(user_id)
-    cid = int(chat_id)
 
-    if cid == uid:
-        u = get_user_row(uid)
-        scope_name = (
-            display_name(
-                u["first_name"] or "",
-                u["last_name"] or "",
-                u["username"] or "",
-                int(uid)
-            ) if u else str(uid)
-        )
-    else:
-        scope_name = _get_chat_title_cached(cid)
+    u = get_user_row(uid)
+    scope_name = (
+        display_name(
+            u["first_name"] or "",
+            u["last_name"] or "",
+            u["username"] or "",
+            int(uid)
+        ) if u else str(uid)
+    )
 
-    rows = _timer_rows_for_chat(cid)
+    rows = _timer_rows_for_user(uid)
 
     lines = []
     lines.append(f"{premium_emoji_html('⏳')} Список таймеров {h(scope_name)}")
@@ -12136,6 +12155,7 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
             rem = int(rem_row["rp"] if rem_row else 0)
             att_ids_lvl = int(lab_row["a_ids"] if lab_row else 1) or 1
             tgt_ids_lvl = int(trow["t_ids"] if trow else 1) or 1
+            ids_sent = False
             if ids_should_fire(att_ids_lvl, tgt_ids_lvl):
                 result_text = (
                     f"💢 Попытка заразить «{target_tag}» провалилась...\n"
@@ -12150,6 +12170,7 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
                 )
                 ids_msg = _notify_target(int(target_id), ids_text)
                 if ids_msg:
+                    ids_sent = True
                     autoanswer_trigger(int(target_id), attacker_id, int(ids_msg.chat.id), int(ids_msg.message_id), "IDS")
             _emit(
                 header +
@@ -12158,7 +12179,7 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
                 f"🧪 Осталось патогенов: {rem} | +1 = {pat_price_mat_line}",
                 reply_markup=kb_infect_retry_user(attacker_id, int(target_id))
             )
-            if message.chat.type in ("group", "supergroup") and _chat_has_user(message.chat.id, int(target_id)):
+            if (not ids_sent) and message.chat.type in ("group", "supergroup") and _chat_has_user(message.chat.id, int(target_id)):
                 reply_mid = 0
                 if edit_ctx and isinstance(edit_ctx, dict):
                     reply_mid = int(edit_ctx.get("msg_id") or 0)
@@ -12181,7 +12202,11 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
                     f"вы будете получать по {_fmt_bio_res_after_po(int(gained))}"
                 )
             _emit(txt)
-            if message.chat.type in ("group", "supergroup") and _chat_has_user(message.chat.id, int(target_id)):
+            att_ids_lvl = int(lab_row["a_ids"] if lab_row else 1) or 1
+            tgt_ids_lvl = int(trow["t_ids"] if trow else 1) or 1
+            ids_possible = ids_should_fire(att_ids_lvl, tgt_ids_lvl)
+
+            if (not ids_possible) and message.chat.type in ("group", "supergroup") and _chat_has_user(message.chat.id, int(target_id)):
                 reply_mid = 0
                 if edit_ctx and isinstance(edit_ctx, dict):
                     reply_mid = int(edit_ctx.get("msg_id") or 0)
@@ -12191,6 +12216,7 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
             return
         att_ids_lvl = int(lab_row["a_ids"] if lab_row else 1) or 1
         tgt_ids_lvl = int(trow["t_ids"] if trow else 1) or 1
+        ids_sent = False
         if ids_should_fire(att_ids_lvl, tgt_ids_lvl):
             result_text = (
                 f"🥽 Иммунитет объекта «{target_tag}» оказался стойким к вашему патогену.\n"
@@ -12205,6 +12231,7 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
             )
             ids_msg = _notify_target(int(target_id), ids_text)
             if ids_msg:
+                ids_sent = True
                 autoanswer_trigger(int(target_id), attacker_id, int(ids_msg.chat.id), int(ids_msg.message_id), "IDS")
         rem_row = db_one("SELECT COALESCE(ready_pathogens,0) AS rp FROM labs WHERE user_id=?", (attacker_id,))
         rem = int(rem_row["rp"] if rem_row else 0)
@@ -12215,7 +12242,7 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
             f"🧪 Осталось патогенов: {rem} | +1 = {pat_price_txt}",
             reply_markup=kb_infect_retry_user_upg(attacker_id, int(target_id))
         )
-        if message.chat.type in ("group", "supergroup") and _chat_has_user(message.chat.id, int(target_id)):
+        if (not ids_sent) and message.chat.type in ("group", "supergroup") and _chat_has_user(message.chat.id, int(target_id)):
             reply_mid = 0
             if edit_ctx and isinstance(edit_ctx, dict):
                 reply_mid = int(edit_ctx.get("msg_id") or 0)
@@ -12326,15 +12353,6 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
         tgt_imm = int(trow["imm"] if trow else 0)
         p_success = infect_success_chance(attacker_inf, tgt_imm)
         
-        used += 1
-        if message.chat.type in ("group", "supergroup") and _chat_has_user(int(message.chat.id), int(tid)):
-            reply_mid = 0
-            if edit_ctx and isinstance(edit_ctx, dict):
-                reply_mid = int(edit_ctx.get("msg_id") or 0)
-            if reply_mid <= 0:
-                reply_mid = int(getattr(message, "message_id", 0) or 0)
-            autoanswer_trigger(int(tid), int(attacker_id), int(message.chat.id), reply_mid, "CHAT")
-
         if random.random() * 100.0 < rand_evt_pct:
             evt_fail += 1
             fail += 1
@@ -12411,7 +12429,7 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
             tgt_ids_lvl = int(trow["t_ids"] if trow else 1) or 1
             if ids_should_fire(att_ids_lvl, tgt_ids_lvl):
                 result_text = (
-                    f"🥽 Иммунитет объекта «{tgt_tag}» оказался стойким к вашему патогену.\n"
+                    f"🥽 Иммунитет объекта «{chosen_tag}» оказался стойким к вашему патогену.\n"
                     "Антитела смогли справиться с заражением."
                 )
                 ids_text = render_ids_report(
