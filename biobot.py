@@ -411,7 +411,7 @@ def random_event_pct(qualification_level: int) -> float:
         q = int(qualification_level or 0)
     except Exception:
         q = 0
-    pct = 10.0 - (q // 10) * 0.1 # шанс срабатывания случайного события
+    pct = 12.0 - (q // 10) * 0.1 # шанс срабатывания случайного события
     if pct < 5.0:
         pct = 5.0
     return float(pct)
@@ -798,7 +798,7 @@ def autoanswer_trigger(defender_id: int, organizer_id: int, chat_id: int, reply_
                 "INSERT INTO infections(attacker_id,target_id,start_ts,end_ts,add_bio_res,next_payout_ts,counted,pathogen_name) "
                 "VALUES (?,?,?,?,?,?,1,?) "
                 "ON CONFLICT(attacker_id,target_id) DO UPDATE SET "
-                "start_ts=excluded.start_ts, end_ts=excluded.end_ts, add_bio_res=excluded.add_bio_res, "
+                "start_ts=excluded.start_ts, end_ts=excluded.end_ts, "
                 "next_payout_ts=excluded.next_payout_ts, counted=1, pathogen_name=excluded.pathogen_name",
                 (defender_id, organizer_id, now, end_ts, gained, next_payout, pathogen_name)
             )
@@ -8833,7 +8833,7 @@ VACCINE_FAIL_TEXT = (
 SKILL_N1 = {
     "INF": 7,   # заразность
     "LET": 4,   # летальность
-    "HEA": 12,   # тяжесть
+    "HEA": 10,   # тяжесть
     "IMM": 7,   # иммунитет
     "REA": 6,   # реагирование
     "IDS": 5,   # обнаружение
@@ -12007,7 +12007,7 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
                             "INSERT INTO infections(attacker_id,target_id,start_ts,end_ts,add_bio_res,next_payout_ts,counted,pathogen_name) "
                             "VALUES (?,?,?,?,?,?,1,?) "
                             "ON CONFLICT(attacker_id,target_id) DO UPDATE SET "
-                            "start_ts=excluded.start_ts, end_ts=excluded.end_ts, add_bio_res=excluded.add_bio_res, "
+                            "start_ts=excluded.start_ts, end_ts=excluded.end_ts, "
                             "next_payout_ts=excluded.next_payout_ts, counted=1, pathogen_name=excluded.pathogen_name",
                             (attacker_id, int(target_id), now, end_ts, gained, next_payout, (pathogen_name or "").strip())
                         )
@@ -12494,7 +12494,7 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
                     "INSERT INTO infections(attacker_id,target_id,start_ts,end_ts,add_bio_res,next_payout_ts,counted,pathogen_name) "
                     "VALUES (?,?,?,?,?,?,1,?) "
                     "ON CONFLICT(attacker_id,target_id) DO UPDATE SET "
-                    "start_ts=excluded.start_ts, end_ts=excluded.end_ts, add_bio_res=excluded.add_bio_res, "
+                    "start_ts=excluded.start_ts, end_ts=excluded.end_ts, "
                     "next_payout_ts=excluded.next_payout_ts, counted=1, pathogen_name=excluded.pathogen_name",
                     (attacker_id, int(tid), now, end_ts, gained, next_payout, (pathogen_name or "").strip())
                 )
