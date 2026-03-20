@@ -6471,11 +6471,11 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
             rest = toks[2] if len(toks) >= 3 and toks[2].isdigit() else ""
             return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="top_corps", args=rest)
 
-        if len(toks) >= 3 and toks[1] in ("болезней", "болезни", "б") and toks[2] == "чата":
+        if len(toks) >= 3 and toks[1] in ("болезней", "болезни", "б", "патогенов", "патогены", "паты", "патов") and toks[2] == "чата":
             rest = toks[3] if len(toks) >= 4 and toks[3].isdigit() else ""
             return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="top_diseases_chat", args=rest)
 
-        if len(toks) >= 2 and toks[1] in ("болезней", "болезни", "б"):
+        if len(toks) >= 2 and toks[1] in ("болезней", "болезни", "б", "патогенов", "патогены", "паты", "патов"):
             rest = toks[2] if len(toks) >= 3 and toks[2].isdigit() else ""
             return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="top_diseases", args=rest)
 
