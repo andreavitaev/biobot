@@ -712,9 +712,9 @@ def autoanswer_trigger(defender_id: int, organizer_id: int, chat_id: int, reply_
     if fever_until > now:
         left = fever_until - now
         txt = ( 
-            _auto_header(defender_id, chat_id, "🌡️"),
-            f"❎ Не удалось заразить {org_q}: Горячка, вызванная {_pat_for_fever(fever_pat)}, "
-            f"время выздоровления {_format_hms(left)}"
+            _auto_header(defender_id, chat_id, "🌡️")
+            + f"❎ Не удалось заразить {org_q}: Горячка, вызванная {_pat_for_fever(fever_pat)}, "
+            + f"время выздоровления {_format_hms(left)}"
             )
         _auto_send_reply(chat_id, reply_to_msg_id, txt)
         db_exec("UPDATE autoanswer_state SET waiting_hot=1, waiting_hot_since=? WHERE user_id=?",
@@ -724,8 +724,8 @@ def autoanswer_trigger(defender_id: int, organizer_id: int, chat_id: int, reply_
     ready = int(lab_def["ready_pathogens"] or 0)
     if ready <= 0:
         txt = (
-            _auto_header(defender_id, chat_id, "🧪"),
-            f"❎ Не удалось заразить {org_q}: не осталось патогенов"
+            _auto_header(defender_id, chat_id, "🧪")
+            + f"❎ Не удалось заразить {org_q}: не осталось патогенов"
         )
         _auto_send_reply(chat_id, reply_to_msg_id, txt)
         db_exec("UPDATE autoanswer_state SET waiting_no_pathogens=1, waiting_since=? WHERE user_id=?",
@@ -743,8 +743,8 @@ def autoanswer_trigger(defender_id: int, organizer_id: int, chat_id: int, reply_
     if random.random() * 100.0 < random_event_pct(qual):
         ev = pick_random_event_text()
         txt = (
-            _auto_header(defender_id, chat_id, "💢"),
-            f"❎ Не удалось заразить {org_q}: {h(ev)}"
+            _auto_header(defender_id, chat_id, "💢")
+            + f"❎ Не удалось заразить {org_q}: {h(ev)}"
         )
         _auto_send_reply(chat_id, reply_to_msg_id, txt)
         return
@@ -759,8 +759,8 @@ def autoanswer_trigger(defender_id: int, organizer_id: int, chat_id: int, reply_
     roll = random.random() * 100.0
     if roll >= p_success:
         txt = (
-            _auto_header(defender_id, chat_id, "🛡"),
-            f"❎ Не удалось заразить {org_q}: иммунитет справился с заражением"
+            _auto_header(defender_id, chat_id, "🛡")
+            + f"❎ Не удалось заразить {org_q}: иммунитет справился с заражением"
         )
         _auto_send_reply(chat_id, reply_to_msg_id, txt)
         return
@@ -818,14 +818,13 @@ def autoanswer_trigger(defender_id: int, organizer_id: int, chat_id: int, reply_
                 c.execute("UPDATE labs SET diseases_total=COALESCE(diseases_total,0)+1 WHERE user_id=?", (organizer_id,))
 
             c.execute(
-                "INSERT INTO infections(attacker_id,target_id,start_ts,end_ts,add_bio_res,next_payout_ts,counted,pathogen_name) "
-                "VALUES (?,?,?,?,?,?,1,?) "
+                "INSERT INTO infections(attacker_id,target_id,start_ts,end_ts,add_bio_res,next_payout_ts,counted,pathogen_name,known_to_target) "
+                "VALUES (?,?,?,?,?,?,1,?,1) "
                 "ON CONFLICT(attacker_id,target_id) DO UPDATE SET "
                 "start_ts=excluded.start_ts, end_ts=excluded.end_ts, "
-                "next_payout_ts=excluded.next_payout_ts, counted=1, pathogen_name=excluded.pathogen_name",
+                "next_payout_ts=excluded.next_payout_ts, counted=1, pathogen_name=excluded.pathogen_name, known_to_target=1",
                 (defender_id, organizer_id, now, end_ts, gained, next_payout, pathogen_name)
             )
-
             c.execute(
                 "INSERT OR IGNORE INTO infection_seen(attacker_id,target_id) VALUES (?,?)",
                 (defender_id, organizer_id)
@@ -843,9 +842,9 @@ def autoanswer_trigger(defender_id: int, organizer_id: int, chat_id: int, reply_
 
     exp_word = _ru_form(int(gained), "био-опыт", "био-опыта", "био-опыта")
     txt = (
-        _auto_header(defender_id, chat_id, "🦠"),
-        f"✅ Успешное заражение {org_q}\n"
-        f"☣️‍ +{_fmt_k(int(gained))} {exp_word}"
+        _auto_header(defender_id, chat_id, "🦠")
+        + f"✅ Успешное заражение {org_q}\n"
+        + f"☣️‍ +{_fmt_k(int(gained))} {exp_word}"
     )
     _auto_send_reply(chat_id, reply_to_msg_id, txt)
 
@@ -2232,6 +2231,11 @@ def init_db():
 
     try:
         db_exec("ALTER TABLE infections ADD COLUMN pathogen_name TEXT DEFAULT ''", commit=True)
+    except Exception:
+        pass
+
+    try:
+        db_exec("ALTER TABLE infections ADD COLUMN known_to_target INTEGER DEFAULT 0", commit=True)
     except Exception:
         pass
 
@@ -7609,7 +7613,7 @@ def render_lab_infected_list(owner_id: int) -> str:
 
 def render_lab_diseases_list(owner_id: int) -> str:
     rows = db_all(
-        "SELECT i.attacker_id, i.end_ts, i.start_ts, "
+        "SELECT i.attacker_id, i.end_ts, i.start_ts, COALESCE(i.known_to_target,0) AS known_to_target, "
         "COALESCE(la.pathogen_name,'') AS current_pathogen_name, "
         "u.username, u.first_name, u.last_name "
         "FROM infections i "
@@ -7628,11 +7632,12 @@ def render_lab_diseases_list(owner_id: int) -> str:
     items = []
     for i, r in enumerate(rows, 1):
         attacker_id = int(r["attacker_id"] or 0)
+        known_to_target = int(r["known_to_target"] or 0)
         pname = (r["current_pathogen_name"] or "").strip()
         disease = f"«{h(pname)}»" if pname else "неизвестный патоген"
         until = _fmt_date_ddmmyy(int(r["end_ts"] or 0))
 
-        if attacker_id != 0:
+        if attacker_id != 0 and known_to_target == 1:
             owner_un = (r["username"] or "").strip()
             owner_disp = display_name(
                 r["first_name"] or "",
@@ -12023,8 +12028,8 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
                             c.execute("UPDATE labs SET diseases_total=COALESCE(diseases_total,0)+1 WHERE user_id=?", (int(target_id),))
 
                         c.execute(
-                            "INSERT INTO infections(attacker_id,target_id,start_ts,end_ts,add_bio_res,next_payout_ts,counted,pathogen_name) "
-                            "VALUES (?,?,?,?,?,?,1,?) "
+                            "INSERT INTO infections(attacker_id,target_id,start_ts,end_ts,add_bio_res,next_payout_ts,counted,pathogen_name,known_to_target) "
+                            "VALUES (?,?,?,?,?,?,1,?,0) "
                             "ON CONFLICT(attacker_id,target_id) DO UPDATE SET "
                             "start_ts=excluded.start_ts, end_ts=excluded.end_ts, "
                             "next_payout_ts=excluded.next_payout_ts, counted=1, pathogen_name=excluded.pathogen_name",
@@ -12099,6 +12104,11 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
                             )
                             ids_msg = _notify_target(int(target_id), ids_text)
                             if ids_msg:
+                                db_exec(
+                                    "UPDATE infections SET known_to_target=1 WHERE attacker_id=? AND target_id=?",
+                                    (int(attacker_id), int(target_id)),
+                                    commit=True
+                                )
                                 autoanswer_trigger(int(target_id), attacker_id, int(ids_msg.chat.id), int(ids_msg.message_id), "IDS")
                         else:
                             _notify_target(int(target_id), target_notice)
@@ -12343,6 +12353,8 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
         if is_bot_target(tid, None, "") or int(tid) == int(attacker_id):
             continue
 
+        used += 1
+
         ensure_lab_exists(int(tid))
         chosen_tag = _mass_target_tag(int(tid))
 
@@ -12509,8 +12521,8 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
                     c.execute("UPDATE labs SET diseases_total=COALESCE(diseases_total,0)+1 WHERE user_id=?", (int(tid),))
 
                 c.execute(
-                    "INSERT INTO infections(attacker_id,target_id,start_ts,end_ts,add_bio_res,next_payout_ts,counted,pathogen_name) "
-                    "VALUES (?,?,?,?,?,?,1,?) "
+                    "INSERT INTO infections(attacker_id,target_id,start_ts,end_ts,add_bio_res,next_payout_ts,counted,pathogen_name,known_to_target) "
+                    "VALUES (?,?,?,?,?,?,1,?,0) "
                     "ON CONFLICT(attacker_id,target_id) DO UPDATE SET "
                     "start_ts=excluded.start_ts, end_ts=excluded.end_ts, "
                     "next_payout_ts=excluded.next_payout_ts, counted=1, pathogen_name=excluded.pathogen_name",
@@ -12577,6 +12589,11 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
                     )
                     ids_msg = _notify_target(int(tid), ids_text)
                     if ids_msg:
+                        db_exec(
+                            "UPDATE infections SET known_to_target=1 WHERE attacker_id=? AND target_id=?",
+                            (int(attacker_id), int(tid)),
+                            commit=True
+                        )
                         autoanswer_trigger(int(tid), attacker_id, int(ids_msg.chat.id), int(ids_msg.message_id), "IDS")
                 else:
                     _notify_target(int(tid), notice)
