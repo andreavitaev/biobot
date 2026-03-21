@@ -1082,6 +1082,7 @@ PREMIUM_EMOJI_IDS: Dict[str, str] = {
     "⚗️": "5262680005393025261",
     "💉": "5472317878801800869",
     "🧪": "5411512278740640309",
+    "🧫": "5280706833537865059",
     "📟": "5195361551283942795",
     "🛰️": "5447213996820168272",
     "🤖": "5355051922862653659",
@@ -1089,7 +1090,7 @@ PREMIUM_EMOJI_IDS: Dict[str, str] = {
     "⏱️": "5258258882022612173",
     "⛑️": "5264892613630111886",
     "🏷️": "5255806717689631058",
-    "✉️": "",
+    "✉️": "5447607759421863856",
     "📑": "",
     "📋": "5197269100878907942",
     "🧾": "5444860552310457690",
@@ -2121,6 +2122,7 @@ def init_db():
         next_vaccine_in INTEGER DEFAULT 32400,
                 
         qualification   INTEGER DEFAULT 1,
+        synthesis     INTEGER DEFAULT 1,
         acceleration     INTEGER DEFAULT 1,
 
         security        INTEGER DEFAULT 1,
@@ -2189,6 +2191,7 @@ def init_db():
         "ALTER TABLE labs ADD COLUMN reaction INTEGER DEFAULT 1",
         "ALTER TABLE labs ADD COLUMN ids INTEGER DEFAULT 1",
         "ALTER TABLE labs ADD COLUMN ips INTEGER DEFAULT 1",
+        "ALTER TABLE labs ADD COLUMN synthesis INTEGER DEFAULT 1",
         "ALTER TABLE labs ADD COLUMN acceleration INTEGER DEFAULT 1",
         "ALTER TABLE labs ADD COLUMN defended_total INTEGER DEFAULT 0",
         "ALTER TABLE labs ADD COLUMN corp_id INTEGER DEFAULT 0",
@@ -4130,9 +4133,7 @@ def render_top_users(limit: int, chat_id: int = 0) -> tuple[str, InlineKeyboardM
     lines.append("<blockquote expandable>")
     for i, r in enumerate(rows, 1):
         uid = int(r["user_id"])
-        un = (r["username"] or "")
-        disp = display_name(r["first_name"] or "", r["last_name"] or "", un, uid)
-        tag = tg_mention(uid, disp, username=un)
+        tag = public_user_tag(uid)
         lines.append(f"{i}. {tag} | {_fmt_k(int(r['be'] or 0))} опыт | {_fmt_k(int(r['sick'] or 0))} бол")
     lines.append("</blockquote>")
     return "\n".join(lines), kb_top_switch("U", int(chat_id), int(limit))
@@ -4148,9 +4149,12 @@ def render_top_diseases(limit: int, chat_id: int = 0) -> tuple[str, InlineKeyboa
 
     lines.append("<blockquote expandable>")
     for i, r in enumerate(rows, 1):
+        owner_id = int(r["user_id"])
+        owner_un = (r["username"] or "")
         pname = (r["pname"] or "").strip()
-        shown_name = f"«{h(pname)}»" if pname else "неизвестный патоген"
-        lines.append(f"{i}. {shown_name} | {_fmt_k(int(r['sick'] or 0))} бол")
+        disease_name = f"«{h(pname)}»" if pname else "неизвестный патоген"
+        clickable_disease = tg_mention(owner_id, disease_name, username=owner_un)
+        lines.append(f"{i}. {clickable_disease} | {_fmt_k(int(r['sick'] or 0))} бол")
     lines.append("</blockquote>")
     return "\n".join(lines), kb_top_switch("D", int(chat_id), int(limit))
 
@@ -5756,7 +5760,6 @@ def _handle_report_content_message(message) -> bool:
     if cat_u == "USER":
         lines = raw.splitlines()
         if not lines or not lines[0].strip().startswith("@"):
-            bot.reply_to(message, "Формат неверный. Первая строка должна быть @username.")
             return True
         target_un = lines[0].strip()
         desc = "\n".join(lines[1:]).strip()
@@ -6024,6 +6027,14 @@ def strip_bio_prefix(text: str) -> str:
 
 def normalize(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").strip())
+
+def has_explicit_bot_prefix(text: str) -> bool:
+    s = (text or "").strip()
+    if not s:
+        return False
+    if s.startswith("/") or s.startswith("."):
+        return True
+    return bool(re.match(r"^(био|бот)\s+", s, flags=re.IGNORECASE))
 
 def parse_message_as_command(text: str) -> Optional[Parsed]:
     if not text:
@@ -7207,8 +7218,9 @@ def handle_timer_commands(message, parsed: Parsed):
         return
 
     command_text = _timer_body_command(message.text or "")
-    if not command_text:
-        bot.reply_to(message, "📑 Со следующей строки укажите текст команды бота для исполнения.")
+    ok_cmd, cmd_err = _timer_validate_body_command(command_text)
+    if not ok_cmd:
+        bot.reply_to(message, cmd_err)
         return
 
     current_rows = _timer_rows_for_user(uid)
@@ -7266,7 +7278,7 @@ def handle_timer_commands(message, parsed: Parsed):
     if parsed.cmd == "timer_add_abs":
         ts, err = _timer_parse_absolute_spec((parsed.args or "").strip())
         if ts is None:
-            bot.reply_to(message, err)
+            bot.reply_to(message, err, parse_mode="HTML", disable_web_page_preview=True)
             return
 
         _timer_create(uid, chat_id, int(ts), 0, {}, command_text)
@@ -7359,8 +7371,9 @@ def render_lab(user_id: int) -> str:
     qual = (
         int(_rget(lab, "total_pathogens", 1) or 1)
         + int(_rget(lab, "total_vaccines", 1) or 1)
+        + int(_rget(lab, "synthesis", 1) or 1)
         + int(_rget(lab, "acceleration", 1) or 1)
-    ) // 3
+    ) // 4
     lines.append(f'👨‍🔬 Квалификация учёных: {qual} ур')
     sec = (
         int(_rget(lab, "reaction", 1) or 1)
@@ -7458,7 +7471,8 @@ def kb_lab_dev(owner_id: int) -> InlineKeyboardMarkup:
     kb.row(
         _ikb_premium_icon_only("🧪", callback_data=_upg_cb("P", owner_id, "PAT", 1, "D")),
         _ikb_premium_icon_only("💉", callback_data=_upg_cb("P", owner_id, "VAC", 1, "D")),
-        _ikb_premium_icon_only("⚗️", callback_data=_upg_cb("P", owner_id, "ACC", 1, "D")),
+        _ikb_premium_icon_only("⚗️", callback_data=_upg_cb("P", owner_id, "SYN", 1, "D")),
+        _ikb_premium_icon_only("🧫", callback_data=_upg_cb("P", owner_id, "ACC", 1, "D")),
     )
     kb.row(InlineKeyboardButton("Вернуться к досье", callback_data=_labui_data(owner_id, "D")))
     return kb
@@ -7512,7 +7526,8 @@ def kb_lab_dev_inline(owner_id: int) -> InlineKeyboardMarkup:
     kb.row(
         InlineKeyboardButton("🧪", callback_data=_upg_cb("P", owner_id, "PAT", 1, "D")),
         InlineKeyboardButton("💉", callback_data=_upg_cb("P", owner_id, "VAC", 1, "D")),
-        InlineKeyboardButton("⚗️", callback_data=_upg_cb("P", owner_id, "ACC", 1, "D")),
+        InlineKeyboardButton("⚗️", callback_data=_upg_cb("P", owner_id, "SYN", 1, "D")),
+        InlineKeyboardButton("🧫", callback_data=_upg_cb("P", owner_id, "ACC", 1, "D")),
     )
     kb.row(InlineKeyboardButton("Вернуться к досье", callback_data=_labui_data(owner_id, "D")))
     return kb
@@ -7553,14 +7568,16 @@ def render_lab_dev(owner_id: int) -> str:
     qual = (
         int(_rget(lab, "total_pathogens", 1) or 1)
         + int(_rget(lab, "total_vaccines", 1) or 1)
+        + int(_rget(lab, "synthesis", 1) or 1)
         + int(_rget(lab, "acceleration", 1) or 1)
-    ) // 3   
+    ) // 4   
     lines.append(f'👨‍🔬 Квалификация учёных: {qual} ур')
     lines.append("")
     lines.append("<i>ХАРАКТЕРИСТИКИ:</i>")
     lines.append(f'🧪 Количество патогенов: {lab["total_pathogens"]}')
     lines.append(f'💉 Количество вакцин: {lab["total_vaccines"]}')
-    lines.append(f'⚗️ Ускоренное производство: {_rget(lab,"acceleration",1)} ур')
+    lines.append(f'⚗️ Синтез: {_rget(lab,"synthesis",1)} ур')
+    lines.append(f'🧫 Ускоренное производство: {_rget(lab,"acceleration",1)} ур')
     return "\n".join(lines)
 
 def render_lab_sec(owner_id: int) -> str:
@@ -7845,21 +7862,22 @@ def _timer_parse_period_spec(text: str) -> tuple[Optional[dict], str]:
 def _timer_spec_to_text(spec: dict) -> str:
     parts = []
 
-    if int(spec.get("minutes", 0) or 0) > 0:
-        n = int(spec["minutes"])
-        parts.append(f"{n} {_ru_form(n, 'минута', 'минуты', 'минут')}")
-    if int(spec.get("hours", 0) or 0) > 0:
-        n = int(spec["hours"])
-        parts.append(f"{n} {_ru_form(n, 'час', 'часа', 'часов')}")
-    if int(spec.get("days", 0) or 0) > 0:
-        n = int(spec["days"])
-        parts.append(f"{n} {_ru_form(n, 'день', 'дня', 'дней')}")
-    if int(spec.get("weeks", 0) or 0) > 0:
-        n = int(spec["weeks"])
-        parts.append(f"{n} {_ru_form(n, 'неделя', 'недели', 'недель')}")
-    if int(spec.get("months", 0) or 0) > 0:
-        n = int(spec["months"])
-        parts.append(f"{n} {_ru_form(n, 'месяц', 'месяца', 'месяцев')}")
+    hours = int(spec.get("hours", 0) or 0)
+    minutes = int(spec.get("minutes", 0) or 0)
+    days = int(spec.get("days", 0) or 0)
+    weeks = int(spec.get("weeks", 0) or 0)
+    months = int(spec.get("months", 0) or 0)
+
+    if hours > 0:
+        parts.append(f"{hours} {_ru_form(hours, 'час', 'часа', 'часов')}")
+    if minutes > 0:
+        parts.append(f"{minutes} {_ru_form(minutes, 'минута', 'минуты', 'минут')}")
+    if days > 0:
+        parts.append(f"{days} {_ru_form(days, 'день', 'дня', 'дней')}")
+    if weeks > 0:
+        parts.append(f"{weeks} {_ru_form(weeks, 'неделя', 'недели', 'недель')}")
+    if months > 0:
+        parts.append(f"{months} {_ru_form(months, 'месяц', 'месяца', 'месяцев')}")
 
     return " ".join(parts) if parts else "0 минут"
 
@@ -7916,57 +7934,215 @@ def _timer_apply_period(dt: datetime, spec: dict) -> datetime:
     )
     return out
 
+_TIMER_ABS_FORMATS_HELP = (
+    "📋 Поддерживаемые форматы:\n"
+    "<blockquote expandable>\n"
+    "чч:мм:сс\n"
+    "чч:мм\n"
+    "чч\n"
+    "дд.мм.гггг\n"
+    "дд.мм\n"
+    "дд\n"
+    "чч:мм:сс дд.мм.гггг\n"
+    "чч:мм:сс дд.мм\n"
+    "чч:мм:сс дд\n"
+    "чч:мм дд.мм.гггг\n"
+    "чч:мм дд.мм\n"
+    "чч:мм дд\n"
+    "чч дд.мм.гггг\n"
+    "чч дд.мм\n"
+    "чч дд\n"
+    "дд.мм.гггг чч:мм:сс\n"
+    "дд.мм чч:мм:сс\n"
+    "дд чч:мм:сс\n"
+    "дд.мм.гггг чч:мм\n"
+    "дд.мм чч:мм\n"
+    "дд чч:мм\n"
+    "дд.мм.гггг чч\n"
+    "дд.мм чч\n"
+    "дд чч\n"
+    "</blockquote>"
+)
+
+def _timer_invalid_abs_error() -> str:
+    return "📑 Неверный формат периода таймера.\n" + _TIMER_ABS_FORMATS_HELP
+
+def _parse_time_token(tok: str):
+    s = (tok or "").strip()
+    if not s:
+        return None
+    if not re.fullmatch(r"\d{1,2}(:\d{1,2}){0,2}", s):
+        return None
+
+    parts = [int(x) for x in s.split(":")]
+    if len(parts) == 1:
+        hh, mm, ss = parts[0], 0, 0
+    elif len(parts) == 2:
+        hh, mm = parts
+        ss = 0
+    else:
+        hh, mm, ss = parts
+
+    if hh > 23 or mm > 59 or ss > 59:
+        return None
+    return hh, mm, ss
+
+def _parse_date_token(tok: str):
+    s = (tok or "").strip()
+    if not s:
+        return None
+
+    if not re.fullmatch(r"\d{1,2}(\.\d{1,2}){0,1}(\.\d{2}|\.\d{4}){0,1}", s):
+        return None
+
+    parts = s.split(".")
+    if len(parts) == 1:
+        return {"day": int(parts[0]), "month": None, "year": None}
+
+    if len(parts) == 2:
+        return {"day": int(parts[0]), "month": int(parts[1]), "year": None}
+
+    y_raw = parts[2].strip()
+    y = int(y_raw)
+    if len(y_raw) == 2:
+        y += 2000
+
+    return {"day": int(parts[0]), "month": int(parts[1]), "year": y}
+
+def _next_valid_month_day_after(base_dt: datetime, day: int, month: int, hh: int, mm: int, ss: int):
+    year = base_dt.year
+    for plus_year in (0, 1):
+        y = year + plus_year
+        try:
+            cand = datetime(y, month, day, hh, mm, ss)
+        except Exception:
+            continue
+        if cand > base_dt:
+            return cand
+    return None
+
+def _next_valid_day_of_month_after(base_dt: datetime, day: int, hh: int, mm: int, ss: int):
+    y = base_dt.year
+    m = base_dt.month
+    for _ in range(0, 14):
+        try:
+            cand = datetime(y, m, day, hh, mm, ss)
+            if cand > base_dt:
+                return cand
+        except Exception:
+            pass
+
+        m += 1
+        if m > 12:
+            m = 1
+            y += 1
+    return None
+
 def _timer_parse_absolute_spec(text: str) -> tuple[Optional[int], str]:
     s = (text or "").strip()
     if not s:
-        return None, "📑 Укажите дату или время таймера."
+        return None, _timer_invalid_abs_error()
 
-    mt = re.search(r"(?<!\d)(\d{1,2}):(\d{2})(?!\d)", s)
-    md = re.search(r"(?<!\d)(\d{1,2})\.(\d{1,2})(?:\.(\d{2,4}))?(?!\d)", s)
-
-    if not mt and not md:
-        return None, "📑 Неверный формат даты таймера."
+    toks = s.split()
+    if len(toks) > 2:
+        return None, _timer_invalid_abs_error()
 
     now_dt = datetime.now()
 
-    day = now_dt.day
-    month = now_dt.month
-    year = now_dt.year
-    hour = 0
-    minute = 0
+    time_part = None
+    date_part = None
 
-    if mt:
-        hour = int(mt.group(1))
-        minute = int(mt.group(2))
-        if hour > 23 or minute > 59:
-            return None, "📑 Неверный формат времени таймера."
+    for tok in toks:
+        pt = _parse_time_token(tok)
+        pd = _parse_date_token(tok)
 
-    if md:
-        day = int(md.group(1))
-        month = int(md.group(2))
-        y = md.group(3)
-        if y:
-            y = str(y)
-            year = int(y)
-            if year < 100:
-                year += 2000
+        if pt and not time_part:
+            time_part = pt
+            continue
+        if pd and not date_part:
+            date_part = pd
+            continue
+        return None, _timer_invalid_abs_error()
 
-    try:
-        target_dt = datetime(year, month, day, hour, minute)
-    except Exception:
-        return None, "📑 Неверная дата таймера."
+    if not time_part and not date_part:
+        return None, _timer_invalid_abs_error()
 
-    delta_sec = int(target_dt.timestamp()) - now_ts()
+    hh, mm, ss = time_part if time_part else (0, 0, 1)
+
+    # Только время
+    if time_part and not date_part:
+        cand = now_dt.replace(hour=hh, minute=mm, second=ss, microsecond=0)
+        if cand <= now_dt:
+            cand = cand + timedelta(days=1)
+        if int((cand - now_dt).total_seconds()) > TIMER_MAX_SECONDS:
+            return None, "📑 Максимальный срок таймера — один год."
+        return int(cand.timestamp()), ""
+
+    day = int(date_part["day"] or 0)
+    month = date_part["month"]
+    year = date_part["year"]
+
+    if day <= 0 or day > 31:
+        return None, _timer_invalid_abs_error()
+
+    cand = None
+
+    # Полная дата
+    if year is not None and month is not None:
+        try:
+            cand = datetime(int(year), int(month), int(day), hh, mm, ss)
+        except Exception:
+            return None, _timer_invalid_abs_error()
+
+        if cand <= now_dt:
+            return None, "📑 Нельзя установить таймер задним числом."
+
+    # День + месяц
+    elif month is not None:
+        if month < 1 or month > 12:
+            return None, _timer_invalid_abs_error()
+        cand = _next_valid_month_day_after(now_dt, day, int(month), hh, mm, ss)
+        if cand is None:
+            return None, _timer_invalid_abs_error()
+
+    # Только день
+    else:
+        cand = _next_valid_day_of_month_after(now_dt, day, hh, mm, ss)
+        if cand is None:
+            return None, _timer_invalid_abs_error()
+
+    delta_sec = int((cand - now_dt).total_seconds())
     if delta_sec <= 0:
         return None, "📑 Нельзя установить таймер задним числом."
     if delta_sec > TIMER_MAX_SECONDS:
         return None, "📑 Максимальный срок таймера — один год."
 
-    return int(target_dt.timestamp()), ""
+    return int(cand.timestamp()), ""
 
 def _timer_body_command(text: str) -> str:
     _first, body = _timer_first_line_and_body(text)
     return (body or "").strip()
+
+def _timer_validate_body_command(cmd_text: str) -> tuple[bool, str]:
+    raw = (cmd_text or "").strip()
+    if not raw:
+        return False, "📑 Неверный формат команды. Я вас не понимаю."
+
+    parsed = parse_message_as_command(raw)
+    if not parsed:
+        return False, "📑 Команда для таймера не распознана."
+
+    if parsed.cmd in (
+        "timer_add_rel", "timer_add_abs", "timer_add_cycle",
+        "timer_delete", "timer_clear_all", "timer_list",
+        "owner", "owner_remove", "agents_panel",
+        "bot_ban", "bot_unban", "remake_lab",
+        "report", "settings", "blacklist", "users_list",
+        "name_lock_lab", "name_lock_pat"
+    ):
+        return False, "📑 Эта команда не может быть выполнена таймером."
+
+    return True, ""
 
 def _timer_rows_for_user(user_id: int) -> List[sqlite3.Row]:
     return db_all(
@@ -8248,15 +8424,26 @@ def _rget(row, key: str, default=None):
 # шанс коэффицента
 def _pick_cof_rost() -> int:
     r = random.random() * 100.0
-    if r < 62:
+
+    if r < 42.10:
         return 1
-    if r < 79:
+    if r < 42.10 + 23.54:
         return 2
-    if r < 89:
+    if r < 42.10 + 23.54 + 18.45:
         return 3
-    if r < 96:
+    if r < 42.10 + 23.54 + 18.45 + 9.02:
         return 4
-    return 5
+    if r < 42.10 + 23.54 + 18.45 + 9.02 + 2.99:
+        return 5
+    if r < 42.10 + 23.54 + 18.45 + 9.02 + 2.99 + 1.84:
+        return 6
+    if r < 42.10 + 23.54 + 18.45 + 9.02 + 2.99 + 1.84 + 1.03:
+        return 7
+    if r < 42.10 + 23.54 + 18.45 + 9.02 + 2.99 + 1.84 + 1.03 + 0.71:
+        return 8
+    if r < 42.10 + 23.54 + 18.45 + 9.02 + 2.99 + 1.84 + 1.03 + 0.71 + 0.23:
+        return 9
+    return 10
 
 # стартовые значения
 SYNTH_COOLDOWN_SEC = 4 * 3600 # синтезация кулдаун
@@ -8519,6 +8706,7 @@ def _pick_target_from_db(attacker_id: int, mode: str, chat_id: int, chat_filter:
             params.append(att_exp)
 
         rows = db_all(base, tuple(params)) or []
+        rows = [r for r in rows if not same_corp(int(attacker_id), int(r["uid"]))]
         if not rows:
             return None
 
@@ -8564,6 +8752,7 @@ def _pick_target_from_db(attacker_id: int, mode: str, chat_id: int, chat_filter:
         params.append(att_exp)
 
     rows = db_all(base, tuple(params)) or []
+    rows = [r for r in rows if not same_corp(int(attacker_id), int(r["uid"]))]
     if not rows:
         return None
 
@@ -8816,6 +9005,15 @@ def _craft_params(base_sec: int, min_sec: int, acc_level: int) -> tuple[int, flo
     dup_pct = min(100.0, float(extra) * 0.1)
     return int(craft), float(dup_pct)
 
+def _synth_bonus_value(syn_level: int) -> int:
+    try:
+        lvl = int(syn_level or 0)
+    except Exception:
+        lvl = 0
+    if lvl < 1:
+        lvl = 1
+    return max(0, lvl - 1) * 25
+
 def _roll_pct(pct: float) -> bool:
     try:
         return random.random() * 100.0 < float(pct)
@@ -8857,12 +9055,13 @@ VACCINE_FAIL_TEXT = (
 SKILL_N1 = {
     "INF": 7,   # заразность
     "LET": 4,   # летальность
-    "HEA": 10,   # тяжесть
+    "HEA": 10,  # тяжесть
     "IMM": 7,   # иммунитет
     "REA": 6,   # реагирование
     "IDS": 5,   # обнаружение
     "IPS": 7,   # предотвращение
-    "ACC": 5,   # ускорение
+    "SYN": 15,  # синтез
+    "ACC": 5,   # ускоренное производство
     "PAT": 4,   # патогены
     "VAC": 8,   # вакцины
 }
@@ -8875,7 +9074,8 @@ SKILLS = {
     "REA": {"col": "reaction",    "title_1": "Улучшение оборудования группы быстрого реагирования", "title_2": "реагирование", "emoji": "👮"},
     "IDS": {"col": "ids",         "title_1": "Улучшение системы обнаружения угроз", "title_2": "обнаружение", "emoji": "🛰️"},
     "IPS": {"col": "ips",         "title_1": "Улучшение системы предотвращения угроз", "title_2": "предотвращение", "emoji": "📟"},
-    "ACC": {"col": "acceleration","title_1": "Улучшение лабораторного оборудования", "title_2": "ускорение", "emoji": "⚗️"},
+    "SYN": {"col": "synthesis",   "title_1": "Улучшение химического оборудования", "title_2": "синтез", "emoji": "⚗️"},
+    "ACC": {"col": "acceleration","title_1": "Улучшение лабораторного оборудования", "title_2": "ускорение", "emoji": "🧫"},
     "PAT": {"col": "total_pathogens", "ready_col": "ready_pathogens", "title_1": "Увеличение количества ячеек патогенов", "title_2": "патоген", "emoji": "🧪"},
     "VAC": {"col": "total_vaccines",  "ready_col": "ready_vaccines",  "title_1": "Увеличение количества ячеек вакцин", "title_2": "вакцина",  "emoji": "💉"},
 }
@@ -8888,6 +9088,7 @@ SKILL_SYNONYMS = {
     "реагирование": "REA", "реаг": "REA",
     "обнаружение": "IDS", "обнаруж": "IDS", "ids": "IDS",
     "предотвращение": "IPS", "предотв": "IPS", "ips": "IPS",
+    "синтез": "SYN", "синт": "SYN",
     "ускорение": "ACC", "ускор": "ACC", "производство": "ACC",
     "патоген": "PAT", "патогены": "PAT",
     "вакцина": "VAC", "вакцины": "VAC",
@@ -9078,6 +9279,11 @@ def _build_upgrade_preview(uid: int, code: str, steps: int) -> str:
         if bv != av:
             extra_lines += f"💉 Время произв.: {_format_hms(bv)} → {_format_hms(av)}\n"
 
+    if code == "SYN":
+        bsyn = _synth_bonus_value(cur)
+        add_syn = _synth_bonus_value(final_lvl) - bsyn
+        extra_lines += f"📈 Рост эффективности: {bsyn} + {add_syn}\n"
+
     if code == "LET":
         bfev = _calc_fever_sec(cur)
         afev = _calc_fever_sec(final_lvl)
@@ -9119,6 +9325,11 @@ def _execute_upgrade(uid: int, code: str, steps: int):
             extra_lines += f"🧪: {_format_hms(bp)} → {_format_hms(ap)}\n"
         if bv != av:
             extra_lines += f"💉: {_format_hms(bv)} → {_format_hms(av)}\n"
+
+    if code == "SYN":
+        bsyn = _synth_bonus_value(cur)
+        add_syn = _synth_bonus_value(final_lvl) - bsyn
+        extra_lines += f"📈 Рост эффективности: {bsyn} + {add_syn}\n"
 
     ok, spent_r, spent_m = _pay_cost(int(uid), price)
     if not ok:
@@ -9216,6 +9427,7 @@ STRICT_NO_EXTRA_ARGS_CMDS = {
     "corp_req_list", "corp_leave",
     "rp_stats",
     "blacklist", "users_list", "agents_panel",
+    "synth",
 }
 
 CALC_UPGRADE_PUBLIC_VARS = [
@@ -9837,15 +10049,23 @@ def synth_attempt(uid: int) -> str:
     ensure_lab_exists(uid)
     now = now_ts()
 
-    row = db_one("SELECT COALESCE(last_synth_ts,0) AS t FROM labs WHERE user_id=?", (uid,))
+    row = db_one(
+        "SELECT COALESCE(last_synth_ts,0) AS t, COALESCE(synthesis,1) AS syn "
+        "FROM labs WHERE user_id=?",
+        (uid,)
+    )
     last_ts = int(row["t"] if row else 0)
+    synth_lvl = int(row["syn"] if row else 1)
+
     left = (last_ts + SYNTH_COOLDOWN_SEC) - now
     if left > 0:
         return f"❌ СИНТЕЗ НЕ ВЫПОЛНЕН! Ограничение раз в 4 часа. Следующая добыча через {_format_duration(left)}"
 
-    stat_bio_mater = random.randint(1, 100) # синтез старт число
+    synth_bonus = _synth_bonus_value(synth_lvl)
+    stat_bio_mater = random.randint(1, 100+synth_bonus)
+    base_value = stat_bio_mater
     cof_rost = _pick_cof_rost()
-    bio_mater = int(stat_bio_mater * cof_rost)
+    bio_mater = int(base_value * cof_rost)
 
     db_exec(
         "UPDATE labs SET all_bio_mater=COALESCE(all_bio_mater,0)+?, last_synth_ts=? WHERE user_id=?",
@@ -9854,8 +10074,9 @@ def synth_attempt(uid: int) -> str:
     )
 
     return (
-        f"⚗️ СИНТЕЗ ЗАВЕРШЁН! Получено 💊 +{bio_mater} = {stat_bio_mater}×{cof_rost}\n\n"
-        f"🔺Коэфициент роста: {cof_rost}"
+        f"⚗️ СИНТЕЗ ЗАВЕРШЁН! Получено 💊 +{bio_mater} = {base_value}×{cof_rost}\n\n"
+        f"🔺 Коэффициент роста: {cof_rost}\n"
+        f"📈 Эффективность синтеза: {synth_bonus}"
     )
 
 def handle_synth_command(message):
@@ -11892,6 +12113,9 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
             return
         if int(target_id) == int(attacker_id):
             _emit("🧪 Вы не можете заразить самого себя.")
+            return
+        if same_corp(int(attacker_id), int(target_id)):
+            _emit("📑 Участники одной Корпорации не могут заражать друг друга.")
             return
 
         if message.chat.type == "private" and not is_lab_active(int(target_id)):
@@ -13956,10 +14180,11 @@ def _inline_strip_target_prefix(query: str) -> tuple[Optional[int], str, str]:
 
     parts = raw.split(None, 1)
     tok = parts[0].strip()
-    if tok.startswith("@"):
-        tid = find_user_id_by_username(tok)
-        tail = parts[1].strip() if len(parts) > 1 else ""
-        return (int(tid), tok, tail) if tid is not None else (None, tok, tail)
+    tail = parts[1].strip() if len(parts) > 1 else ""
+
+    tid = _resolve_or_create_infect_target(tok)
+    if tid is not None:
+        return int(tid), tok, tail
 
     return None, "", raw
 
@@ -14450,6 +14675,13 @@ def text_router(message):
             return
 
         if parsed.cmd in STRICT_NO_EXTRA_ARGS_CMDS and (parsed.args or "").strip():
+            return
+        if parsed.cmd in (
+            "top_users", "top_users_chat",
+            "top_diseases", "top_diseases_chat",
+            "top_corps", "top_corps_chat",
+            "rp_stats",
+        ) and not has_explicit_bot_prefix(message.text or ""):
             return
         if parsed.cmd in ("balance", "lab", "mylab", "corp_info"):
             bad = not strict_single_target_args_ok(message, parsed, allow_empty=True)
