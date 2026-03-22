@@ -1096,6 +1096,7 @@ PREMIUM_EMOJI_IDS: Dict[str, str] = {
     "🧾": "5444860552310457690",
     "📝": "5334882760735598374",
     "📊": "5431577498364158238",
+    "📈": "5332482733010622094",
     "✅": "5447298551841322535",
     "❎": "5445283164207479914",
     "⭕": "5260416304224936047",
@@ -1122,6 +1123,8 @@ PREMIUM_EMOJI_IDS: Dict[str, str] = {
     "🏢": "5264733042710181045",
     "💎": "5343636681473935403",
     "🪬": "5276489300207217985",
+    "🎁": "5199749070830197566",
+    "🔹": "5258255531948146531",
     "💬": "5255727011686553638",
     "👋": "5208853155957209306",
     "⚙️": "5445347129155419150",
@@ -2158,6 +2161,43 @@ def init_db():
 
         infected_total  INTEGER DEFAULT 0,
         diseases_total  INTEGER DEFAULT 0
+    );
+    """, commit=True)
+
+    try:
+        db_exec("ALTER TABLE labs ADD COLUMN skill_points INTEGER DEFAULT 0", commit=True)
+    except Exception:
+        pass
+
+    # промокоды
+    db_exec("""
+    CREATE TABLE IF NOT EXISTS promo_codes (
+        promo_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+        code            TEXT NOT NULL,
+        code_key        TEXT NOT NULL UNIQUE,
+        is_permanent    INTEGER NOT NULL DEFAULT 0,
+        expires_ts      INTEGER NOT NULL DEFAULT 0,
+        created_at      INTEGER NOT NULL DEFAULT 0,
+        created_by      INTEGER NOT NULL DEFAULT 0
+    );
+    """, commit=True)
+
+    db_exec("""
+    CREATE TABLE IF NOT EXISTS promo_bonuses (
+        bonus_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+        promo_id        INTEGER NOT NULL,
+        kind            TEXT NOT NULL,
+        ref_code        TEXT NOT NULL DEFAULT '',
+        amount          INTEGER NOT NULL DEFAULT 0
+    );
+    """, commit=True)
+
+    db_exec("""
+    CREATE TABLE IF NOT EXISTS promo_uses (
+        promo_id        INTEGER NOT NULL,
+        user_id         INTEGER NOT NULL,
+        used_at         INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (promo_id, user_id)
     );
     """, commit=True)
 
@@ -5123,12 +5163,23 @@ def build_agents_panel_text(user_id: int) -> str:
         lines.append("/owner — назначить агента")
         lines.append("/owner_remove — снять права с агента")
         lines.append("/users — список всех пользователей")
+        lines.append("/promocode_generate — назначить агента")
+        lines.append("/promocode_create — снять права с агента")
+        lines.append("/promocode_all — список всех пользователей")
+        lines.append("/promocode_delete — назначить агента")
     lines.append("/bot_ban — заблокировать пользователя")
     lines.append("/bot_unban — разблокировать пользователя")
     lines.append("/remake_lab — восстановить лабораторию")
     lines.append("<code>/+lab_name</code> | <code>/-lab_name</code> — разрешает/запрещает имена лаборатории для пользователя")
     lines.append("<code>/+pat_name</code> | <code>/-pat_name</code> — разрешает/запрещает имена патогена для пользователя")
     lines.append("/blacklist — список пользователей с ограничениями")
+    lines.append("")
+    if uid == int(CREATOR_ID):
+        lines.append("🎁 Раздел промокоды:")
+        lines.append("/promocode_generate — генерация случайного временного промокода")
+        lines.append("/promocode_create — создание промокода")
+        lines.append("/promocode_all — список всех промокодов")
+        lines.append("/promocode_delete — удалить промокод")
 
     return "\n".join(lines)
 
@@ -6240,6 +6291,34 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
     if t == LAB_DELETE_PHRASE:
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="lab_delete_confirm_phrase", args="")
 
+    # промокоды
+    if low == "promocode_generate":
+        return Parsed(raw=raw_multiline, has_prefix_char=False, prefix_char=None, cmd="promo_generate", args="")
+
+    if low == "promocode_all":
+        return Parsed(raw=raw_multiline, has_prefix_char=False, prefix_char=None, cmd="promo_all", args="")
+
+    if low == "promocode_delete" or low.startswith("promocode_delete "):
+        rest = ""
+        parts = t.split(" ", 1)
+        if len(parts) > 1:
+            rest = parts[1].strip()
+        return Parsed(raw=raw_multiline, has_prefix_char=False, prefix_char=None, cmd="promo_delete", args=rest)
+
+    if low == "promocode_create" or low.startswith("promocode_create "):
+        rest = ""
+        parts = t.split(" ", 1)
+        if len(parts) > 1:
+            rest = parts[1].strip()
+        return Parsed(raw=raw_multiline, has_prefix_char=False, prefix_char=None, cmd="promo_create", args=rest)
+
+    if low == "promo" or low.startswith("promo "):
+        rest = ""
+        parts = t.split(" ", 1)
+        if len(parts) > 1:
+            rest = parts[1].strip()
+        return Parsed(raw=raw_multiline, has_prefix_char=False, prefix_char=None, cmd="promo_use", args=rest)
+
     # приватные настройки
     if sign in ("+", "-"):
         if low in ("баланс", "мешок", "кошелек", "кошелёк", "кош", "бал", "меш"):
@@ -6309,6 +6388,8 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
         elif low in ("кш", "кпц"):
             calc_cmd = "calc_chance"
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd=calc_cmd, args="")
+    if low in ("кс", "кус"):
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="calc_buff", args="")
 
     if low.startswith("калькулятор "):
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="calc", args=t.split(" ", 1)[1].strip())
@@ -6322,6 +6403,14 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="calc_chance", args=t.split(" ", 1)[1].strip())
     if low.startswith("кпц "):
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="calc_chance", args=t.split(" ", 1)[1].strip())
+    if low.startswith("калькулятор усилений "):
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="calc_buff", args=t.split(" ", 2)[2].strip())
+    if low.startswith("калькулятор усиления "):
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="calc_buff", args=t.split(" ", 2)[2].strip())
+    if low.startswith("кс "):
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="calc_buff", args=t.split(" ", 1)[1].strip())
+    if low.startswith("кус "):
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="calc_buff", args=t.split(" ", 1)[1].strip())
 
     # заразить
     if low == "заразить" or low.startswith("заразить "):
@@ -7184,6 +7273,130 @@ def handle_users_list_command(message):
 
     text, rm = render_users_text(1)
     bot.reply_to(message, text, parse_mode="HTML", disable_web_page_preview=True, reply_markup=rm)
+
+def handle_promo_generate_command(message):
+    uid = int(message.from_user.id)
+    if not can_manage_support(uid):
+        return
+
+    code = _promo_make_random_code()
+    bonuses = []
+
+    # 1-3 случайных бонуса
+    choices = ["res", "mat", "points", "skill"]
+    random.shuffle(choices)
+    for kind in choices[: random.randint(1, 3)]:
+        if kind == "res":
+            bonuses.append({"kind": "res", "ref_code": "", "amount": random.choice([50, 100, 150, 250, 500])})
+        elif kind == "mat":
+            bonuses.append({"kind": "mat", "ref_code": "", "amount": random.choice([20, 50, 100, 200])})
+        elif kind == "points":
+            bonuses.append({"kind": "points", "ref_code": "", "amount": random.choice([1, 2, 3])})
+        else:
+            sk = random.choice(list(SKILLS.keys()))
+            bonuses.append({"kind": "skill", "ref_code": sk, "amount": random.choice([1, 2])})
+
+    ts = int(now_ts() + 7 * 86400)
+    _promo_create(code, 0, ts, bonuses, uid)
+
+    bonus_txt = "\n".join([_promo_bonus_to_text(b) for b in bonuses if _promo_bonus_to_text(b)])
+    bot.reply_to(
+        message,
+        f"✅ Промокод создан:\n<code>{h(code)}</code>\nДействителен до <code>{h(_fmt_ts(ts))}</code>\n{bonus_txt}",
+        parse_mode="HTML",
+        disable_web_page_preview=True
+    )
+
+def handle_promo_create_command(message):
+    uid = int(message.from_user.id)
+    if not can_manage_support(uid):
+        return
+
+    payload, err = _promo_parse_create_message(message.text or "")
+    if not payload:
+        bot.reply_to(message, err, parse_mode="HTML", disable_web_page_preview=True)
+        return
+
+    try:
+        _promo_create(
+            payload["code"],
+            int(payload["is_permanent"]),
+            int(payload["expires_ts"]),
+            list(payload["bonuses"]),
+            uid
+        )
+    except sqlite3.IntegrityError:
+        bot.reply_to(message, "📑 Промокод с таким названием уже существует.")
+        return
+
+    bonus_txt = "\n".join([_promo_bonus_to_text(b) for b in payload["bonuses"] if _promo_bonus_to_text(b)])
+    status = "постоянный" if int(payload["is_permanent"]) == 1 else f"до <code>{h(_fmt_ts(int(payload['expires_ts'])))}</code>"
+    bot.reply_to(
+        message,
+        f"✅ Промокод <code>{h(payload['code'])}</code> создан.\nСтатус: {status}\n{bonus_txt}",
+        parse_mode="HTML",
+        disable_web_page_preview=True
+    )
+
+def handle_promo_all_command(message):
+    uid = int(message.from_user.id)
+    if not can_manage_support(uid):
+        return
+    text, rm = render_promocode_list_text(1)
+    bot.reply_to(message, text, parse_mode="HTML", disable_web_page_preview=True, reply_markup=rm)
+
+def handle_promo_delete_command(message, parsed: Parsed):
+    uid = int(message.from_user.id)
+    if not can_manage_support(uid):
+        return
+
+    arg = (parsed.args or "").strip()
+    if not arg:
+        return
+
+    rows = _promo_fetch_all_rows()
+    promo_id = None
+    if arg.isdigit():
+        idx = int(arg)
+        if 1 <= idx <= len(rows):
+            promo_id = int(rows[idx - 1]["promo_id"])
+    else:
+        code_key = _promo_norm_code(arg)
+        for r in rows:
+            if _promo_norm_code(r["code"]) == code_key:
+                promo_id = int(r["promo_id"])
+                break
+
+    if promo_id is None:
+        bot.reply_to(message, "📑 Промокод не найден.")
+        return
+
+    with DB_LOCK:
+        c = conn.cursor()
+        try:
+            c.execute("BEGIN")
+            c.execute("DELETE FROM promo_bonuses WHERE promo_id=?", (promo_id,))
+            c.execute("DELETE FROM promo_uses WHERE promo_id=?", (promo_id,))
+            c.execute("DELETE FROM promo_codes WHERE promo_id=?", (promo_id,))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            try:
+                c.close()
+            except Exception:
+                pass
+
+    bot.reply_to(message, "✅ Промокод удалён.")
+
+def handle_promo_use_command(message, parsed: Parsed):
+    uid = int(message.from_user.id)
+    code = (parsed.args or "").strip()
+    if not code:
+        return
+    ok, txt = _promo_apply_to_user(code, uid)
+    bot.reply_to(message, txt, parse_mode="HTML", disable_web_page_preview=True)
 
 def handle_timer_commands(message, parsed: Parsed):
     uid = int(message.from_user.id)
@@ -8489,6 +8702,8 @@ BLUI_TAG = "K"
 USERSUI_TAG = "US"
 EMPACKUI_TAG = "EP"
 RPUI_TAG = "RP"
+PROMOUI_TAG = "PR"
+PROMO_PAGE_SIZE = 15
 
 # хендлеры и хэлперы
 #           report
@@ -8514,6 +8729,390 @@ INF_CHAT_FILTER_SYNONYMS = {
     "-": "m", "м": "m", "меньше": "m",
     "=": "e", "равный": "e",
 }
+
+#           промокод
+_PROMO_THEME_A = [
+    "BIO", "LAB", "PATHOGEN", "CORP", "GENOME", "SYNTH", "CELL", "VECTOR",
+    "OUTBREAK", "QUARANTINE", "VIRUS", "MED", "IMMUNE", "PLAGUE", "TOXIN"
+]
+_PROMO_THEME_B = [
+    "CORE", "NOVA", "DELTA", "OMEGA", "NEXUS", "SECTOR", "REACTOR",
+    "PROTO", "ALPHA", "BETA", "GAMMA", "SIGMA", "XENO", "ECHO", "RIFT"
+]
+
+def _promo_norm_code(code: str) -> str:
+    return re.sub(r"\s+", " ", (code or "").strip()).casefold()
+
+def _promo_make_random_code() -> str:
+    left = random.choice(_PROMO_THEME_A)
+    right = random.choice(_PROMO_THEME_B)
+    num = random.randint(10, 9999)
+
+    pattern = random.randint(1, 7)
+    if pattern == 1:
+        return f"{left}-{right}{num}"
+    if pattern == 2:
+        return f"{left}_{right}_{num}"
+    if pattern == 3:
+        return f"{left}{num}{right}{num}"
+    if pattern == 4:
+        return f"{left}{num}-{right}"
+    if pattern == 5:
+        return f"{num}_{left}{right}"
+    if pattern == 6:
+        return f"{num}{left}¦{num}{right}"
+    return f"{left}{right}{num}"
+
+def _promo_bonus_skill_code_from_prefix(line: str) -> tuple[Optional[str], int]:
+    toks = (line or "").strip().split()
+    if len(toks) < 2:
+        return None, 0
+
+    for take in range(min(3, len(toks) - 1), 0, -1):
+        probe = " ".join(toks[:take])
+        code = _resolve_skill(probe)
+        if code and toks[take].isdigit():
+            return code, int(toks[take])
+
+    return None, 0
+
+def _promo_parse_bonus_line(line: str):
+    s = re.sub(r"\s+", " ", (line or "").strip())
+    if not s:
+        return None
+
+    low = s.lower()
+    toks = s.split()
+
+    code, amt = _promo_bonus_skill_code_from_prefix(s)
+    if code and amt > 0:
+        return {"kind": "skill", "ref_code": code, "amount": amt}
+
+    if low.startswith("очков навыка ") or low.startswith("очков "):
+        last = toks[-1]
+        if last.isdigit():
+            return {"kind": "points", "ref_code": "", "amount": int(last)}
+
+    if low.startswith("очко навыка "):
+        last = toks[-1]
+        if last.isdigit():
+            return {"kind": "points", "ref_code": "", "amount": int(last)}
+
+    if low.startswith("био-ресурсы ") or low.startswith("ресы ") or low.startswith("био-ресурс "):
+        last = toks[-1]
+        if last.isdigit():
+            return {"kind": "res", "ref_code": "", "amount": int(last)}
+
+    if low.startswith("био-материалы ") or low.startswith("маты ") or low.startswith("био-материал "):
+        last = toks[-1]
+        if last.isdigit():
+            return {"kind": "mat", "ref_code": "", "amount": int(last)}
+
+    return None
+
+def _promo_parse_create_message(message_text: str):
+    raw = strip_bio_prefix((message_text or "").strip())
+    if not raw:
+        return None, "📑 Неверный формат команды."
+
+    first_line, body = _timer_first_line_and_body(raw)
+    fl = first_line.strip()
+    if fl.startswith("/") or fl.startswith("."):
+        fl = fl[1:].strip()
+
+    parts = fl.split(None, 1)
+    if len(parts) < 2:
+        return None, "📑 Неверный формат команды."
+
+    header = parts[1].strip()
+    low = header.lower()
+
+    is_permanent = 0
+    expires_ts = 0
+    code = ""
+
+    if low.startswith("постоянный "):
+        is_permanent = 1
+        code = header[len("постоянный "):].strip()
+    elif low.startswith("временный "):
+        tail = header[len("временный "):].strip()
+        toks = tail.split()
+        parsed = False
+        for take in (2, 1):
+            if len(toks) >= take:
+                ts, err = _timer_parse_absolute_spec(" ".join(toks[:take]))
+                if ts is not None:
+                    expires_ts = int(ts)
+                    code = " ".join(toks[take:]).strip()
+                    parsed = True
+                    break
+        if not parsed:
+            return None, "📑 Неверный формат периода промокода."
+    else:
+        return None, "📑 Укажите параметр <code>постоянный</code> или <code>временный</code>."
+
+    if not code:
+        return None, "📑 Укажите название промокода."
+
+    bonus_lines = [x.strip() for x in body.splitlines() if x.strip()]
+    if not bonus_lines:
+        return None, (
+            "📑 Укажите бонусы с новой строки.\n"
+            "Поддерживаемые форматы:\n"
+            "<blockquote expandable>\n"
+            "заразность n\n"
+            "синтез n\n"
+            "ускорение n\n"
+            "очков навыка n\n"
+            "био-ресурсы n\n"
+            "био-материалы n\n"
+            "</blockquote>"
+        )
+
+    bonuses = []
+    for line in bonus_lines:
+        b = _promo_parse_bonus_line(line)
+        if not b or int(b["amount"]) <= 0:
+            return None, (
+                "📑 Неверный формат бонусов.\n"
+                "Поддерживаемые форматы:\n"
+                "<blockquote expandable>\n"
+                "заразность n\n"
+                "синтез n\n"
+                "ускорение n\n"
+                "очков навыка n\n"
+                "био-ресурсы n\n"
+                "био-материалы n\n"
+                "</blockquote>"
+            )
+        bonuses.append(b)
+
+    return {
+        "is_permanent": int(is_permanent),
+        "expires_ts": int(expires_ts),
+        "code": code,
+        "code_key": _promo_norm_code(code),
+        "bonuses": bonuses,
+    }, ""
+
+def _promo_bonus_to_text(b) -> str:
+    if b is None:
+        return ""
+
+    if isinstance(b, dict):
+        kind = str(b.get("kind") or "")
+        amount = int(b.get("amount") or 0)
+        ref_code = str(b.get("ref_code") or "")
+    else:
+        kind = str(b["kind"] or "")
+        amount = int(b["amount"] or 0)
+        ref_code = str(b["ref_code"] or "")
+
+    if kind == "skill":
+        skill = SKILLS.get(ref_code)
+        if skill:
+            return f"{skill['emoji']} +{amount}"
+        return f"🔹 {h(ref_code)} +{amount}"
+
+    if kind == "points":
+        pts_word = _ru_form(amount, "очко навыка", "очка навыка", "очков навыка")
+        return f"🔹 +{amount} {pts_word}"
+
+    if kind == "res":
+        return f"🧬 +{amount}"
+
+    if kind == "mat":
+        return f"💊 +{amount}"
+
+    return ""
+
+def _promo_fetch_all_rows():
+    return db_all(
+        "SELECT promo_id, code, code_key, is_permanent, expires_ts, created_at "
+        "FROM promo_codes ORDER BY created_at DESC, promo_id DESC"
+    ) or []
+
+def _promo_cb(page: int) -> str:
+    return f"{PROMOUI_TAG}:{int(page)}"
+
+def _promo_parse_cb(data: str) -> Optional[int]:
+    try:
+        p = (data or "").split(":")
+        if len(p) != 2 or p[0] != PROMOUI_TAG:
+            return None
+        return int(p[1])
+    except Exception:
+        return None
+
+def render_promocode_list_text(page: int) -> tuple[str, Optional[InlineKeyboardMarkup]]:
+    rows = _promo_fetch_all_rows()
+    total = len(rows)
+    if total <= 0:
+        return "📋 Список промокодов:\n<blockquote>Список пуст.</blockquote>", None
+
+    total_pages = max(1, (total + PROMO_PAGE_SIZE - 1) // PROMO_PAGE_SIZE)
+    page = max(1, min(int(page), total_pages))
+    start = (page - 1) * PROMO_PAGE_SIZE
+    part = rows[start:start + PROMO_PAGE_SIZE]
+
+    lines = ["📋 Список промокодов:"]
+    lines.append("<blockquote expandable>")
+    for idx, r in enumerate(part, start + 1):
+        promo_id = int(r["promo_id"])
+        if int(r["is_permanent"] or 0) == 1:
+            status_txt = "постоянный"
+        else:
+            status_txt = f"действителен до {_fmt_ts(int(r['expires_ts'] or 0))}"
+
+        bonuses = db_all(
+            "SELECT kind, ref_code, amount FROM promo_bonuses WHERE promo_id=? ORDER BY bonus_id ASC",
+            (promo_id,)
+        ) or []
+        bonus_parts = []
+        for b in bonuses:
+            bt = _promo_bonus_to_text(b)
+            if bt:
+                bonus_parts.append(bt)
+        bonus_txt = " ".join(bonus_parts).strip()
+        lines.append(f"{idx}| <code>{h(r['code'])}</code> - {status_txt}")
+        if bonus_txt:
+            lines.append(bonus_txt)
+
+    lines.append("</blockquote>")
+
+    kb = None
+    if total_pages > 1:
+        kb = InlineKeyboardMarkup(row_width=8)
+        row_btns = []
+        if page > 2:
+            row_btns.append(InlineKeyboardButton("<<", callback_data=_promo_cb(1)))
+        if page > 1:
+            row_btns.append(InlineKeyboardButton("<", callback_data=_promo_cb(page - 1)))
+
+        page_nums = []
+        if total_pages <= 4:
+            page_nums = list(range(1, total_pages + 1))
+        elif page == 1:
+            page_nums = [1, 2, 3, 4]
+        elif page == total_pages:
+            page_nums = [total_pages - 3, total_pages - 2, total_pages - 1, total_pages]
+        else:
+            page_nums = [max(1, page - 1), page, min(total_pages, page + 1), min(total_pages, page + 2)]
+            page_nums = sorted(dict.fromkeys([p for p in page_nums if 1 <= p <= total_pages]))
+
+        for p in page_nums:
+            if p == page:
+                row_btns.append(InlineKeyboardButton(f"·{p}·", callback_data=_promo_cb(page)))
+            else:
+                row_btns.append(InlineKeyboardButton(str(p), callback_data=_promo_cb(p)))
+
+        if page < total_pages:
+            row_btns.append(InlineKeyboardButton(">", callback_data=_promo_cb(page + 1)))
+        if page < total_pages - 1:
+            row_btns.append(InlineKeyboardButton(">>", callback_data=_promo_cb(total_pages)))
+
+        kb.row(*row_btns)
+
+    return "\n".join(lines), kb
+
+def _promo_create(code: str, is_permanent: int, expires_ts: int, bonuses: list, creator_id: int):
+    with DB_LOCK:
+        c = conn.cursor()
+        try:
+            c.execute("BEGIN")
+            c.execute(
+                "INSERT INTO promo_codes(code, code_key, is_permanent, expires_ts, created_at, created_by) VALUES (?,?,?,?,?,?)",
+                (code, _promo_norm_code(code), int(is_permanent), int(expires_ts), int(now_ts()), int(creator_id))
+            )
+            promo_id = int(c.lastrowid)
+            for b in bonuses:
+                c.execute(
+                    "INSERT INTO promo_bonuses(promo_id, kind, ref_code, amount) VALUES (?,?,?,?)",
+                    (promo_id, str(b["kind"]), str(b.get("ref_code") or ""), int(b["amount"]))
+                )
+            conn.commit()
+            return promo_id
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            try:
+                c.close()
+            except Exception:
+                pass
+
+def _promo_apply_to_user(code: str, user_id: int) -> tuple[bool, str]:
+    ensure_lab_exists(int(user_id))
+    row = db_one(
+        "SELECT promo_id, code, is_permanent, expires_ts FROM promo_codes WHERE code_key=? LIMIT 1",
+        (_promo_norm_code(code),)
+    )
+    if not row:
+        return False, "📑 Промокод не найден."
+
+    promo_id = int(row["promo_id"])
+    if int(row["is_permanent"] or 0) != 1:
+        exp = int(row["expires_ts"] or 0)
+        if exp > 0 and exp < now_ts():
+            return False, "📑 Срок действия промокода истёк."
+
+    used = db_one("SELECT 1 FROM promo_uses WHERE promo_id=? AND user_id=? LIMIT 1", (promo_id, int(user_id)))
+    if used:
+        return False, "📑 Вы уже использовали этот промокод."
+
+    bonuses = db_all(
+        "SELECT kind, ref_code, amount FROM promo_bonuses WHERE promo_id=? ORDER BY bonus_id ASC",
+        (promo_id,)
+    ) or []
+    if not bonuses:
+        return False, "📑 Это промокод пустышка."
+
+    with DB_LOCK:
+        c = conn.cursor()
+        try:
+            c.execute("BEGIN")
+            for b in bonuses:
+                kind = str(b["kind"] or "")
+                ref = str(b["ref_code"] or "")
+                amt = int(b["amount"] or 0)
+                if amt <= 0:
+                    continue
+
+                if kind == "skill" and ref in SKILLS:
+                    col = SKILLS[ref]["col"]
+                    c.execute(f"UPDATE labs SET {col}=COALESCE({col},1)+? WHERE user_id=?", (amt, int(user_id)))
+                elif kind == "points":
+                    c.execute("UPDATE labs SET skill_points=COALESCE(skill_points,0)+? WHERE user_id=?", (amt, int(user_id)))
+                elif kind == "res":
+                    c.execute(
+                        "UPDATE labs SET all_bio_res=COALESCE(all_bio_res,0)+?, bio_res=COALESCE(bio_res,0)+? WHERE user_id=?",
+                        (amt, amt, int(user_id))
+                    )
+                elif kind == "mat":
+                    c.execute("UPDATE labs SET all_bio_mater=COALESCE(all_bio_mater,0)+? WHERE user_id=?", (amt, int(user_id)))
+
+            c.execute(
+                "INSERT INTO promo_uses(promo_id, user_id, used_at) VALUES (?,?,?)",
+                (promo_id, int(user_id), int(now_ts()))
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            try:
+                c.close()
+            except Exception:
+                pass
+
+    _recalc_derived(int(user_id))
+    pretty_parts = []
+    for b in bonuses:
+        bt = _promo_bonus_to_text(b)
+        if bt:
+            pretty_parts.append(bt)
+    pretty = " ".join(pretty_parts).strip()
+    return True, f"🎁 Промокод <code>{h(row['code'])}</code> активирован.\n{pretty}"
 
 # коэфициент кривизны
 INFECT_BOUND_K = 0.7
@@ -9012,7 +9611,7 @@ def _synth_bonus_value(syn_level: int) -> int:
         lvl = 0
     if lvl < 1:
         lvl = 1
-    return max(0, lvl - 1) * 25
+    return max(0, lvl - 1) * 10
 
 def _roll_pct(pct: float) -> bool:
     try:
@@ -9251,6 +9850,10 @@ def kb_upgrade(uid: int, code: str, steps: int, src: str = "C", ictype: Optional
         return _upg_cb(action, uid, code, s, src)
 
     kb.row(InlineKeyboardButton("Подтвердить улучшение", callback_data=_cb("B", int(steps))))
+    sp_row = db_one("SELECT COALESCE(skill_points,0) AS sp FROM labs WHERE user_id=?", (int(uid),))
+    sp = int(sp_row["sp"] or 0) if sp_row else 0
+    if sp > 0:
+        kb.row(InlineKeyboardButton(f"🔹 Использовать очко навыка ({sp})", callback_data=_cb("SP", 1)))
     kb.row(
         InlineKeyboardButton("× 1", callback_data=_cb("P", 1)),
         InlineKeyboardButton("× 2", callback_data=_cb("P", 2)),
@@ -9360,6 +9963,55 @@ def _execute_upgrade(uid: int, code: str, steps: int):
         f"{extra_lines}"
         f"{spent_txt}\n\n"
         "Дополнительно:"
+    )
+    return True, text, final_lvl
+
+def _execute_upgrade_by_skill_point(uid: int, code: str):
+    ensure_lab_exists(int(uid))
+    if code not in SKILLS:
+        return False, "📑 Навык не найден.", None
+
+    row = db_one("SELECT COALESCE(skill_points,0) AS sp FROM labs WHERE user_id=?", (int(uid),))
+    sp = int(row["sp"] or 0) if row else 0
+    if sp <= 0:
+        return False, "📑 У вас нет очков навыка.", None
+
+    skill = SKILLS[code]
+    col = skill["col"]
+    cur_row = db_one(f"SELECT COALESCE({col},1) AS v FROM labs WHERE user_id=?", (int(uid),))
+    cur = int(cur_row["v"] or 1) if cur_row else 1
+    final_lvl = cur + 1
+
+    db_exec(
+        f"UPDATE labs SET {col}=COALESCE({col},1)+1, skill_points=CASE WHEN COALESCE(skill_points,0)>0 THEN skill_points-1 ELSE 0 END WHERE user_id=?",
+        (int(uid),),
+        commit=True
+    )
+    _recalc_derived(int(uid))
+
+    extra_lines = ""
+    if code == "SYN":
+        bsyn = _synth_bonus_value(cur)
+        add_syn = _synth_bonus_value(final_lvl) - bsyn
+        extra_lines += f"📈 Рост эффективности: {bsyn} + {add_syn}\n"
+    if code == "ACC":
+        bp, bdup = _craft_params(PATHOGEN_CRAFT_SEC, PATHOGEN_MIN_SEC, cur)
+        ap, adup = _craft_params(PATHOGEN_CRAFT_SEC, PATHOGEN_MIN_SEC, final_lvl)
+        bv, bdupv = _craft_params(VACCINE_CRAFT_SEC, VACCINE_MIN_SEC, cur)
+        av, adupv = _craft_params(VACCINE_CRAFT_SEC, VACCINE_MIN_SEC, final_lvl)
+        if bp != ap:
+            extra_lines += f"🧪 Время произв.: {_format_hms(bp)} → {_format_hms(ap)}\n"
+        elif adup != bdup:
+            extra_lines += f"🧪 Дублирование: {_fmt_pct_text(bdup)} → {_fmt_pct_text(adup)}\n"
+        if bv != av:
+            extra_lines += f"💉 Время произв.: {_format_hms(bv)} → {_format_hms(av)}\n"
+        elif adupv != bdupv:
+            extra_lines += f"💉 Дублирование: {_fmt_pct_text(bdupv)} → {_fmt_pct_text(adupv)}\n"
+
+    text = (
+        f"✅ {h(skill['title_1'])} выполнено на {cur} ур ({final_lvl})\n"
+        f"{extra_lines}"
+        "🔹 Потрачено 1 очко навыка"
     )
     return True, text, final_lvl
 
@@ -9473,19 +10125,28 @@ def _calc_chance_hint_text() -> str:
         "</blockquote>"
     )
 
-
 def _fmt_pct_text(v: float) -> str:
     x = float(v)
-    if abs(x - round(x)) < 1e-9:
-        return f"{int(round(x))}%"
-    return f"{x:.1f}%"
+    s = f"{x:.2f}".rstrip("0").rstrip(".")
+    s = s.replace(".", ",")
+    return f"{s}%"
 
 def _calc_sabotage_success_pct(reaction_level: int, ips_level: int) -> float:
-    p = int(reaction_level) - int(ips_level)
-    if p < 0:
-        p = 0
-    if p > 90:
-        p = 90
+    g = max(0.0, float(int(reaction_level or 0)))
+    s = max(0.0, float(int(ips_level or 0)))
+
+    if g <= 0.0 and s <= 0.0:
+        return 40.0
+
+    den = g + s
+    if den <= 0.0:
+        return 0.0
+
+    g_pct = (100.0 * g) / den
+    s_pct = (100.0 * s) / den
+    delta = g_pct - s_pct
+
+    p = max(0.0, min(80.0, 40.0 + delta))
     return float(p)
 
 def _calc_heaviness_success_pct(heaviness_level: int, qualification_level: int) -> float:
@@ -9541,6 +10202,51 @@ def _calc_chance_payload(metric_token: str, lvl1: int, lvl2: int):
             f"❌ Провал: <b>{_fmt_pct_text(fail)}</b>"
         )
     }
+
+CALC_BUFF_METRIC_ALIASES = {
+    "синтез": "SYN", "синтеза": "SYN", "синт": "SYN",
+    "ускорение": "ACC", "ускорения": "ACC", "ускор": "ACC", "ускр": "ACC",
+}
+
+def _calc_buff_payload(metric_token: str, lvl1: int, lvl2: int):
+    key = CALC_BUFF_METRIC_ALIASES.get((metric_token or "").strip().lower())
+    if not key:
+        return None
+
+    n1 = int(lvl1)
+    n2 = int(lvl2)
+    if n1 >= n2:
+        return None
+
+    if key == "SYN":
+        b1 = _synth_bonus_value(n1)
+        b2 = _synth_bonus_value(n2)
+        return {
+            "text": (
+                f"🧮 Калькулятор: ⚗️ Усиления синтеза <b>{n1}</b> → <b>{n2}</b>\n"
+                f"📈 Постоянный бонус: <b>{b1}</b> → <b>{b2}</b>\n"
+                f"🎲 Диапазон базового значения: <b>{1 + b1}</b>..<b>{100 + b1}</b> → <b>{1 + b2}</b>..<b>{100 + b2}</b>"
+            )
+        }
+
+    pp1, dup1 = _craft_params(PATHOGEN_CRAFT_SEC, PATHOGEN_MIN_SEC, n1)
+    pp2, dup2 = _craft_params(PATHOGEN_CRAFT_SEC, PATHOGEN_MIN_SEC, n2)
+    vv1, vdup1 = _craft_params(VACCINE_CRAFT_SEC, VACCINE_MIN_SEC, n1)
+    vv2, vdup2 = _craft_params(VACCINE_CRAFT_SEC, VACCINE_MIN_SEC, n2)
+
+    lines = [f"🧮 Калькулятор: 🧫 Усиления ускорения <b>{n1}</b> → <b>{n2}</b>"]
+
+    if pp1 != pp2:
+        lines.append(f"🧪 Время патогена: <b>{_format_hms(pp1)}</b> → <b>{_format_hms(pp2)}</b>")
+    elif dup1 != dup2:
+        lines.append(f"🧪 Дублирование патогена: <b>{_fmt_pct_text(dup1)}</b> → <b>{_fmt_pct_text(dup2)}</b>")
+
+    if vv1 != vv2:
+        lines.append(f"💉 Время вакцины: <b>{_format_hms(vv1)}</b> → <b>{_format_hms(vv2)}</b>")
+    elif vdup1 != vdup2:
+        lines.append(f"💉 Дублирование вакцины: <b>{_fmt_pct_text(vdup1)}</b> → <b>{_fmt_pct_text(vdup2)}</b>")
+
+    return {"text": "\n".join(lines)}
 
 def _inline_plain_target_name(target_id: int) -> str:
     row = get_user_row(int(target_id))
@@ -9770,6 +10476,17 @@ def handle_calc_command(message, parsed: Parsed):
     if not parts:
         return
 
+    if parsed.cmd == "calc_buff":
+        if len(parts) < 3:
+            return
+
+        payload = _calc_buff_payload(parts[0], parts[1], parts[2])
+        if not payload:
+            return
+
+        _emit(payload["text"])
+        return
+
     mode = "UPG"
     if parsed.cmd == "calc_upg":
         mode = "UPG"
@@ -9872,13 +10589,20 @@ def cb_upgrade(cq):
                 disable_web_page_preview=True
             )
 
+        if action == "SP":
+            ok, txt, _ = _execute_upgrade_by_skill_point(uid, code)
+            rm = kb_upgrade(uid, code, 1, src, ictype=ictype, ictx=ictx) if ok else None
+            if ok and src == "D":
+                rm.row(InlineKeyboardButton("Вернуться к досье", callback_data=_labui_data(uid, "D")))
+            _edit(txt, reply_markup=rm)
+            bot.answer_callback_query(cq.id)
+            return
+
         if action == "P":
             txt = _build_upgrade_preview(uid, code, steps)
             rm = kb_upgrade(uid, code, steps, src, ictype=ictype, ictx=ictx)
-
             if src == "D":
                 rm.row(InlineKeyboardButton("Вернуться к досье", callback_data=_labui_data(uid, "D")))
-
             _edit(txt, reply_markup=rm)
             bot.answer_callback_query(cq.id)
             return
@@ -9987,11 +10711,12 @@ def render_balance(user_id: int) -> str:
     ensure_lab_exists(user_id)
 
     row = db_one(
-        "SELECT COALESCE(all_bio_res,0) AS r, COALESCE(all_bio_mater,0) AS m FROM labs WHERE user_id=?",
+        "SELECT COALESCE(all_bio_res,0) AS r, COALESCE(all_bio_mater,0) AS m, COALESCE(skill_points,0) AS sp FROM labs WHERE user_id=?",
         (int(user_id),),
     )
     all_bio_res = int(row["r"] if row else 0)
     all_bio_mater = int(row["m"] if row else 0)
+    skill_points = int(row["sp"] if row else 0)
 
     u = get_user_row(user_id)
     un = (u["username"] or "") if u else ""
@@ -10006,10 +10731,16 @@ def render_balance(user_id: int) -> str:
     res_word = _ru_form(all_bio_res, "био-ресурс", "био-ресурса", "био-ресурсов")
     mat_word = _ru_form(all_bio_mater, "био-материал", "био-материала", "био-материалов")
 
+    pts_line = ""
+    if skill_points > 0:
+        pts_word = _ru_form(skill_points, "очко навыка", "очка навыка", "очков навыка")
+        pts_line = f"🔹 {_fmt_k(skill_points)} {pts_word}\n"
+
     return (
         f"Баланс <b>{who}</b>:\n"
         f"🧬 {_fmt_k(all_bio_res)} {res_word}\n"
         f"💊 {_fmt_k(all_bio_mater)} {mat_word}\n"
+        f"{pts_line}"
         f"💬 Запасы можно пополнить командой <code>Синтез</code>"
     )
 
@@ -10076,7 +10807,7 @@ def synth_attempt(uid: int) -> str:
     return (
         f"⚗️ СИНТЕЗ ЗАВЕРШЁН! Получено 💊 +{bio_mater} = {base_value}×{cof_rost}\n\n"
         f"🔺 Коэффициент роста: {cof_rost}\n"
-        f"📈 Эффективность синтеза: {synth_bonus}"
+        f"📈 Эффективность синтеза: +{synth_bonus}"
     )
 
 def handle_synth_command(message):
@@ -11582,6 +12313,43 @@ def cb_users_ui(cq):
         except Exception:
             pass
 
+@bot.callback_query_handler(func=lambda cq: (cq.data or "").startswith(f"{PROMOUI_TAG}:"))
+def cb_promo_ui(cq):
+    try:
+        page = _promo_parse_cb(cq.data or "")
+        if page is None:
+            bot.answer_callback_query(cq.id)
+            return
+        if not can_manage_support(int(cq.from_user.id)):
+            bot.answer_callback_query(cq.id)
+            return
+
+        text, rm = render_promocode_list_text(int(page))
+        if cq.inline_message_id:
+            limited_edit_message_text(
+                text=text,
+                inline_id=cq.inline_message_id,
+                parse_mode="HTML",
+                reply_markup=rm,
+                disable_web_page_preview=True
+            )
+        elif cq.message:
+            limited_edit_message_text(
+                text=text,
+                chat_id=cq.message.chat.id,
+                msg_id=cq.message.message_id,
+                parse_mode="HTML",
+                reply_markup=rm,
+                disable_web_page_preview=True
+            )
+        bot.answer_callback_query(cq.id)
+    except Exception as e:
+        send_error_report("cb_promo_ui", e)
+        try:
+            bot.answer_callback_query(cq.id)
+        except Exception:
+            pass
+
 @bot.callback_query_handler(func=lambda cq: (cq.data or "").startswith(f"{EMPACKUI_TAG}:"))
 def cb_emoji_pack_ui(cq):
     try:
@@ -13012,11 +13780,7 @@ def handle_sabotage_command(message, parsed: Parsed, edit_ctx: Optional[dict] = 
     t_ips = int(t["ips"] or 1)
     t_ids = int(t["t_ids"] or 1)
 
-    p = a_rea - t_ips
-    if p < 0:
-        p = 0
-    if p > 90:
-        p = 90
+    p = _calc_sabotage_success_pct(a_rea, t_ips)
 
     ur_t = get_user_row(int(target_id))
     t_un = (ur_t["username"] or "") if ur_t else ""
@@ -13071,8 +13835,8 @@ def handle_sabotage_command(message, parsed: Parsed, edit_ctx: Optional[dict] = 
         commit=True
     )
 
-    roll = random.randint(1, 100)
-    success = (roll <= p and p > 0)
+    roll = random.random() * 100.0
+    success = (roll < p and p > 0.0)
 
     if success:
         rp = int(t["rp"] or 0)
@@ -13125,7 +13889,7 @@ def handle_sabotage_command(message, parsed: Parsed, edit_ctx: Optional[dict] = 
         _emit(
             "🥷 Диверсия выполнена.\n"
             f"Цель: «{target_tag}»\n"
-            f"✅ Успех ({p}%)\n"
+            f"✅ Успех ({_fmt_pct_text(p)})\n"
             f"🧪 Уничтожено патогенов: {lost_p}\n"
             f"💉 Уничтожено вакцин: {lost_v}\n"
             "⏱️ КД на цель: 24 часа"
@@ -13216,7 +13980,7 @@ def handle_sabotage_command(message, parsed: Parsed, edit_ctx: Optional[dict] = 
     _emit(
         "🥷 Диверсия провалилась.\n"
         f"Цель: «{target_tag}»\n"
-        f"❌ Неудача ({p}%)\n"
+        f"❌ Неудача ({_fmt_pct_text(p)})\n"
         f"🧾 Компенсация ущерба: {spent_txt}\n"
         "⏱️ КД на цель: 24 часа"
     )
@@ -14405,13 +15169,26 @@ def _safe_answer_inline_query(inline_query_id: str, results, *, cache_time: int 
         )
         return True
     except Exception as e:
-        msg = str(e)
+        msg = str(e).lower()
+
         if (
             "query is too old" in msg
             or "response timeout expired" in msg
-            or "query ID is invalid" in msg
+            or "query id is invalid" in msg
         ):
             return False
+
+        if (
+            "remote end closed connection without response" in msg
+            or "connection aborted" in msg
+            or "remotedisconnected" in msg
+            or "protocolerror" in msg
+            or "read timed out" in msg
+            or "connect timeout" in msg
+            or "connectionerror" in msg
+        ):
+            return False
+
         raise
 
 @bot.inline_handler(func=lambda q: True)
@@ -14752,6 +15529,27 @@ def text_router(message):
             handle_users_list_command(message)
             return
 
+        # промокоды
+        if parsed.cmd == "promo_generate":
+            handle_promo_generate_command(message)
+            return
+
+        if parsed.cmd == "promo_create":
+            handle_promo_create_command(message)
+            return
+
+        if parsed.cmd == "promo_all":
+            handle_promo_all_command(message)
+            return
+
+        if parsed.cmd == "promo_delete":
+            handle_promo_delete_command(message, parsed)
+            return
+
+        if parsed.cmd == "promo_use":
+            handle_promo_use_command(message, parsed)
+            return
+
         # список команд
         if parsed.cmd == "commands_link":
             handle_commands_link(message)
@@ -14821,7 +15619,7 @@ def text_router(message):
             return
 
         # калькулятор
-        if parsed.cmd in ("calc", "calc_upg", "calc_chance"):
+        if parsed.cmd in ("calc", "calc_upg", "calc_chance", "calc_buff"):
             handle_calc_command(message, parsed)
             return
 
