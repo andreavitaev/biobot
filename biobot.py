@@ -6391,6 +6391,15 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
     if low in ("кс", "кус"):
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="calc_buff", args="")
 
+    if low.startswith("калькулятор усилений "):
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="calc_buff", args=t.split(" ", 2)[2].strip())
+    if low.startswith("калькулятор усиления "):
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="calc_buff", args=t.split(" ", 2)[2].strip())
+    if low.startswith("кс "):
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="calc_buff", args=t.split(" ", 1)[1].strip())
+    if low.startswith("кус "):
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="calc_buff", args=t.split(" ", 1)[1].strip())
+
     if low.startswith("калькулятор "):
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="calc", args=t.split(" ", 1)[1].strip())
     if low.startswith("к "):
@@ -6403,14 +6412,6 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="calc_chance", args=t.split(" ", 1)[1].strip())
     if low.startswith("кпц "):
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="calc_chance", args=t.split(" ", 1)[1].strip())
-    if low.startswith("калькулятор усилений "):
-        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="calc_buff", args=t.split(" ", 2)[2].strip())
-    if low.startswith("калькулятор усиления "):
-        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="calc_buff", args=t.split(" ", 2)[2].strip())
-    if low.startswith("кс "):
-        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="calc_buff", args=t.split(" ", 1)[1].strip())
-    if low.startswith("кус "):
-        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="calc_buff", args=t.split(" ", 1)[1].strip())
 
     # заразить
     if low == "заразить" or low.startswith("заразить "):
