@@ -10804,7 +10804,7 @@ def synth_attempt(uid: int) -> str:
     stat_bio_mater = random.randint(1, 100+synth_bonus)
     base_value = stat_bio_mater
     cof_rost = _pick_cof_rost()
-    bio_mater = int(base_value * cof_rost)
+    bio_mater = int((base_value + synth_bonus) * cof_rost)
 
     db_exec(
         "UPDATE labs SET all_bio_mater=COALESCE(all_bio_mater,0)+?, last_synth_ts=? WHERE user_id=?",
