@@ -9851,15 +9851,22 @@ def kb_upgrade(uid: int, code: str, steps: int, src: str = "C", ictype: Optional
         return _upg_cb(action, uid, code, s, src)
 
     kb.row(InlineKeyboardButton("Подтвердить улучшение", callback_data=_cb("B", int(steps))))
-    sp_row = db_one("SELECT COALESCE(skill_points,0) AS sp FROM labs WHERE user_id=?", (int(uid),))
-    sp = int(sp_row["sp"] or 0) if sp_row else 0
-    if sp > 0:
-        kb.row(InlineKeyboardButton(f"🔹 Использовать очко навыка ({sp})", callback_data=_cb("SP", 1)))
     kb.row(
         InlineKeyboardButton("× 1", callback_data=_cb("P", 1)),
         InlineKeyboardButton("× 2", callback_data=_cb("P", 2)),
         InlineKeyboardButton("× 5", callback_data=_cb("P", 5)),
     )
+    sp_row = db_one("SELECT COALESCE(skill_points,0) AS sp FROM labs WHERE user_id=?", (int(uid),))
+    sp = int(sp_row["sp"] or 0) if sp_row else 0
+    if sp > 0:
+        kb.row(
+            _ikb_premium_lead(
+                "🔹",
+                f"Использовать очко навыка из {sp}",
+                callback_data=_cb("SP", 1),
+                style="primary"
+            )
+        )
     return kb
 
 def _build_upgrade_preview(uid: int, code: str, steps: int) -> str:
