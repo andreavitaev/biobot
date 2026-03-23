@@ -2381,7 +2381,12 @@ def init_db():
 
     # миграции
     try:
-        db_exec("ALTER TABLE chat_members ADD COLUMN username TEXT", commit=True)
+        db_exec("ALTER TABLE chat_members ADD COLUMN first_name TEXT DEFAULT ''", commit=True)
+    except Exception:
+        pass
+
+    try:
+        db_exec("ALTER TABLE chat_members ADD COLUMN last_name TEXT DEFAULT ''", commit=True)
     except Exception:
         pass
 
@@ -4186,7 +4191,12 @@ def render_top_users(limit: int, chat_id: int = 0) -> tuple[str, InlineKeyboardM
     lines.append("<blockquote expandable>")
     for i, r in enumerate(rows, 1):
         uid = int(r["user_id"])
-        tag = public_user_tag(uid)
+        tag = user_tag_from_row(
+            uid,
+            username=(r["username"] or ""),
+            first_name=(r["first_name"] or ""),
+            last_name=(r["last_name"] or "")
+        )
         lines.append(f"{i}. {tag} | {_fmt_k(int(r['be'] or 0))} опыт | {_fmt_k(int(r['sick'] or 0))} бол")
     lines.append("</blockquote>")
     return "\n".join(lines), kb_top_switch("U", int(chat_id), int(limit))
@@ -4479,25 +4489,33 @@ def _best_known_display_by_uid(user_id: int) -> tuple[str, str, int]:
         raw_disp = _raw_name_fallback(row["first_name"] or "", row["last_name"] or "")
         raw_disp = _safe_clickable_name_or_uid(raw_disp, uid)
 
+        # 1) нормальное имя из users
         if raw_disp != str(uid):
             return raw_disp, un, uid
 
+        # 2) username из users
         if un:
             return un, un, uid
 
-        return str(uid), "", uid
-
+    # 3) fallback к chat_members: сначала имя, потом username
     cm = db_one(
-        "SELECT username FROM chat_members "
+        "SELECT username, first_name, last_name "
+        "FROM chat_members "
         "WHERE user_id=? "
         "ORDER BY COALESCE(last_seen,0) DESC LIMIT 1",
         (uid,)
     )
     if cm:
         cm_un = _normalize_username_for_link((cm["username"] or ""))
+        cm_name = _raw_name_fallback(cm["first_name"] or "", cm["last_name"] or "")
+        cm_name = _safe_clickable_name_or_uid(cm_name, uid)
+
+        if cm_name != str(uid):
+            return cm_name, cm_un, uid
         if cm_un:
             return cm_un, cm_un, uid
 
+    # 4) если uid известен — хотя бы кликабельный uid
     if uid > 0:
         return str(uid), "", uid
 
@@ -4525,6 +4543,17 @@ def public_user_tag(user_id: int) -> str:
         return tg_mention(real_uid, un, username=un)
 
     return "неизвестный пользователь"
+
+def user_tag_from_row(uid: int, username: str = "", first_name: str = "", last_name: str = "") -> str:
+    uid = int(uid)
+    un = _normalize_username_for_link(username or "")
+    raw_disp = _raw_name_fallback(first_name or "", last_name or "")
+    label = _safe_clickable_name_or_uid(raw_disp, uid)
+
+    if label == str(uid) and un:
+        label = un
+
+    return tg_mention(uid, label, username=un)
 
 def rp_premium_emoji_html(emoji: str, premium_id: str) -> str:
     emo = str(emoji or "")
@@ -5087,19 +5116,18 @@ def _users_collect_rows() -> list[dict]:
     out = []
     for r in rows:
         uid = int(r["user_id"])
-        un = (r["username"] or "").strip()
-        fn = (r["first_name"] or "").strip()
-        ln = (r["last_name"] or "").strip()
+        label = _safe_clickable_name_or_uid(
+            _raw_name_fallback((r["first_name"] or "").strip(), (r["last_name"] or "").strip()),
+            uid
+        )
 
-        nm = "no name"
-        if fn or ln or un:
-            nm = display_name(fn, ln, un, uid)
-            if not nm or nm == str(uid):
-                nm = _raw_name_fallback(fn, ln) or (f"@{un}" if un else "no name")
+        un = (r["username"] or "").strip()
+        if label == str(uid) and un:
+            label = f"@{un}"
 
         out.append({
             "user_id": uid,
-            "name": nm,
+            "name": label,
             "username": f"@{un}" if un else "—",
             "lab_text": "есть лаба" if int(r["lab_active"] or 0) == 1 else "нет лабы",
         })
@@ -5936,11 +5964,19 @@ def handle_report_command(message):
 
 def remember_chat_member(chat_id: int, tg_user):
     upsert_user(tg_user)
+
     uname = (getattr(tg_user, "username", None) or "").strip().lower() or None
+    fn = (getattr(tg_user, "first_name", None) or "").strip()
+    ln = (getattr(tg_user, "last_name", None) or "").strip()
+
     db_exec(
-        "INSERT INTO chat_members(chat_id,user_id,username,last_seen) VALUES(?,?,?,?) "
-        "ON CONFLICT(chat_id,user_id) DO UPDATE SET username=excluded.username, last_seen=excluded.last_seen",
-        (int(chat_id), int(tg_user.id), uname, now_ts()),
+        "INSERT INTO chat_members(chat_id,user_id,username,first_name,last_name,last_seen) VALUES(?,?,?,?,?,?) "
+        "ON CONFLICT(chat_id,user_id) DO UPDATE SET "
+        "username=excluded.username, "
+        "first_name=excluded.first_name, "
+        "last_name=excluded.last_name, "
+        "last_seen=excluded.last_seen",
+        (int(chat_id), int(tg_user.id), uname, fn, ln, now_ts()),
         commit=True
     )
 
@@ -7899,8 +7935,12 @@ def render_lab_sec(owner_id: int) -> str:
 
 def render_lab_infected_list(owner_id: int) -> str:
     rows = db_all(
-        "SELECT target_id, add_bio_res, end_ts, start_ts FROM infections "
-        "WHERE attacker_id=? ORDER BY start_ts DESC LIMIT 30",
+        "SELECT i.target_id, i.add_bio_res, i.end_ts, i.start_ts, "
+        "u.username, u.first_name, u.last_name "
+        "FROM infections i "
+        "LEFT JOIN users u ON u.user_id=i.target_id "
+        "WHERE i.attacker_id=? "
+        "ORDER BY i.start_ts DESC LIMIT 30",
         (int(owner_id),)
     ) or []
 
@@ -7922,7 +7962,7 @@ def render_lab_infected_list(owner_id: int) -> str:
         lines.append("<blockquote>Нет заражённых.</blockquote>")
         lines.append("")
         lines.append(f"Общее число заражённых: 👥 {total_cnt} (+{last24_cnt})")
-        res_word = _ru_form(total_daily_res, 'био-ресурс', 'био-ресурса', 'био-ресурсов')
+        res_word = _ru_form(total_daily_res, "био-ресурс", "био-ресурса", "био-ресурсов")
         lines.append(f"Число получаемых био-ресурсов: 🧬 +{total_daily_res} {res_word}")
         return "\n".join(lines)
 
@@ -7933,7 +7973,16 @@ def render_lab_infected_list(owner_id: int) -> str:
         end_ts = int(r["end_ts"] or 0)
         until = _fmt_date_ddmmyy(end_ts)
 
-        name = public_user_tag(int(tid))
+        if tid > 0:
+            name = user_tag_from_row(
+                tid,
+                username=(r["username"] or ""),
+                first_name=(r["first_name"] or ""),
+                last_name=(r["last_name"] or "")
+            )
+        else:
+            name = "неизвестный пользователь"
+
         res_word = _ru_form(int(add), "био-ресурс", "био-ресурса", "био-ресурсов")
         items.append(f"{i}. {name} | 🧬 {int(add)} {res_word} | до {until}")
 
