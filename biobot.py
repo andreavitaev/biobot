@@ -3108,6 +3108,19 @@ def corp_name_display(name: str) -> str:
         return h(nm)
     return f"«{h(nm)}»"
 
+def corp_clickable_name(corp_row) -> str:
+    nm = corp_name_display((corp_row["name"] or "").strip())
+    if corp_is_open_value(corp_row) != 1:
+        return nm
+
+    owner_id = int(corp_row["owner_id"] or 0)
+    if owner_id <= 0:
+        return nm
+
+    owner = get_user_row(owner_id)
+    owner_un = (owner["username"] or "") if owner else ""
+    return tg_mention(owner_id, nm, username=owner_un)
+
 def corp_is_open_value(corp_row) -> int:
     try:
         v = corp_row["is_open"]
@@ -4209,8 +4222,9 @@ def render_top_corps(limit: int, chat_id: int = 0) -> tuple[str, InlineKeyboardM
 
     lines.append("<blockquote expandable>")
     for i, r in enumerate(rows, 1):
-        nm = (r["name"] or "").strip()
-        lines.append(f"{i}. {corp_name_display(nm)} | {_fmt_k(int(r['be'] or 0))} опыт | {_fmt_k(int(r['sick'] or 0))} бол")
+        corp_row = corp_by_id(int(r["corp_id"]))
+        nm = corp_clickable_name(corp_row) if corp_row else corp_name_display((r["name"] or "").strip())
+        lines.append(f"{i}. {nm} | {_fmt_k(int(r['be'] or 0))} опыт | {_fmt_k(int(r['sick'] or 0))} бол")
     lines.append("</blockquote>")
     return "\n".join(lines), kb_top_switch("C", int(chat_id), int(limit))
 
@@ -4415,24 +4429,63 @@ def _raw_name_fallback(first_name: str, last_name: str) -> str:
     full = (fn + " " + ln).strip()
     return full
 
+def _is_transparent_or_zalgo_only_name(s: str) -> bool:
+    """
+    True только если имя после очистки:
+    - пустое / состоит из transparent-like символов
+    - или состоит только из combining marks (zalgo без базовых символов)
+    Нормальные имена, цифры, буквы и пунктуацию не режем.
+    """
+    t = _strip_invisible(s or "")
+    t = "".join(ch for ch in t if (ch not in _VARIATION_SELECTORS) and (not ch.isspace()))
+    if not t:
+        return True
+
+    cleaned = []
+    for ch in t:
+        if ch in _BLANK_LIKE_CHARS:
+            continue
+        cleaned.append(ch)
+
+    if not cleaned:
+        return True
+
+    only_marks = True
+    for ch in cleaned:
+        cat = unicodedata.category(ch)
+        if cat not in ("Mn", "Mc", "Me") and not unicodedata.combining(ch):
+            only_marks = False
+            break
+
+    return only_marks
+
+def _safe_clickable_name_or_uid(name: str, uid: int) -> str:
+    """
+    Возвращает:
+    - нормальное имя, если оно пригодно
+    - uid строкой, если имя прозрачное/zalgo-only/пустое
+    """
+    nm = _strip_invisible(name or "").strip()
+    if not nm or _is_transparent_or_zalgo_only_name(nm):
+        return str(int(uid))
+    return nm
+
 def _best_known_display_by_uid(user_id: int) -> tuple[str, str, int]:
     uid = int(user_id)
     row = get_user_row(uid)
 
     if row:
         un = _normalize_username_for_link((row["username"] or ""))
-        disp = display_name(row["first_name"] or "", row["last_name"] or "", un, uid)
+        raw_disp = _raw_name_fallback(row["first_name"] or "", row["last_name"] or "")
+        raw_disp = _safe_clickable_name_or_uid(raw_disp, uid)
 
-        if disp == str(uid) or disp == "no name":
-            cm_un = _best_known_username_by_uid(uid)
-            if cm_un:
-                return cm_un, cm_un, uid
+        if raw_disp != str(uid):
+            return raw_disp, un, uid
 
-            raw_disp = _raw_name_fallback(row["first_name"] or "", row["last_name"] or "")
-            if raw_disp:
-                return raw_disp, un, uid
+        if un:
+            return un, un, uid
 
-        return disp, un, uid
+        return str(uid), "", uid
 
     cm = db_one(
         "SELECT username FROM chat_members "
@@ -4445,6 +4498,9 @@ def _best_known_display_by_uid(user_id: int) -> tuple[str, str, int]:
         if cm_un:
             return cm_un, cm_un, uid
 
+    if uid > 0:
+        return str(uid), "", uid
+
     return "неизвестный пользователь", "", uid
 
 def public_user_tag(user_id: int) -> str:
@@ -4452,28 +4508,21 @@ def public_user_tag(user_id: int) -> str:
     row = get_user_row(uid)
 
     if row and int(row["is_placeholder"] or 0) == 1:
-        un = (row["username"] or "").strip()
+        un = _normalize_username_for_link((row["username"] or ""))
         if un:
-            return tg_mention(uid, "неизвестный пользователь", username=un)
+            return tg_mention(uid, un, username=un)
         if uid > 0:
-            return tg_mention(uid, "неизвестный пользователь")
+            return tg_mention(uid, str(uid))
         return "неизвестный пользователь"
 
     disp, un, real_uid = _best_known_display_by_uid(uid)
 
     if real_uid > 0:
-        if not disp or disp == str(real_uid):
-            raw_row = get_user_row(real_uid)
-            if raw_row:
-                raw_disp = _raw_name_fallback(raw_row["first_name"] or "", raw_row["last_name"] or "")
-                if raw_disp:
-                    disp = raw_disp
-            if not disp or disp == str(real_uid):
-                disp = "неизвестный пользователь"
-        return tg_mention(real_uid, disp, username=un)
+        label = _safe_clickable_name_or_uid(disp, real_uid)
+        return tg_mention(real_uid, label, username=un)
 
     if un:
-        return tg_mention(real_uid, "неизвестный пользователь", username=un)
+        return tg_mention(real_uid, un, username=un)
 
     return "неизвестный пользователь"
 
@@ -6256,7 +6305,7 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
     if low in ("команды", "commands"):
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="commands_link", args="")
 
-    if low in ("рпстат", "рпстата", "рп стата"):
+    if low in ("рпстат", "рпстата", "рп стата", "рп стат"):
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="rp_stats", args="")
 
     if low.startswith("пак айди ") or low.startswith("пак ид ") or low.startswith("пак id ") \
@@ -7550,6 +7599,15 @@ def render_lab(user_id: int) -> str:
 
     pathogen_name = (lab["pathogen_name"] or "").strip() or "неизвестный патоген"
     corp_name = (lab["corp_name"] or "").strip()
+    corp_line = ""
+    try:
+        corp_id = int(lab["corp_id"] or 0)
+    except Exception:
+        corp_id = 0
+    if corp_id > 0:
+        corp_row = corp_by_id(corp_id)
+        if corp_row:
+            corp_line = corp_clickable_name(corp_row)
 
     leader_name = display_name(
         (u["first_name"] or "") if u else "",
@@ -7563,7 +7621,9 @@ def render_lab(user_id: int) -> str:
     lines = []
     lines.append(f'🔬 Досье лаборатории <b>{h(lab_name)}</b>:')
     lines.append(f'Руководитель: {leader}')
-    if corp_name:
+    if corp_line:
+        lines.append(f'🏢 Корпорация: <b>{corp_line}</b>')
+    elif corp_name:
         lines.append(f'🏢 Корпорация: <b>{h(corp_name)}</b>')
     lines.append("")
     lines.append("<i>ОСНОВНАЯ ИНФОРМАЦИЯ:</i>")
@@ -7777,7 +7837,19 @@ def render_lab_dev(owner_id: int) -> str:
     lines = []
     lines.append(f'🏥 Отдел разработок лаборатории <b>{h(lab_name)}</b>:')
     lines.append(f'Руководитель: {leader}')
-    if corp_name:
+    corp_line = ""
+    try:
+        corp_id = int(lab["corp_id"] or 0)
+    except Exception:
+        corp_id = 0
+    if corp_id > 0:
+        corp_row = corp_by_id(corp_id)
+        if corp_row:
+            corp_line = corp_clickable_name(corp_row)
+
+    if corp_line:
+        lines.append(f'🏢 Корпорация: <b>{corp_line}</b>')
+    elif corp_name:
         lines.append(f'🏢 Корпорация: <b>{h(corp_name)}</b>')
     qual = (
         int(_rget(lab, "total_pathogens", 1) or 1)
@@ -7799,7 +7871,18 @@ def render_lab_sec(owner_id: int) -> str:
     lines = []
     lines.append(f'🏣 Отдел безопасности лаборатории <b>{h(lab_name)}</b>:')
     lines.append(f'Руководитель: {leader}')
-    if corp_name:
+    corp_line = ""
+    try:
+        corp_id = int(lab["corp_id"] or 0)
+    except Exception:
+        corp_id = 0
+    if corp_id > 0:
+        corp_row = corp_by_id(corp_id)
+        if corp_row:
+            corp_line = corp_clickable_name(corp_row)
+    if corp_line:
+        lines.append(f'🏢 Корпорация: <b>{corp_line}</b>')
+    elif corp_name:
         lines.append(f'🏢 Корпорация: <b>{h(corp_name)}</b>')
     sec = (
         int(_rget(lab, "reaction", 1) or 1)
@@ -7821,9 +7904,26 @@ def render_lab_infected_list(owner_id: int) -> str:
         (int(owner_id),)
     ) or []
 
+    agg = db_one(
+        "SELECT "
+        "COUNT(*) AS total_cnt, "
+        "COALESCE(SUM(add_bio_res),0) AS total_daily_res, "
+        "COALESCE(SUM(CASE WHEN start_ts>=? THEN 1 ELSE 0 END),0) AS last24_cnt "
+        "FROM infections WHERE attacker_id=?",
+        (int(now_ts() - 86400), int(owner_id))
+    )
+
+    total_cnt = int(agg["total_cnt"] or 0) if agg else 0
+    total_daily_res = int(agg["total_daily_res"] or 0) if agg else 0
+    last24_cnt = int(agg["last24_cnt"] or 0) if agg else 0
+
     lines = ["🔬 СПИСОК ЗАРАЖЕННЫХ ВАШИМ ПАТОГЕНОМ:"]
     if not rows:
         lines.append("<blockquote>Нет заражённых.</blockquote>")
+        lines.append("")
+        lines.append(f"Общее число заражённых: 👥 {total_cnt} (+{last24_cnt})")
+        res_word = _ru_form(total_daily_res, 'био-ресурс', 'био-ресурса', 'био-ресурсов')
+        lines.append(f"Число получаемых био-ресурсов: 🧬 +{total_daily_res} {res_word}")
         return "\n".join(lines)
 
     items = []
@@ -7840,6 +7940,10 @@ def render_lab_infected_list(owner_id: int) -> str:
     lines.append("<blockquote expandable>")
     lines.extend(items)
     lines.append("</blockquote>")
+    lines.append("")
+    lines.append(f"Общее число заражённых: 👥 {total_cnt} (+{last24_cnt})")
+    total_res_word = _ru_form(total_daily_res, "био-ресурс", "био-ресурса", "био-ресурсов")
+    lines.append(f"Число получаемых био-ресурсов: 🧬 +{total_daily_res} {total_res_word}")
     return "\n".join(lines)
 
 def render_lab_diseases_list(owner_id: int) -> str:
@@ -10068,14 +10172,16 @@ def handle_upgrade_command(message, parsed: Parsed, edit_ctx: Optional[dict] = N
     else:
         _emit(txt, reply_markup=None)
 
-CALC_UPGRADE_MODE_ALIASES = {"улучшение", "улучш", "у", "прокачка", "прокач", "пк"}
-CALC_CHANCE_MODE_ALIASES = {"шанс", "шансы", "ш", "проценты", "процент", "проц", "пц"}
+CALC_UPGRADE_MODE_ALIASES = {"улучшение", "улучшения", "улучш", "у", 
+                             "прокачка", "прокачки", "прокач", "пк"}
+CALC_CHANCE_MODE_ALIASES = {"шанс", "шанса", "шансы", "шансов", "ш", 
+                            "проценты", "процента", "процентов", "процент", "проц", "пц"}
 
 CALC_CHANCE_METRIC_ALIASES = {
-    "заражения": "INFECT", "зар": "INFECT",
-    "обнаружения": "IDS", "обн": "IDS", "ids": "IDS",
-    "диверсии": "SAB", "див": "SAB",
-    "тяжести": "HEA", "тяж": "HEA",
+    "заражения": "INFECT", "заражение": "INFECT", "зар": "INFECT",
+    "обнаружения": "IDS", "обнаружение": "IDS", "обн": "IDS", "ids": "IDS",
+    "диверсии": "SAB", "диверсия": "SAB", "див": "SAB",
+    "тяжести": "HEA", "тяжесть": "HEA", "тяж": "HEA",
 }
 
 STRICT_NO_EXTRA_ARGS_CMDS = {
@@ -15465,7 +15571,6 @@ def text_router(message):
             "top_users", "top_users_chat",
             "top_diseases", "top_diseases_chat",
             "top_corps", "top_corps_chat",
-            "rp_stats",
         ) and not has_explicit_bot_prefix(message.text or ""):
             return
         if parsed.cmd in ("balance", "lab", "mylab", "corp_info"):
