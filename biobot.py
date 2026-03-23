@@ -3987,7 +3987,9 @@ def render_corp_members_text(corp_row, viewer_id: int) -> tuple[str, InlineKeybo
     for r in ordered:
         i += 1
         uid = int(r["user_id"])
-        tag = public_user_tag(uid)
+        un = (r["username"] or "")
+        disp = display_name(r["first_name"] or "", r["last_name"] or "", un, uid)
+        tag = tg_mention(uid, disp, username=un)
 
         role = (r["role"] or "")
         pref = ""
@@ -4033,7 +4035,9 @@ def render_corp_requests_text(corp_row, viewer_id: int) -> tuple[str, InlineKeyb
         for r in rows:
             i += 1
             uid = int(r["user_id"])
-            tag = public_user_tag(uid)
+            un = (r["username"] or "")
+            disp = display_name(r["first_name"] or "", r["last_name"] or "", un, uid)
+            tag = tg_mention(uid, disp, username=un)
             lines.append(
                 f"{i}. {tag} | ☣️ {_fmt_k(int(r['be'] or 0))} | 🤧 {_fmt_k(int(r['sick'] or 0))} | ID {int(r['request_id'])}"
             )
@@ -4515,9 +4519,10 @@ def public_user_tag(user_id: int) -> str:
 
     if real_uid > 0:
         label = _safe_clickable_name_or_uid(disp, real_uid)
-        if not label:
-            label = str(real_uid)
         return tg_mention(real_uid, label, username=un)
+
+    if un:
+        return tg_mention(real_uid, un, username=un)
 
     return "неизвестный пользователь"
 
@@ -4956,24 +4961,26 @@ def _user_display_from_any(uid: int, username: str = "", first_name: str = "", l
     uid = int(uid)
     u = get_user_row(uid)
     if u:
-        return public_user_tag(uid)
+        un = (u["username"] or "").strip()
+        fn = (u["first_name"] or "").strip()
+        ln = (u["last_name"] or "").strip()
+        return tg_mention(uid, display_name(fn, ln, un, uid), username=un)
 
     un = (username or "").strip()
     fn = (first_name or "").strip()
     ln = (last_name or "").strip()
+    if fn or ln or un:
+        return tg_mention(uid, display_name(fn, ln, un, uid), username=un)
 
-    raw_name = _safe_clickable_name_or_uid(_raw_name_fallback(fn, ln), uid)
-    if un:
-        return tg_mention(uid, raw_name if raw_name != str(uid) else un, username=un)
-    if uid > 0:
-        return tg_mention(uid, raw_name)
-
-    return "неизвестный пользователь"
+    return f"<code>{uid}</code>"
 
 def _agent_name_by_id(uid: int) -> str:
-    if int(uid) > 0:
-        return public_user_tag(int(uid))
-    return "неизвестный пользователь"
+    u = get_user_row(int(uid))
+    if u:
+        un = (u["username"] or "").strip()
+        disp = display_name(u["first_name"] or "", u["last_name"] or "", un, int(uid))
+        return tg_mention(int(uid), disp, username=un)
+    return f"<code>{int(uid)}</code>"
 
 def render_blacklist_text(page: int) -> tuple[str, Optional[InlineKeyboardMarkup]]:
     rows = _blacklist_collect_rows()
@@ -5929,11 +5936,6 @@ def handle_report_command(message):
 
 def remember_chat_member(chat_id: int, tg_user):
     upsert_user(tg_user)
-    try:
-        _merge_placeholder_to_real_user(tg_user)
-    except Exception:
-        pass
-
     uname = (getattr(tg_user, "username", None) or "").strip().lower() or None
     db_exec(
         "INSERT INTO chat_members(chat_id,user_id,username,last_seen) VALUES(?,?,?,?) "
@@ -7971,7 +7973,14 @@ def render_lab_diseases_list(owner_id: int) -> str:
         until = _fmt_date_ddmmyy(int(r["end_ts"] or 0))
 
         if attacker_id != 0 and known_to_target == 1:
-            inf_by = public_user_tag(attacker_id)
+            owner_un = (r["username"] or "").strip()
+            owner_disp = display_name(
+                r["first_name"] or "",
+                r["last_name"] or "",
+                owner_un,
+                attacker_id
+            )
+            inf_by = tg_mention(attacker_id, owner_disp, username=owner_un)
         else:
             inf_by = "неизвестный пользователь"
 
