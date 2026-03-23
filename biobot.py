@@ -1472,7 +1472,7 @@ def tg_mention(user_id: int, name: str, username: Optional[str] = None) -> str:
     if un:
         href = f"https://t.me/{un}"
     else:
-        href = f"tg://user?id={uid}"
+        href = f"tg://openmessage?user_id={uid}"
 
     return f'<a href="{href}">{h(name)}</a>'
 
