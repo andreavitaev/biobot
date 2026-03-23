@@ -543,14 +543,14 @@ def kb_autoanswer_status(uid: int) -> InlineKeyboardMarkup:
     enabled = int(st["enabled"] or 0) if st else 0
     kb = InlineKeyboardMarkup()
     if enabled == 1:
-        kb.add(InlineKeyboardButton("Выключить", callback_data=f"{CB_AO_TOGGLE}:{uid}:0"))
+        kb.add(InlineKeyboardButton("Выключить", callback_data=f"{CB_AO_TOGGLE}:{uid}:0", style="danger"))
     else:
-        kb.add(InlineKeyboardButton("Включить", callback_data=f"{CB_AO_TOGGLE}:{uid}:1"))
+        kb.add(InlineKeyboardButton("Включить", callback_data=f"{CB_AO_TOGGLE}:{uid}:1", style="success"))
     return kb
 
 def kb_autoanswer_open(uid: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("Статус автоответчика", callback_data=f"{CB_AO_MENU}:{uid}"))
+    kb.add(InlineKeyboardButton("Статус автоответчика", callback_data=f"{CB_AO_MENU}:{uid}", style="primary"))
     return kb
 
 def render_autoanswer_status(uid: int) -> str:
@@ -1505,21 +1505,29 @@ def _premiumize_caption_kwargs(kwargs: dict) -> dict:
     return kwargs
 
 def _bot_send_message_premium(chat_id, text, *args, **kwargs):
-    return _REAL_BOT_SEND_MESSAGE(chat_id, _premium_text_payload(text), *args, **kwargs)
+    msg = _REAL_BOT_SEND_MESSAGE(chat_id, _premium_text_payload(text), *args, **kwargs)
+    remember_bot_message_for_autodelete(msg)
+    return msg
 
 def _bot_reply_to_premium(message, text, *args, **kwargs):
-    return _REAL_BOT_REPLY_TO(message, _premium_text_payload(text), *args, **kwargs)
+    msg = _REAL_BOT_REPLY_TO(message, _premium_text_payload(text), *args, **kwargs)
+    remember_bot_message_for_autodelete(msg)
+    return msg
 
 def _bot_edit_message_text_premium(text, *args, **kwargs):
     return _REAL_BOT_EDIT_MESSAGE_TEXT(_premium_text_payload(text), *args, **kwargs)
 
 def _bot_send_photo_premium(chat_id, photo, *args, **kwargs):
     kwargs = _premiumize_caption_kwargs(kwargs)
-    return _REAL_BOT_SEND_PHOTO(chat_id, photo, *args, **kwargs)
+    msg = _REAL_BOT_SEND_PHOTO(chat_id, photo, *args, **kwargs)
+    remember_bot_message_for_autodelete(msg)
+    return msg
 
 def _bot_send_video_premium(chat_id, video, *args, **kwargs):
     kwargs = _premiumize_caption_kwargs(kwargs)
-    return _REAL_BOT_SEND_VIDEO(chat_id, video, *args, **kwargs)
+    msg = _REAL_BOT_SEND_VIDEO(chat_id, video, *args, **kwargs)
+    remember_bot_message_for_autodelete(msg)
+    return msg
 
 bot.send_message = _bot_send_message_premium
 bot.reply_to = _bot_reply_to_premium
@@ -1880,6 +1888,7 @@ def _housekeeping_daemon():
 
             purge_deleted_db(now)
             _run_due_timers(now)
+            run_chat_autodelete_once()
 
         except Exception as e:
             send_error_report("_tz3_housekeeping_daemon", e)
@@ -2198,6 +2207,25 @@ def init_db():
         user_id         INTEGER NOT NULL,
         used_at         INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (promo_id, user_id)
+    );
+    """, commit=True)
+
+    # автоудаление
+    db_exec("""
+    CREATE TABLE IF NOT EXISTS chat_auto_delete (
+        chat_id        INTEGER PRIMARY KEY,
+        ttl_seconds    INTEGER NOT NULL DEFAULT 0,
+        updated_by     INTEGER NOT NULL DEFAULT 0,
+        updated_at     INTEGER NOT NULL DEFAULT 0
+    );
+    """, commit=True)
+
+    db_exec("""
+    CREATE TABLE IF NOT EXISTS bot_sent_messages (
+        chat_id        INTEGER NOT NULL,
+        message_id     INTEGER NOT NULL,
+        sent_at        INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (chat_id, message_id)
     );
     """, commit=True)
 
@@ -4427,6 +4455,13 @@ def _raw_name_fallback(first_name: str, last_name: str) -> str:
     fn = _strip_invisible(first_name or "").strip()
     ln = _strip_invisible(last_name or "").strip()
     full = (fn + " " + ln).strip()
+
+    if not full:
+        return ""
+
+    if _is_transparent_or_zalgo_only_name(full):
+        return ""
+
     return full
 
 def _is_transparent_or_zalgo_only_name(s: str) -> bool:
@@ -4805,6 +4840,23 @@ def _merge_placeholder_to_real_user(tg_user):
                 c.close()
             except Exception:
                 pass
+
+def _merge_placeholder_for_uid_if_possible(user_id: int):
+    uid = int(user_id)
+    row = get_user_row(uid)
+    if not row:
+        return
+
+    uname = ((row["username"] or "").strip().lower())
+    if not uname:
+        return
+
+    fake = type("U", (), {})()
+    fake.id = uid
+    fake.username = uname
+    fake.first_name = row["first_name"] or ""
+    fake.last_name = row["last_name"] or ""
+    _merge_placeholder_to_real_user(fake)
 
 def add_support_agent(target_id: int, added_by: int, role: str = "support") -> None:
     db_exec("""
@@ -6252,6 +6304,20 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
 
     low = t.lower()
 
+    # автоудаление
+    if sign == "+" and (low == "автоудаление" or low == "ау" or low.startswith("автоудаление ") or low.startswith("ау ")):
+        rest = ""
+        parts = t.split(" ", 1)
+        if len(parts) > 1:
+            rest = parts[1].strip()
+        return Parsed(raw=raw_multiline, has_prefix_char=False, prefix_char=None, cmd="chat_autodel_set", args=rest)
+
+    if sign == "-" and low in ("автоудаление", "ау"):
+        return Parsed(raw=raw_multiline, has_prefix_char=False, prefix_char=None, cmd="chat_autodel_off", args="")
+
+    if low in ("автоудаление", "ау"):
+        return Parsed(raw=raw_multiline, has_prefix_char=False, prefix_char=None, cmd="chat_autodel_status", args="")
+
     # команды лс
     if low in ("settings", "настройки"):
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="settings", args="")
@@ -7553,6 +7619,63 @@ def handle_timer_commands(message, parsed: Parsed):
         )
         return
 
+def handle_chat_autodelete_commands(message, parsed: Parsed):
+    if message.chat.type not in ("group", "supergroup"):
+        bot.reply_to(message, "📑 Эта команда работает только в групповом чате.")
+        return
+
+    chat_id = int(message.chat.id)
+    uid = int(message.from_user.id)
+
+    if not is_group_admin(uid, chat_id):
+        bot.reply_to(message, "📑 Эта команда доступна только администраторам этого чата.")
+        return
+
+    if parsed.cmd == "chat_autodel_status":
+        title = getattr(message.chat, "title", None) or "чат"
+        bot.reply_to(
+            message,
+            render_auto_delete_status(chat_id, title),
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
+        return
+
+    if parsed.cmd == "chat_autodel_off":
+        forget_chat_auto_delete(chat_id)
+        bot.reply_to(message, "✅ Авто-удаление сообщений для этого чата отключено.")
+        return
+
+    spec, err = _timer_parse_period_spec((parsed.args or "").strip())
+    if not spec:
+        bot.reply_to(message, err)
+        return
+
+    ttl = (
+        int(spec.get("months", 0) or 0) * 30 * 86400
+        + int(spec.get("weeks", 0) or 0) * 7 * 86400
+        + int(spec.get("days", 0) or 0) * 86400
+        + int(spec.get("hours", 0) or 0) * 3600
+        + int(spec.get("minutes", 0) or 0) * 60
+    )
+
+    if ttl < 60:
+        bot.reply_to(message, "📑 Минимальный период авто-удаления — 1 минута.")
+        return
+
+    if ttl > TIMER_MAX_SECONDS:
+        bot.reply_to(message, "📑 Максимальный срок авто-удаления — один год.")
+        return
+
+    set_chat_auto_delete_ttl(chat_id, ttl, uid)
+    run_chat_autodelete_once(chat_id)
+
+    bot.reply_to(
+        message,
+        f"✅ Авто-удаление сообщений включено.\n⌛ {_format_duration(ttl)}",
+        disable_web_page_preview=True
+    )
+
 # RESOLVE TARGETS
 def resolve_target_id(token: str) -> Optional[int]:
     """/owner target: @username | tg://user?id=... | user_id. Пользователь должен запускать бота."""
@@ -8199,6 +8322,99 @@ def _timer_spec_to_text(spec: dict) -> str:
 
     return " ".join(parts) if parts else "0 минут"
 
+# Автоудаление
+def is_group_admin(user_id: int, chat_id: int) -> bool:
+    try:
+        cm = bot.get_chat_member(int(chat_id), int(user_id))
+        st = (getattr(cm, "status", "") or "").lower()
+        return st in ("administrator", "creator")
+    except Exception:
+        return False
+
+def get_chat_auto_delete_ttl(chat_id: int) -> int:
+    row = db_one("SELECT COALESCE(ttl_seconds,0) AS t FROM chat_auto_delete WHERE chat_id=? LIMIT 1", (int(chat_id),))
+    return int(row["t"] or 0) if row else 0
+
+def set_chat_auto_delete_ttl(chat_id: int, ttl_seconds: int, by_user_id: int):
+    db_exec(
+        "INSERT INTO chat_auto_delete(chat_id, ttl_seconds, updated_by, updated_at) VALUES (?,?,?,?) "
+        "ON CONFLICT(chat_id) DO UPDATE SET ttl_seconds=excluded.ttl_seconds, updated_by=excluded.updated_by, updated_at=excluded.updated_at",
+        (int(chat_id), int(ttl_seconds), int(by_user_id), int(now_ts())),
+        commit=True
+    )
+
+def forget_chat_auto_delete(chat_id: int):
+    db_exec("DELETE FROM chat_auto_delete WHERE chat_id=?", (int(chat_id),), commit=True)
+
+def remember_bot_message_for_autodelete(msg):
+    try:
+        if not msg:
+            return
+        chat = getattr(msg, "chat", None)
+        if not chat:
+            return
+        chat_type = (getattr(chat, "type", "") or "").lower()
+        if chat_type not in ("group", "supergroup"):
+            return
+        chat_id = int(chat.id)
+        ttl = get_chat_auto_delete_ttl(chat_id)
+        if ttl <= 0:
+            return
+        db_exec(
+            "INSERT OR REPLACE INTO bot_sent_messages(chat_id, message_id, sent_at) VALUES (?,?,?)",
+            (chat_id, int(msg.message_id), int(now_ts())),
+            commit=True
+        )
+    except Exception:
+        pass
+
+def run_chat_autodelete_once(chat_id: Optional[int] = None):
+    now = int(now_ts())
+
+    if chat_id is not None:
+        settings = db_all(
+            "SELECT chat_id, ttl_seconds FROM chat_auto_delete WHERE chat_id=? AND COALESCE(ttl_seconds,0)>0",
+            (int(chat_id),)
+        ) or []
+    else:
+        settings = db_all(
+            "SELECT chat_id, ttl_seconds FROM chat_auto_delete WHERE COALESCE(ttl_seconds,0)>0"
+        ) or []
+
+    for s in settings:
+        cid = int(s["chat_id"])
+        ttl = int(s["ttl_seconds"] or 0)
+        if ttl <= 0:
+            continue
+
+        rows = db_all(
+            "SELECT message_id, sent_at FROM bot_sent_messages WHERE chat_id=? AND sent_at<=? ORDER BY sent_at ASC LIMIT 100",
+            (cid, int(now - ttl))
+        ) or []
+
+        for r in rows:
+            mid = int(r["message_id"])
+            try:
+                bot.delete_message(cid, mid)
+            except Exception:
+                pass
+            finally:
+                db_exec("DELETE FROM bot_sent_messages WHERE chat_id=? AND message_id=?", (cid, mid), commit=True)
+
+def render_auto_delete_status(chat_id: int, chat_title: str) -> str:
+    ttl = get_chat_auto_delete_ttl(int(chat_id))
+    if ttl > 0:
+        val = f"⌛ {_format_duration(ttl)}"
+    else:
+        val = "❌ Отключено"
+
+    return (
+        f"🔏 Авто-удаление сообщений чата <b>{h(chat_title)}</b>\n"
+        f"{val}\n\n"
+        f"💬 Чтобы изменить время, введите <code>Био +автоудаление</code> + период"
+    )
+
+# Таймеры
 def _timer_spec_seconds_approx(spec: dict) -> int:
     return int(
         int(spec.get("months", 0) or 0) * 30 * 86400
@@ -8819,7 +9035,6 @@ REPORT_CATS = {
     "RESTORE": "Восстановление лаборатории",
     "OTHER": "Другое",
 }
-
 #           Заражение
 INF_MODE_SYNONYMS = {
     "р": "r", "рандом": "r",
@@ -9749,6 +9964,15 @@ def _vaccine_fail_pct(target_id: int) -> int:
     if pct < 0:
         pct = 0
     return int(pct)
+
+def _cb_buy_vaccine(uid: int) -> str:
+    return f"{CB_BUY_VACCINE}:{int(uid)}"
+
+def _cb_use_vaccine(uid: int) -> str:
+    return f"{CB_USE_VACCINE}:{int(uid)}"
+
+def _cb_use_vaccine_x(uid: int, doses: int) -> str:
+    return f"{CB_USE_VACCINE_X}:{int(uid)}:{int(doses)}"
 
 VACCINE_FAIL_TEXT = (
     "🧿 Вакцина не смогла справиться с болезнью. Патоген оказался устойчивее к антителам вакцины.\n"
@@ -10934,20 +11158,18 @@ def handle_synth_command(message):
 
 #             вакцина
 def get_fever_and_vaccines(user_id: int) -> tuple[int, str, int]:
-    ensure_lab_exists(user_id)
+    uid = int(user_id)
+    _merge_placeholder_for_uid_if_possible(uid)
+    ensure_lab_exists(uid)
+
     r = db_one(
         "SELECT COALESCE(fever_until_ts,0) AS f, COALESCE(fever_pathogen,'') AS fp, COALESCE(ready_vaccines,0) AS v "
         "FROM labs WHERE user_id=?",
-        (int(user_id),)
+        (uid,)
     )
     if not r:
         return 0, "", 0
     return int(r["f"] or 0), (r["fp"] or ""), int(r["v"] or 0)
-
-VACCINE_FAIL_TEXT = (
-    "🧿 Вакцина не смогла справиться с болезнью. Патоген оказался устойчивее к антителам вакцины.\n"
-    "Введите повторную дозу или отлежитесь какое-то время."
-)
 
 def _vaccine_fail_pct(target_id: int) -> int:
     """
@@ -10980,12 +11202,12 @@ def _vaccine_fail_pct(target_id: int) -> int:
         pct = 0
     return int(pct)
 
-def kb_vaccine_retry() -> InlineKeyboardMarkup:
+def kb_vaccine_retry(uid: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup()
     kb.row(
-        _ikb_premium_counter("💉", "× 1", callback_data=f"{CB_USE_VACCINE_X}:1"),
-        _ikb_premium_counter("💉", "× 5", callback_data=f"{CB_USE_VACCINE_X}:5"),
-        _ikb_premium_counter("💉", "× 10", callback_data=f"{CB_USE_VACCINE_X}:10"),
+        _ikb_premium_counter("💉", "× 1", callback_data=_cb_use_vaccine_x(int(uid), 1)),
+        _ikb_premium_counter("💉", "× 5", callback_data=_cb_use_vaccine_x(int(uid), 5)),
+        _ikb_premium_counter("💉", "× 10", callback_data=_cb_use_vaccine_x(int(uid), 10)),
     )
     return kb
 
@@ -11002,6 +11224,7 @@ def try_buy_vaccine(user_id: int) -> tuple[str, int, int]:
     """
     uid = int(user_id)
     now = now_ts()
+    _merge_placeholder_for_uid_if_possible(uid)
     ensure_lab_exists(uid)
 
     with DB_LOCK:
@@ -11087,6 +11310,7 @@ def try_use_vaccine(user_id: int, doses: int = 1) -> tuple[str, int]:
     """
     uid = int(user_id)
     now = now_ts()
+    _merge_placeholder_for_uid_if_possible(uid)
     ensure_lab_exists(uid)
 
     try:
@@ -11422,11 +11646,17 @@ def on_my_chat_member_update(update):
         send_error_report("on_my_chat_member_update", e)
 
 # CALLBACK HANDLERS
-@bot.callback_query_handler(func=lambda cq: (cq.data or "") == CB_BUY_VACCINE)
+@bot.callback_query_handler(func=lambda cq: (cq.data or "").startswith(f"{CB_BUY_VACCINE}:"))
 def cb_buy_vaccine(cq):
     try:
         uid = int(cq.from_user.id)
+        parts = (cq.data or "").split(":")
+        target_uid = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else uid
+        if int(cq.from_user.id) != int(target_uid):
+            bot.answer_callback_query(cq.id, "Вы не можете нажимать чужие кнопки!")
+            return
         upsert_user(cq.from_user)
+        _merge_placeholder_for_uid_if_possible(cq.from_user)
 
         fever_until, fever_pat, vac_cnt = get_fever_and_vaccines(uid)
         now = now_ts()
@@ -11456,7 +11686,7 @@ def cb_buy_vaccine(cq):
 
         if vac_cnt > 0:
             rm = InlineKeyboardMarkup()
-            rm.add(InlineKeyboardButton("💉 Использовать вакцину", callback_data=CB_USE_VACCINE), style="primary")
+            rm.add(InlineKeyboardButton("💉 Использовать вакцину", callback_data=_cb_use_vaccine(uid)), style="primary")
             text = (
                 "💉 У вас нет необходимости покупать вакцину. Для быстрого выздоровления используйте вакцину\n"
                 "команда <code>Био использовать вакцину</code>"
@@ -11490,7 +11720,7 @@ def cb_buy_vaccine(cq):
             text = "📝 У вас недостаточно средств."
         elif status == "FAIL":
             text = VACCINE_FAIL_TEXT
-            rm = kb_vaccine_retry()
+            rm = kb_vaccine_retry(uid)
         else:
             text = (
                 "💉 Вакцина излечила вас от горячки.\n"
@@ -11523,11 +11753,17 @@ def cb_buy_vaccine(cq):
         except Exception:
             pass
 
-@bot.callback_query_handler(func=lambda cq: (cq.data or "") == CB_USE_VACCINE)
+@bot.callback_query_handler(func=lambda cq: (cq.data or "").startswith(f"{CB_USE_VACCINE}:"))
 def cb_use_vaccine(cq):
     try:
         uid = int(cq.from_user.id)
+        parts = (cq.data or "").split(":")
+        target_uid = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else uid
+        if int(cq.from_user.id) != int(target_uid):
+            bot.answer_callback_query(cq.id, "Вы не можете нажимать чужие кнопки!")
+            return
         upsert_user(cq.from_user)
+        _merge_placeholder_for_uid_if_possible(cq.from_user)
 
         fever_until, fever_pat, vac_cnt = get_fever_and_vaccines(uid)
         now = now_ts()
@@ -11542,7 +11778,7 @@ def cb_use_vaccine(cq):
                 rm = None
             elif status == "FAIL":
                 text = VACCINE_FAIL_TEXT
-                rm = kb_vaccine_retry()
+                rm = kb_vaccine_retry(uid)
             elif status == "NO_VACCINE":
                 price_txt = _fmt_bio_res(get_vaccine_price(uid))
                 text = (
@@ -11550,7 +11786,7 @@ def cb_use_vaccine(cq):
                     f"{price_txt}, команда <code>Био купить вакцину</code>"
                 )
                 rm = InlineKeyboardMarkup()
-                rm.add(InlineKeyboardButton("💉 Купить вакцину", callback_data=CB_BUY_VACCINE, style="primary"))
+                rm.add(InlineKeyboardButton("💉 Купить вакцину", callback_data=_cb_buy_vaccine(uid), style="primary"))
             else:
                 text = "📝 У вас нет горячки. Нет необходимости использовать вакцину."
                 rm = None
@@ -11585,11 +11821,17 @@ def cb_use_vaccine(cq):
 def cb_use_vaccine_x(cq):
     try:
         uid = int(cq.from_user.id)
+        parts = (cq.data or "").split(":")
+        target_uid = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else uid
+        if int(cq.from_user.id) != int(target_uid):
+            bot.answer_callback_query(cq.id, "Вы не можете нажимать чужие кнопки!")
+            return
         upsert_user(cq.from_user)
+        _merge_placeholder_for_uid_if_possible(cq.from_user)
 
         doses = 1
         try:
-            doses = int((cq.data or "").split(":", 2)[2])
+            doses = int((cq.data or "").split(":", 3)[3])
         except Exception:
             doses = 1
         doses = max(1, min(10, doses))
@@ -11610,7 +11852,7 @@ def cb_use_vaccine_x(cq):
                 rm = None
             elif status == "FAIL":
                 text = prefix + VACCINE_FAIL_TEXT
-                rm = kb_vaccine_retry()
+                rm = kb_vaccine_retry(uid)
             elif status == "NO_VACCINE":
                 price_txt = _fmt_bio_res(get_vaccine_price(uid))
                 text = prefix + (
@@ -11618,7 +11860,7 @@ def cb_use_vaccine_x(cq):
                     f"{price_txt}, команда <code>Био купить вакцину</code>"
                 )
                 rm = InlineKeyboardMarkup()
-                rm.add(InlineKeyboardButton("💉 Купить вакцину", callback_data=CB_BUY_VACCINE, style="primary"))
+                rm.add(InlineKeyboardButton("💉 Купить вакцину", callback_data=_cb_buy_vaccine(uid), style="primary"))
             else:
                 text = "📝 У вас нет горячки. Нет необходимости использовать вакцину."
                 rm = None
@@ -12845,7 +13087,7 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
 
         if vac_cnt > 0:
             kb = InlineKeyboardMarkup()
-            kb.add(InlineKeyboardButton("💉 Использовать вакцину", callback_data=CB_USE_VACCINE, style="primary"))
+            kb.add(InlineKeyboardButton("💉 Использовать вакцину", callback_data=_cb_use_vaccine(attacker_id), style="primary"))
             _emit(
                 f"🌡️ У вас горячка, вызванная {_pat_for_fever(fever_pat)}. Придётся отлежаться, пока она не пройдёт\n"
                 f"Время выздоровления {_format_hms(left)}"
@@ -12856,7 +13098,7 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
         else:
             price_txt = _fmt_bio_res(get_vaccine_price(attacker_id))
             kb = InlineKeyboardMarkup()
-            kb.add(InlineKeyboardButton("💉 Купить вакцину", callback_data=CB_BUY_VACCINE, style="primary"))
+            kb.add(InlineKeyboardButton("💉 Купить вакцину", callback_data=_cb_buy_vaccine(attacker_id), style="primary"))
             _emit(
                 f"🌡️ У вас горячка, вызванная {_pat_for_fever(fever_pat)}. Придётся отлежаться, пока она не пройдёт\n"
                 f"Время выздоровления {_format_hms(left)}"
@@ -15691,6 +15933,11 @@ def text_router(message):
             handle_timer_commands(message, parsed)
             return
 
+        # автоудаление
+        if parsed.cmd in ("chat_autodel_set", "chat_autodel_status", "chat_autodel_off"):
+            handle_chat_autodelete_commands(message, parsed)
+            return
+
         # приватные настройки
         if parsed.cmd in ("balance_hide", "balance_show", "lab_hide", "lab_show"):
             handle_privacy_toggle(message, parsed.cmd)
@@ -15750,11 +15997,11 @@ def text_router(message):
             if status == "OK":
                 bot.reply_to(message, "💉 Вакцина излечила вас от горячки.\n🧾 Потрачена 1 единица вакцины")
             elif status == "FAIL":
-                bot.reply_to(message, VACCINE_FAIL_TEXT, disable_web_page_preview=True, reply_markup=kb_vaccine_retry())
+                bot.reply_to(message, VACCINE_FAIL_TEXT, disable_web_page_preview=True, reply_markup=kb_vaccine_retry(uid))
             elif status == "NO_VACCINE":
                 price_txt = _fmt_bio_res(get_vaccine_price(uid))
                 kb = InlineKeyboardMarkup()
-                kb.add(InlineKeyboardButton("💉 Купить вакцину", callback_data=CB_BUY_VACCINE, style="primary"))
+                kb.add(InlineKeyboardButton("💉 Купить вакцину", callback_data=_cb_buy_vaccine(uid), style="primary"))
                 bot.reply_to(
                     message,
                     f"💉 Сейчас у вас нет ни одной вакцины. Для быстрого выздоровления вы можете купить вакцину: {price_txt}, "
@@ -15778,7 +16025,7 @@ def text_router(message):
 
             if vac_cnt > 0:
                 kb = InlineKeyboardMarkup()
-                kb.add(InlineKeyboardButton("💉 Использовать вакцину", callback_data=CB_USE_VACCINE, style="primary"))
+                kb.add(InlineKeyboardButton("💉 Использовать вакцину", callback_data=_cb_use_vaccine(uid), style="primary"))
                 bot.reply_to(
                     message,
                     "💉 У вас нет необходимости покупать вакцину.  Для быстрого выздоровления используйте вакцину\n"
@@ -15794,7 +16041,7 @@ def text_router(message):
             elif status == "NO_FEVER":
                 bot.reply_to(message, "📝 У вас нет горячки. Нет необходимости покупать вакцину.")
             elif status == "FAIL":
-                bot.reply_to(message, VACCINE_FAIL_TEXT, disable_web_page_preview=True, reply_markup=kb_vaccine_retry())
+                bot.reply_to(message, VACCINE_FAIL_TEXT, disable_web_page_preview=True, reply_markup=kb_vaccine_retry(uid))
             else:
                 bot.reply_to(
                     message,
