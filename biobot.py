@@ -2168,6 +2168,21 @@ def init_db():
     );
     """, commit=True)
 
+    db_exec("""
+    CREATE TABLE IF NOT EXISTS infect_formula_settings (
+        settings_id   INTEGER PRIMARY KEY CHECK(settings_id=1),
+        k_value       REAL NOT NULL DEFAULT 0.5,
+        beta_value    REAL NOT NULL DEFAULT 1.0,
+        updated_at    INTEGER NOT NULL DEFAULT 0
+    );
+    """, commit=True)
+    
+    db_exec(
+        "INSERT OR IGNORE INTO infect_formula_settings(settings_id, k_value, beta_value, updated_at) VALUES (1,?,?,?)",
+        (float(INFECT_BOUND_K), float(INFECT_BOUND_BETA), int(now_ts())),
+        commit=True
+    )
+
     # автоудаление
     db_exec("""
     CREATE TABLE IF NOT EXISTS chat_auto_delete (
@@ -2383,6 +2398,8 @@ def init_db():
         )
     except Exception:
         pass
+
+    load_infect_formula_settings()
 
 def init_deleted_db(): # отдельная БД для удалённых лабораторий
     conn2 = sqlite3.connect(DELETED_DB_PATH, check_same_thread=False)
@@ -5295,10 +5312,9 @@ def build_agents_panel_text(user_id: int) -> str:
         lines.append("/owner — назначить агента")
         lines.append("/owner_remove — снять права с агента")
         lines.append("/users — список всех пользователей")
-        lines.append("/promocode_generate — назначить агента")
-        lines.append("/promocode_create — снять права с агента")
-        lines.append("/promocode_all — список всех пользователей")
-        lines.append("/promocode_delete — назначить агента")
+        lines.append("/edit_k — изменить k")
+        lines.append("/edit_b — изменить β")
+        lines.append("/cof_inf_stats — информация по переменным заражения")
     lines.append("/bot_ban — заблокировать пользователя")
     lines.append("/bot_unban — разблокировать пользователя")
     lines.append("/remake_lab — восстановить лабораторию")
@@ -6449,6 +6465,16 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
             rest = parts[1].strip()
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="remake_lab", args=rest)
 
+    if low == "cof_inf_stats":
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="cof_inf_stats", args="")
+
+    if low.startswith("edit_k "):
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="edit_k", args=t.split(" ", 1)[1].strip())
+
+    if low.startswith("edit_b "):
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="edit_b", args=t.split(" ", 1)[1].strip())
+
+    # удаление лабы
     if t == LAB_DELETE_PHRASE:
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="lab_delete_confirm_phrase", args="")
 
@@ -7340,6 +7366,58 @@ def handle_owner_remove_command(message, parsed: Parsed):
 
     remove_support_agent(int(target_id))
     bot.reply_to(message, f"✅ Пользователь <code>{int(target_id)}</code> больше не является агентом техподдержки.", parse_mode="HTML")
+
+def handle_edit_k_command(message, parsed: Parsed):
+    if not parsed.has_prefix_char or not can_manage_support(int(message.from_user.id)):
+        return
+
+    val = _parse_edit_float_arg(parsed.args or "")
+    if val is None:
+        bot.reply_to(message, "📑 Укажите числовое значение коэффициента k.")
+        return
+    if val < 0:
+        bot.reply_to(message, "📑 Коэффициент k не может быть отрицательным.")
+        return
+
+    save_infect_formula_settings(val, INFECT_BOUND_BETA)
+    bot.reply_to(
+        message,
+        f"✅ Коэффициент масштаба (k) изменён на <b>{str(INFECT_BOUND_K).replace('.', ',')}</b>",
+        parse_mode="HTML",
+        disable_web_page_preview=True
+    )
+
+def handle_edit_b_command(message, parsed: Parsed):
+    if not parsed.has_prefix_char or not can_manage_support(int(message.from_user.id)):
+        return
+
+    val = _parse_edit_float_arg(parsed.args or "")
+    if val is None:
+        bot.reply_to(message, "📑 Укажите числовое значение коэффициента β.")
+        return
+    if val < 0:
+        bot.reply_to(message, "📑 Коэффициент β не может быть отрицательным.")
+        return
+
+    save_infect_formula_settings(INFECT_BOUND_K, val)
+    bot.reply_to(
+        message,
+        f"✅ Коэффициент искривления (β) изменён на <b>{str(INFECT_BOUND_BETA).replace('.', ',')}</b>",
+        parse_mode="HTML",
+        disable_web_page_preview=True
+    )
+
+def handle_cof_inf_stats_command(message, parsed: Parsed):
+    if not parsed.has_prefix_char or not can_manage_support(int(message.from_user.id)):
+        return
+
+    bot.reply_to(
+        message,
+        render_cof_inf_stats_text(),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+        reply_markup=kb_cof_inf_stats()
+    )
 
 def handle_admin_name_restriction_command(message, parsed: Parsed):
     if message.chat.type != "private":
@@ -9452,8 +9530,80 @@ def _promo_apply_to_user(code: str, user_id: int) -> tuple[bool, str]:
     pretty = " ".join(pretty_parts).strip()
     return True, f"🎁 Промокод <code>{h(row['code'])}</code> активирован.\n{pretty}"
 
-INFECT_BOUND_K = 0.5 # коэффициент масштаба
-INFECT_BOUND_BETA = 1.0 # коэфициент кривизны
+# расчёт коэффициентов
+INFECT_BOUND_K = 0.2 # коэффициент масштаба
+INFECT_BOUND_BETA = 1.0 # коэффициент кривизны
+COFINFUI_TAG = "CI"
+
+def load_infect_formula_settings():
+    global INFECT_BOUND_K, INFECT_BOUND_BETA
+
+    row = db_one(
+        "SELECT COALESCE(k_value,0.5) AS k_value, COALESCE(beta_value,1.0) AS beta_value "
+        "FROM infect_formula_settings WHERE settings_id=1 LIMIT 1"
+    )
+    if not row:
+        return
+
+    try:
+        INFECT_BOUND_K = float(row["k_value"])
+    except Exception:
+        INFECT_BOUND_K = 0.5
+
+    try:
+        INFECT_BOUND_BETA = float(row["beta_value"])
+    except Exception:
+        INFECT_BOUND_BETA = 1.0
+
+def save_infect_formula_settings(k_value: float, beta_value: float):
+    global INFECT_BOUND_K, INFECT_BOUND_BETA
+
+    INFECT_BOUND_K = float(k_value)
+    INFECT_BOUND_BETA = float(beta_value)
+
+    db_exec(
+        "INSERT INTO infect_formula_settings(settings_id, k_value, beta_value, updated_at) "
+        "VALUES (1,?,?,?) "
+        "ON CONFLICT(settings_id) DO UPDATE SET "
+        "k_value=excluded.k_value, beta_value=excluded.beta_value, updated_at=excluded.updated_at",
+        (float(INFECT_BOUND_K), float(INFECT_BOUND_BETA), int(now_ts())),
+        commit=True
+    )
+
+def _parse_edit_float_arg(s: str):
+    raw = (s or "").strip().replace(",", ".")
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except Exception:
+        return None
+
+def _cof_inf_stats_cb() -> str:
+    return f"{COFINFUI_TAG}:R"
+
+def kb_cof_inf_stats() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("Обновить статистику", callback_data=_cof_inf_stats_cb()))
+    return kb
+
+def render_cof_inf_stats_text() -> str:
+    pairs = [(1, 2), (10, 20), (19, 20), (1, 100)]
+
+    lines = []
+    lines.append("📋 Изменения формулы заражения")
+    lines.append("")
+    lines.append(f"Коэф. масштаба (k): {str(INFECT_BOUND_K).replace('.', ',')}")
+    lines.append(f"Коэф. искривления (β): {str(INFECT_BOUND_BETA).replace('.', ',')}")
+    lines.append("")
+    lines.append("Z | I | P(усп) | P(пров)")
+
+    for z, i in pairs:
+        p_success = float(infect_success_chance(z, i))
+        p_fail = 100.0 - p_success
+        lines.append(f"{z} | {i} | {_fmt_pct_text(p_success)} | {_fmt_pct_text(p_fail)}")
+
+    return "\n".join(lines)
 
 # шансы заражения
 def infect_success_chance(att_infect: int, tgt_imm: int) -> float:
@@ -12628,6 +12778,42 @@ def cb_users_ui(cq):
         send_error_report("cb_users_ui", e)
         try:
             bot.answer_callback_query(cq.id, "Не удалось переключить страницу.")
+        except Exception:
+            pass
+
+@bot.callback_query_handler(func=lambda cq: (cq.data or "") == _cof_inf_stats_cb())
+def cb_cof_inf_stats_refresh(cq):
+    try:
+        if not can_manage_support(int(cq.from_user.id)):
+            bot.answer_callback_query(cq.id)
+            return
+
+        text = render_cof_inf_stats_text()
+        rm = kb_cof_inf_stats()
+
+        if cq.inline_message_id:
+            limited_edit_message_text(
+                text=text,
+                inline_id=cq.inline_message_id,
+                parse_mode="HTML",
+                reply_markup=rm,
+                disable_web_page_preview=True
+            )
+        elif cq.message:
+            limited_edit_message_text(
+                text=text,
+                chat_id=cq.message.chat.id,
+                msg_id=cq.message.message_id,
+                parse_mode="HTML",
+                reply_markup=rm,
+                disable_web_page_preview=True
+            )
+
+        bot.answer_callback_query(cq.id, "Статистика обновлена.")
+    except Exception as e:
+        send_error_report("cb_cof_inf_stats_refresh", e)
+        try:
+            bot.answer_callback_query(cq.id)
         except Exception:
             pass
 
@@ -15845,6 +16031,19 @@ def text_router(message):
         # /owner_remove
         if parsed.cmd == "owner_remove":
             handle_owner_remove_command(message, parsed)
+            return
+
+        # коффициенты заражения
+        if parsed.cmd == "edit_k":
+            handle_edit_k_command(message, parsed)
+            return
+
+        if parsed.cmd == "edit_b":
+            handle_edit_b_command(message, parsed)
+            return
+
+        if parsed.cmd == "cof_inf_stats":
+            handle_cof_inf_stats_command(message, parsed)
             return
 
         # /agents
