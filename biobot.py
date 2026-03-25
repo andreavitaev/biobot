@@ -3,6 +3,7 @@ import re
 import io
 import sys
 import json
+import math
 import time
 import heapq
 import random
@@ -127,24 +128,6 @@ def pick_random_event_text() -> str:
     except Exception:
         return "Произошёл непредвиденный сбой во время операции."
 
-def _split_stat_tail(tail: str) -> tuple[str, str]:
-    s = (tail or "").strip()
-    if not s:
-        return "", ""
-
-    if "|" in s:
-        parts = [x.strip() for x in s.split("|")]
-        if len(parts) >= 2:
-            return parts[0], parts[1]
-        return parts[0], ""
-
-    for sep in (" / ", " ; ", " — ", " - "):
-        if sep in s:
-            a, b = s.split(sep, 1)
-            return a.strip(), b.strip()
-
-    return s.strip(), ""
-
 def load_rp_actions() -> dict:
     global _RP_ACTIONS_CACHE, _RP_ACTIONS_CACHE_MTIME
 
@@ -250,23 +233,6 @@ def load_personal_rp_actions(user_id: int) -> dict:
             "uses_count": int(r["uses_count"] or 0),
         }
     return out
-
-def get_any_rp_action(user_id: int, trigger: str):
-    key = _normalize_rp_trigger(trigger)
-    if not key:
-        return None
-
-    personal = load_personal_rp_actions(int(user_id)).get(key)
-    if personal:
-        return personal
-
-    global_action = get_rp_action(key)
-    if global_action:
-        out = dict(global_action)
-        out["source"] = "global"
-        return out
-
-    return None
 
 def _all_rp_actions_for_user(user_id: int) -> list[dict]:
     actions = []
@@ -1557,14 +1523,6 @@ with DB_LOCK:
 
 _DB_COMMITS_SINCE_CKPT = 0
 
-def _maybe_checkpoint_passive():
-    global _DB_COMMITS_SINCE_CKPT
-    try:
-        conn.execute("PRAGMA wal_checkpoint(PASSIVE);")
-    except Exception:
-        pass
-    _DB_COMMITS_SINCE_CKPT = 0
-
 def db_one(sql: str, params=()):
     with DB_LOCK:
         c = conn.cursor()
@@ -2330,6 +2288,11 @@ def init_db():
     );
     """, commit=True)
 
+    try:
+        db_exec("ALTER TABLE bot_group_chats ADD COLUMN owner_id INTEGER DEFAULT 0", commit=True)
+    except Exception:
+        pass
+
     db_exec("""
     CREATE TABLE IF NOT EXISTS rp_offers (
         offer_id     INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2802,14 +2765,6 @@ def _perform_lab_delete(user_id: int) -> tuple[bool, str]:
         send_error_report("_perform_lab_delete", e)
         return False, "📑 Не удалось удалить Лабораторию."
 
-def _insert_row_into_table(table_name: str, row_data: dict):
-    if not row_data:
-        return
-    cols = list(row_data.keys())
-    ph = ",".join(["?"] * len(cols))
-    sql = f"INSERT OR REPLACE INTO {table_name}({','.join(cols)}) VALUES ({ph})"
-    db_exec(sql, tuple(row_data[c] for c in cols), commit=False)
-
 def _restore_deleted_lab(user_id: int, *, support_mode: bool = False) -> tuple[bool, str]:
     row = get_deleted_lab_row(int(user_id))
     if not row:
@@ -2977,9 +2932,6 @@ def upsert_user(tg_user):
         tg_user.last_name,
         now_ts()
     ), commit=True)
-
-def touch_user(user_id: int):
-    db_exec("UPDATE users SET last_seen=? WHERE user_id=?", (now_ts(), int(user_id)), commit=True)
 
 def ensure_creator_is_support():
     db_exec("""
@@ -4422,34 +4374,6 @@ def _resolve_or_create_infect_target(token: str) -> Optional[int]:
         return _ensure_placeholder_user_by_uid(int(m.group(1)))
 
     return None
-def is_placeholder_user(user_id: int) -> bool:
-    row = get_user_row(int(user_id))
-    if not row:
-        return False
-    return int(row["is_placeholder"] or 0) == 1
-
-def _best_known_username_by_uid(user_id: int) -> str:
-    uid = int(user_id)
-
-    row = db_one("SELECT username FROM users WHERE user_id=? LIMIT 1", (uid,))
-    if row:
-        un = _normalize_username_for_link((row["username"] or ""))
-        if un:
-            return un
-
-    row = db_one(
-        "SELECT username FROM chat_members "
-        "WHERE user_id=? AND COALESCE(username,'')<>'' "
-        "ORDER BY COALESCE(last_seen,0) DESC "
-        "LIMIT 1",
-        (uid,)
-    )
-    if row:
-        un = _normalize_username_for_link((row["username"] or ""))
-        if un:
-            return un
-
-    return ""
 
 def _raw_name_fallback(first_name: str, last_name: str) -> str:
     fn = _strip_invisible(first_name or "").strip()
@@ -4841,8 +4765,15 @@ def _merge_placeholder_to_real_user(tg_user):
             except Exception:
                 pass
 
-def _merge_placeholder_for_uid_if_possible(user_id: int):
-    uid = int(user_id)
+def _merge_placeholder_for_uid_if_possible(user_or_id):
+    try:
+        if hasattr(user_or_id, "id"):
+            uid = int(getattr(user_or_id, "id"))
+        else:
+            uid = int(user_or_id)
+    except Exception:
+        return
+
     row = get_user_row(uid)
     if not row:
         return
@@ -4918,19 +4849,6 @@ def set_name_restriction(user_id: int, kind: str, locked: int, imposed_by: int, 
         ),
         commit=True
     )
-
-def _restriction_target_and_reason_from_message(message):
-    first_line, body = _timer_first_line_and_body(message.text or "")
-    first_line = strip_bio_prefix(first_line)
-    if first_line.startswith("/") or first_line.startswith("."):
-        first_line = first_line[1:].strip()
-
-    parts = first_line.split()
-    if len(parts) < 2:
-        return None, "", ""
-    token = parts[1].strip()
-    reason = (body or "").strip()[:50]
-    return token, reason, first_line
 
 def _blacklist_collect_rows() -> list[dict]:
     out: Dict[int, dict] = {}
@@ -5127,6 +5045,115 @@ def _users_parse_cb(data: str) -> Optional[int]:
     except Exception:
         return None
 
+def _known_chats_cb(page: int) -> str:
+    return f"{CHATSUI_TAG}:{int(page)}"
+
+def _known_chats_parse_cb(data: str) -> Optional[int]:
+    try:
+        p = (data or "").split(":")
+        if len(p) != 2 or p[0] != CHATSUI_TAG:
+            return None
+        return int(p[1])
+    except Exception:
+        return None
+
+def _known_chats_collect_rows() -> list[dict]:
+    rows = db_all(
+        "SELECT q.chat_id, "
+        "COALESCE(bg.title, '') AS title, "
+        "COALESCE(bg.owner_id, 0) AS owner_id, "
+        "COALESCE(bg.updated_at, 0) AS updated_at "
+        "FROM ("
+        "  SELECT chat_id FROM bot_group_chats WHERE COALESCE(is_active,0)=1 "
+        "  UNION "
+        "  SELECT chat_id FROM chat_members "
+        ") q "
+        "LEFT JOIN bot_group_chats bg ON bg.chat_id=q.chat_id "
+        "ORDER BY COALESCE(bg.updated_at,0) DESC, q.chat_id ASC"
+    ) or []
+
+    out = []
+    for r in rows:
+        chat_id = int(r["chat_id"])
+        title = (r["title"] or "").strip() or f"Чат {chat_id}"
+        owner_id = int(r["owner_id"] or 0)
+
+        if owner_id <= 0:
+            try:
+                sync_chat_admins(chat_id)
+            except Exception:
+                pass
+            rr = db_one("SELECT COALESCE(owner_id,0) AS owner_id FROM bot_group_chats WHERE chat_id=?", (chat_id,))
+            owner_id = int(rr["owner_id"] or 0) if rr else 0
+
+        owner_tag = public_user_tag(owner_id) if owner_id > 0 else "неизвестно"
+
+        out.append({
+            "chat_id": chat_id,
+            "title": title,
+            "owner_tag": owner_tag,
+        })
+
+    return out
+
+def render_known_chats_text(page: int) -> tuple[str, Optional[InlineKeyboardMarkup]]:
+    rows = _known_chats_collect_rows()
+    total = len(rows)
+
+    if total <= 0:
+        kb = InlineKeyboardMarkup()
+        kb.row(InlineKeyboardButton("Пользователи", callback_data=_users_cb(1)))
+        return "📑 Список известных чатов пуст.", kb
+
+    total_pages = max(1, (total + USERS_PAGE_SIZE - 1) // USERS_PAGE_SIZE)
+    page = max(1, min(int(page), total_pages))
+    start = (page - 1) * USERS_PAGE_SIZE
+    part = rows[start:start + USERS_PAGE_SIZE]
+
+    lines = []
+    lines.append("📑 Список известных чатов")
+    lines.append("")
+    lines.append("<blockquote expandable>")
+    for idx, row in enumerate(part, start + 1):
+        lines.append(f"{idx}. <b>{h(row['title'])}</b> | {row['owner_tag']}")
+    lines.append("</blockquote>")
+
+    kb = InlineKeyboardMarkup(row_width=8)
+    row_btns = []
+
+    if total_pages > 1:
+        if page > 2:
+            row_btns.append(InlineKeyboardButton("<<", callback_data=_known_chats_cb(1)))
+        if page > 1:
+            row_btns.append(InlineKeyboardButton("<", callback_data=_known_chats_cb(page - 1)))
+
+        page_nums = []
+        if total_pages <= 4:
+            page_nums = list(range(1, total_pages + 1))
+        elif page == 1:
+            page_nums = [1, 2, 3, 4]
+        elif page == total_pages:
+            page_nums = [total_pages - 3, total_pages - 2, total_pages - 1, total_pages]
+        else:
+            page_nums = [max(1, page - 1), page, min(total_pages, page + 1), min(total_pages, page + 2)]
+            page_nums = sorted(dict.fromkeys([p for p in page_nums if 1 <= p <= total_pages]))
+
+        for p in page_nums:
+            if p == page:
+                row_btns.append(InlineKeyboardButton(f"·{p}·", callback_data=_known_chats_cb(page)))
+            else:
+                row_btns.append(InlineKeyboardButton(str(p), callback_data=_known_chats_cb(p)))
+
+        if page < total_pages:
+            row_btns.append(InlineKeyboardButton(">", callback_data=_known_chats_cb(page + 1)))
+        if page < total_pages - 1:
+            row_btns.append(InlineKeyboardButton(">>", callback_data=_known_chats_cb(total_pages)))
+
+        kb.row(*row_btns)
+
+    kb.row(InlineKeyboardButton("Пользователи", callback_data=_users_cb(1)))
+    return "\n".join(lines), kb
+
 def _users_collect_rows() -> list[dict]:
     rows = db_all(
         "SELECT u.user_id, u.username, u.first_name, u.last_name, u.last_seen, u.is_placeholder, "
@@ -5220,6 +5247,10 @@ def render_users_text(page: int) -> tuple[str, Optional[InlineKeyboardMarkup]]:
             row_btns.append(InlineKeyboardButton(">>", callback_data=_users_cb(total_pages)))
 
         kb.row(*row_btns)
+
+    if kb is None:
+        kb = InlineKeyboardMarkup()
+    kb.row(InlineKeyboardButton("Известные чаты", callback_data=_known_chats_cb(1)))
 
     return "\n".join(lines), kb
 
@@ -5996,17 +6027,19 @@ def remember_chat_member(chat_id: int, tg_user):
         commit=True
     )
 
-def remember_bot_group_chat(chat_id: int, title: str = "", chat_type: str = "group", is_active: int = 1):
+def remember_bot_group_chat(chat_id: int, title: str = "", chat_type: str = "group", is_active: int = 1, owner_id: int = 0):
     db_exec(
-        "INSERT INTO bot_group_chats(chat_id, title, chat_type, is_active, updated_at) VALUES (?,?,?,?,?) "
+        "INSERT INTO bot_group_chats(chat_id, title, chat_type, is_active, updated_at, owner_id) VALUES (?,?,?,?,?,?) "
         "ON CONFLICT(chat_id) DO UPDATE SET "
-        "title=excluded.title, chat_type=excluded.chat_type, is_active=excluded.is_active, updated_at=excluded.updated_at",
+        "title=excluded.title, chat_type=excluded.chat_type, is_active=excluded.is_active, updated_at=excluded.updated_at, "
+        "owner_id=CASE WHEN excluded.owner_id>0 THEN excluded.owner_id ELSE bot_group_chats.owner_id END",
         (
             int(chat_id),
             str(title or ""),
             str(chat_type or ""),
             int(is_active),
-            int(now_ts())
+            int(now_ts()),
+            int(owner_id or 0)
         ),
         commit=True
     )
@@ -6016,31 +6049,44 @@ def _users_total_count() -> int:
     return int(row["c"] or 0) if row else 0
 
 def _bot_group_chat_count() -> int:
-    row = db_one("SELECT COUNT(*) AS c FROM bot_group_chats WHERE COALESCE(is_active,0)=1")
-    cnt = int(row["c"] or 0) if row else 0
-    if cnt > 0:
-        return cnt
-
-    row = db_one("SELECT COUNT(DISTINCT chat_id) AS c FROM chat_members")
+    row = db_one(
+        "SELECT COUNT(DISTINCT chat_id) AS c FROM ("
+        "  SELECT chat_id FROM bot_group_chats WHERE COALESCE(is_active,0)=1 "
+        "  UNION "
+        "  SELECT chat_id FROM chat_members "
+        ") t"
+    )
     return int(row["c"] or 0) if row else 0
 
 def sync_chat_admins(chat_id: int):
     """
     Пытается получить всех админов чата и записать их в chat_members.
-    Работает, если у бота есть право видеть админов (обычно всегда) и чат не скрывает список админов.
+    Заодно фиксирует владельца чата в bot_group_chats.owner_id.
     """
     try:
         admins = bot.get_chat_administrators(int(chat_id)) or []
     except Exception:
         return
 
+    owner_id = 0
+
     for cm in admins:
         try:
             u = getattr(cm, "user", None)
+            st = (getattr(cm, "status", "") or "").lower()
             if u:
                 remember_chat_member(int(chat_id), u)
+                if st == "creator":
+                    owner_id = int(u.id)
         except Exception:
             pass
+
+    if owner_id > 0:
+        db_exec(
+            "UPDATE bot_group_chats SET owner_id=?, updated_at=? WHERE chat_id=?",
+            (int(owner_id), int(now_ts()), int(chat_id)),
+            commit=True
+        )
 
 def _known_chat_member_count(chat_id: int, exclude_user_id: int = 0) -> int:
     row = db_one(
@@ -6952,30 +6998,6 @@ def _custom_pack_emoji_html(emoji_fallback: str, custom_emoji_id: str) -> str:
     if PREMIUM_EMOJI_ENABLED and ceid:
         return f'<tg-emoji emoji-id="{h(ceid)}">{h(emo)}</tg-emoji>'
     return h(emo)
-
-def render_emoji_pack_ids_text(pack_title: str, pack_url: str, stickers: list) -> str:
-    title_link = f'<a href="{h(pack_url)}">{h(pack_title)}</a>' if pack_url else h(pack_title)
-
-    lines = [f"📋 Список всех премиум эмодзи пака {title_link}", ""]
-    if not stickers:
-        lines.append("<blockquote expandable>Список пуст.</blockquote>")
-        return "\n".join(lines)
-
-    lines.append("<blockquote expandable>")
-    idx = 0
-    for st in stickers:
-        ceid = str(getattr(st, "custom_emoji_id", "") or "").strip()
-        if not ceid:
-            continue
-
-        idx += 1
-        emo = _custom_pack_emoji_html(str(getattr(st, "emoji", "") or "🙂"), ceid)
-        lines.append(f"{idx}|{emo}|<code>{h(ceid)}</code>")
-
-    if idx == 0:
-        lines.append("В паке не найдено premium/custom emoji.")
-    lines.append("</blockquote>")
-    return "\n".join(lines)
 
 def _emoji_pack_cache_key(short_name: str) -> str:
     s = re.sub(r"[^A-Za-z0-9_]", "", (short_name or "").strip())
@@ -8145,11 +8167,6 @@ def _fmt_bio_res_after_po(n: int) -> str:
     w = _ru_unit(n, "био-ресурсу", "био-ресурса", "био-ресурсов")
     return f"{n} {w}"
 
-def _fmt_bio_mater_after_po(n: int) -> str:
-    n = int(n)
-    w = _ru_unit(n, "био-материалу", "био-материала", "био-материалов")
-    return f"{n} {w}"
-
 def _format_hm_from_seconds(seconds: int) -> str:
     """Часы+минуты, без секунд (для строки 'Горячка на ...')."""
     seconds = max(0, int(seconds))
@@ -9021,6 +9038,7 @@ SETUI_TAG = "W"
 REPORTUI_TAG = "Y"
 BLUI_TAG = "K"
 USERSUI_TAG = "US"
+CHATSUI_TAG = "UC"
 EMPACKUI_TAG = "EP"
 RPUI_TAG = "RP"
 PROMOUI_TAG = "PR"
@@ -9434,45 +9452,31 @@ def _promo_apply_to_user(code: str, user_id: int) -> tuple[bool, str]:
     pretty = " ".join(pretty_parts).strip()
     return True, f"🎁 Промокод <code>{h(row['code'])}</code> активирован.\n{pretty}"
 
-# коэфициент кривизны
-INFECT_BOUND_K = 0.7
+INFECT_BOUND_K = 0.5 # коэффициент масштаба
+INFECT_BOUND_BETA = 1.0 # коэфициент кривизны
 
+# шансы заражения
 def infect_success_chance(att_infect: int, tgt_imm: int) -> float:
-    """
-        N = max(Z, I)
-        M = min(Z, I)
-        r = min(1, |Z - I| / M)
-
-        Pmin = 0.1 + 9.9 / sqrt(N)
-        Pmax = 99.9 - 9.9 / sqrt(N)
-
-        если Z > I:
-            Pусп = 50 + r * (Pmax - 50)
-        если Z = I:
-            Pусп = 50
-        если Z < I:
-            Pусп = 50 - r * (50 - Pmin)
-    """
     z = max(1.0, float(int(att_infect or 0)))
     i = max(1.0, float(int(tgt_imm or 0)))
 
     n = max(z, i)
-    m = min(z, i)
     k = float(INFECT_BOUND_K)
+    beta = float(INFECT_BOUND_BETA)
 
-    denom = pow(n, k)
-    if denom <= 0:
-        denom = 1.0
+    sqrt_n = math.sqrt(n)
+    if sqrt_n <= 0.0:
+        sqrt_n = 1.0
 
-    p_min = 0.1 + 19.9 / denom
-    p_max = 99.9 - 19.9 / denom
-
-    r = min(1.0, abs(z - i) / m)
+    p_min = 0.1 + 9.9 / sqrt_n
+    p_max = 99.9 - 9.9 / sqrt_n
 
     if z > i:
-        p = 50.0 + r * (p_max - 50.0)
+        expo_arg = -k * (((z - i) * (n ** beta)) / i)
+        p = 50.0 + (1.0 - math.exp(expo_arg)) * (p_max - 50.0)
     elif z < i:
-        p = 50.0 - r * (50.0 - p_min)
+        expo_arg = -k * (((i - z) * (n ** beta)) / z)
+        p = 50.0 - (1.0 - math.exp(expo_arg)) * (50.0 - p_min)
     else:
         p = 50.0
 
@@ -9938,32 +9942,6 @@ def _roll_pct(pct: float) -> bool:
         return random.random() * 100.0 < float(pct)
     except Exception:
         return False
-
-def _vaccine_fail_pct(target_id: int) -> int:
-    """Шанс провала вакцины из-за тяжести патогена (макс 90%)."""
-    uid = int(target_id)
-    now = now_ts()
-
-    qrow = db_one("SELECT COALESCE(qualification,1) AS q FROM labs WHERE user_id=?", (uid,))
-    qual = int(qrow["q"] if qrow else 1) or 1
-
-    hrow = db_one(
-        "SELECT MAX(COALESCE(l.heaviness,0)) AS h "
-        "FROM infections i "
-        "JOIN labs l ON l.user_id=i.attacker_id "
-        "WHERE i.target_id=? AND i.end_ts>?",
-        (uid, now)
-    )
-    heavy = int(hrow["h"] if hrow and hrow["h"] is not None else 0)
-
-    if heavy <= qual:
-        return 0
-    pct = (heavy - qual) * 2
-    if pct > 90:
-        pct = 90
-    if pct < 0:
-        pct = 0
-    return int(pct)
 
 def _cb_buy_vaccine(uid: int) -> str:
     return f"{CB_BUY_VACCINE}:{int(uid)}"
@@ -10487,17 +10465,14 @@ def _calc_sabotage_success_pct(reaction_level: int, ips_level: int) -> float:
     p = max(0.0, min(80.0, 40.0 + delta))
     return float(p)
 
-def _calc_heaviness_success_pct(heaviness_level: int, qualification_level: int) -> float:
-    hea = int(heaviness_level)
-    qual = int(qualification_level)
-    if hea <= qual:
-        return 0.0
-    p = (hea - qual) * 2.0
-    if p > 90.0:
-        p = 90.0
-    if p < 0.0:
-        p = 0.0
-    return float(p)
+# шансы тяжести
+def _calc_heaviness_success_fail_pct(heaviness_level: int, qualification_level: int) -> tuple[float, float]:
+    t = max(1.0, float(int(heaviness_level or 0)))
+    q = max(1.0, float(int(qualification_level or 0)))
+
+    p_success = min(60.0, max(10.0, 35.0 + ((t / q) * 100.0 - 100.0)))
+    p_fail = 100.0 - p_success
+    return float(p_success), float(p_fail)
 
 def _calc_chance_payload(metric_token: str, lvl1: int, lvl2: int):
     metric_key = CALC_CHANCE_METRIC_ALIASES.get((metric_token or "").strip().lower())
@@ -10521,10 +10496,9 @@ def _calc_chance_payload(metric_token: str, lvl1: int, lvl2: int):
         success = float(_calc_sabotage_success_pct(l1, l2))
         fail = 100.0 - success
         label = "диверсии"
-        levels_txt = f"👮 {l1} ур → 📟 {l2} ур"
+        levels_txt = f"🕵️ {l1} ур → 📟 {l2} ур"
     else:
-        success = float(_calc_heaviness_success_pct(l1, l2))
-        fail = 100.0 - success
+        success, fail = _calc_heaviness_success_fail_pct(l1, l2)
         label = "тяжести"
         levels_txt = f"🧿 {l1} ур → 👨‍🔬 {l2} ур"
 
@@ -10763,7 +10737,7 @@ def _inline_calc_req_from_query(query: str):
     metric_hint = {
         "INFECT": "Введите уровень заразности и уровень иммунитета",
         "IDS": "Введите два уровня системы обнаружения угроз (IDS)",
-        "SAB": "Введите уровень группы быстрого реагирования и уровень системы предотвращения угроз (IPS)",
+        "SAB": "Введите уровень группы быстрого реагирования и уровень службы безопасности",
         "HEA": "Введите уровень тяжести патогена и уровень квалификации учёных",
     }[metric_key]
 
@@ -11171,12 +11145,7 @@ def get_fever_and_vaccines(user_id: int) -> tuple[int, str, int]:
         return 0, "", 0
     return int(r["f"] or 0), (r["fp"] or ""), int(r["v"] or 0)
 
-def _vaccine_fail_pct(target_id: int) -> int:
-    """
-    Шанс провального срабатывания вакцины (макс 90%):
-    за каждый 1% уровня тяжести свыше квалификации +2%.
-    Здесь "тяжесть" берём как MAX heaviness среди активных инфекций на цели.
-    """
+def _vaccine_fail_pct(target_id: int) -> float:
     uid = int(target_id)
     now = now_ts()
 
@@ -11192,15 +11161,8 @@ def _vaccine_fail_pct(target_id: int) -> int:
     )
     heavy = int(hrow["h"] if hrow and hrow["h"] is not None else 0)
 
-    if heavy <= qual:
-        return 0
-
-    pct = (heavy - qual) * 2
-    if pct > 90:
-        pct = 90
-    if pct < 0:
-        pct = 0
-    return int(pct)
+    _, p_fail = _calc_heaviness_success_fail_pct(heavy, qual)
+    return float(p_fail)
 
 def kb_vaccine_retry(uid: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup()
@@ -12666,6 +12628,46 @@ def cb_users_ui(cq):
         send_error_report("cb_users_ui", e)
         try:
             bot.answer_callback_query(cq.id, "Не удалось переключить страницу.")
+        except Exception:
+            pass
+
+@bot.callback_query_handler(func=lambda cq: (cq.data or "").startswith(f"{CHATSUI_TAG}:"))
+def cb_known_chats_ui(cq):
+    try:
+        page = _known_chats_parse_cb(cq.data or "")
+        if page is None:
+            bot.answer_callback_query(cq.id)
+            return
+
+        if not is_support(int(cq.from_user.id)):
+            bot.answer_callback_query(cq.id)
+            return
+
+        text, rm = render_known_chats_text(int(page))
+
+        if cq.inline_message_id:
+            limited_edit_message_text(
+                text=text,
+                inline_id=cq.inline_message_id,
+                parse_mode="HTML",
+                reply_markup=rm,
+                disable_web_page_preview=True
+            )
+        elif cq.message:
+            limited_edit_message_text(
+                text=text,
+                chat_id=cq.message.chat.id,
+                msg_id=cq.message.message_id,
+                parse_mode="HTML",
+                reply_markup=rm,
+                disable_web_page_preview=True
+            )
+
+        bot.answer_callback_query(cq.id)
+    except Exception as e:
+        send_error_report("cb_known_chats_ui", e)
+        try:
+            bot.answer_callback_query(cq.id, "Не удалось открыть список чатов.")
         except Exception:
             pass
 
@@ -15753,6 +15755,12 @@ def observe_seen_users(message):
     try:
         if (getattr(message.chat, "type", "") or "").lower() in ("group", "supergroup"):
             if not is_channel_sender_message(message):
+                remember_bot_group_chat(
+                    int(message.chat.id),
+                    title=(getattr(message.chat, "title", "") or ""),
+                    chat_type=(getattr(message.chat, "type", "") or "group"),
+                    is_active=1
+                )
                 u = getattr(message, "from_user", None)
                 if u and not bool(getattr(u, "is_bot", False)):
                     remember_chat_member(int(message.chat.id), u)
