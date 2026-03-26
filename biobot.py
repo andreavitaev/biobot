@@ -788,9 +788,11 @@ def autoanswer_trigger(defender_id: int, organizer_id: int, chat_id: int, reply_
                 "VALUES (?,?,?,?,?,?,1,?,1) "
                 "ON CONFLICT(attacker_id,target_id) DO UPDATE SET "
                 "start_ts=excluded.start_ts, end_ts=excluded.end_ts, "
+                "add_bio_res=excluded.add_bio_res, "
                 "next_payout_ts=excluded.next_payout_ts, counted=1, pathogen_name=excluded.pathogen_name, known_to_target=1",
                 (defender_id, organizer_id, now, end_ts, gained, next_payout, pathogen_name)
             )
+
             c.execute(
                 "INSERT OR IGNORE INTO infection_seen(attacker_id,target_id) VALUES (?,?)",
                 (defender_id, organizer_id)
@@ -8146,7 +8148,7 @@ def render_lab_infected_list(owner_id: int) -> str:
         lines.append("")
         lines.append(f"Общее число заражённых: 👥 {total_cnt} (+{last24_cnt})")
         res_word = _ru_form(total_daily_res, 'био-ресурс', 'био-ресурса', 'био-ресурсов')
-        lines.append(f"Число получаемых био-ресурсов: 🧬 +{total_daily_res} {res_word}")
+        lines.append(f"🧬 +{total_daily_res} {res_word}")
         return "\n".join(lines)
 
     items = []
@@ -8166,7 +8168,7 @@ def render_lab_infected_list(owner_id: int) -> str:
     lines.append("")
     lines.append(f"Общее число заражённых: 👥 {total_cnt} (+{last24_cnt})")
     total_res_word = _ru_form(total_daily_res, "био-ресурс", "био-ресурса", "био-ресурсов")
-    lines.append(f"Число получаемых био-ресурсов: 🧬 +{total_daily_res} {total_res_word}")
+    lines.append(f"🧬 +{total_daily_res} {total_res_word}")
     return "\n".join(lines)
 
 def render_lab_diseases_list(owner_id: int) -> str:
@@ -13568,6 +13570,7 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
                             "VALUES (?,?,?,?,?,?,1,?,0) "
                             "ON CONFLICT(attacker_id,target_id) DO UPDATE SET "
                             "start_ts=excluded.start_ts, end_ts=excluded.end_ts, "
+                            "add_bio_res=excluded.add_bio_res, "
                             "next_payout_ts=excluded.next_payout_ts, counted=1, pathogen_name=excluded.pathogen_name",
                             (attacker_id, int(target_id), now, end_ts, gained, next_payout, (pathogen_name or "").strip())
                         )
@@ -13735,12 +13738,13 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
             return
 
         if success:
+            exp_word = _ru_form(int(gained), "био-опыт", "био-опыта", "био-опыта")
             txt = (
                 header +
                 f"🦠 {attacker_tag} подверг заражению {_pat_for_text((pathogen_name or '').strip())} {target_tag}\n"
                 f"☠️ Горячка на {_format_hm_from_seconds(fever_add)}\n"
                 f"🤒 Заражение на {_format_days(inf_days)}\n"
-                f"☣️ +{gained} био-опыт"
+                f"☣️ +{_fmt_k(int(gained))} {exp_word}"
             )
             if first_time:
                 txt += (
@@ -14061,9 +14065,11 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
                     "VALUES (?,?,?,?,?,?,1,?,0) "
                     "ON CONFLICT(attacker_id,target_id) DO UPDATE SET "
                     "start_ts=excluded.start_ts, end_ts=excluded.end_ts, "
+                    "add_bio_res=excluded.add_bio_res, "
                     "next_payout_ts=excluded.next_payout_ts, counted=1, pathogen_name=excluded.pathogen_name",
                     (attacker_id, int(tid), now, end_ts, gained, next_payout, (pathogen_name or "").strip())
                 )
+
                 c.execute(
                     "INSERT INTO infection_cooldowns(attacker_id,target_id,until_ts) VALUES (?,?,?) "
                     "ON CONFLICT(attacker_id,target_id) DO UPDATE SET until_ts=excluded.until_ts",
@@ -14181,12 +14187,12 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
             return
 
         if last_success:
-            bio_word = _ru_form(last_gained, "био-опыт", "био-опыта", "био-опыта")
+            exp_word = _ru_form(int(gained), "био-опыт", "био-опыта", "био-опыта")
             txt = (
                 f"🦠 {attacker_tag} подверг заражению {_pat_for_text((pathogen_name or '').strip())} {single_target_tag}\n"
                 f"☠️ Горячка на {_format_hm_from_seconds(fever_add)}\n"
                 f"🤒 Заражение на {_format_days(inf_days)}\n"
-                f"☣️ +{last_gained} {bio_word}"
+                f"☣️ +{_fmt_k(int(gained))} {exp_word}"
             )
             if last_first_time or last_dummy:
                 txt += (
