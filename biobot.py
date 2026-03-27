@@ -367,8 +367,8 @@ def render_personal_rp_list_text(user_id: int) -> str:
             )
         lines.append("</blockquote>")
 
-    lines.append("💬 Чтобы создать личную рп команду, введите\n<code>+Мрп</code> <b>[название] / [эмодзи] [айди премиум эмодзи (не обязятельно)] / [текст рп действия]</b>")
-    lines.append("Чтобы удалить личную рп команду — <code>-Мрп</code> <b>[название / номер]</b>")
+    lines.append("💬 Чтобы создать личную рп команду, введите\n\"<code>+Мрп</code>\" <b>[название] / [эмодзи] [айди премиум эмодзи (не обязятельно)] / [текст рп действия]</b>")
+    lines.append("Чтобы удалить личную рп команду — \"<code>-Мрп</code>\" <b>[название / номер]</b>")
 
     return "\n".join(lines)
 
@@ -543,7 +543,7 @@ def render_autoanswer_status(uid: int) -> str:
         f"Статус: {status_icon}\n"
         f"✅Доступно авто-ответов: {avail}/{limit}\n"
         f"⏱️Сбросится через {_format_hm_from_seconds(left)}\n\n"
-        "💬Для увеличения лимита автоответов, используйте команду <code>Био +предотвращение</code>"
+        "💬Для увеличения лимита автоответов, используйте команду \"<code>Био +предотвращение</code>\""
     )
 
 def _auto_mark_used_report(uid: int, chat_id: int, msg_id: int) -> bool:
@@ -791,6 +791,12 @@ def autoanswer_trigger(defender_id: int, organizer_id: int, chat_id: int, reply_
                 "add_bio_res=excluded.add_bio_res, "
                 "next_payout_ts=excluded.next_payout_ts, counted=1, pathogen_name=excluded.pathogen_name, known_to_target=1",
                 (defender_id, organizer_id, now, end_ts, gained, next_payout, pathogen_name)
+            )
+
+            c.execute(
+                "INSERT INTO infection_cooldowns(attacker_id,target_id,until_ts) VALUES (?,?,?) "
+                "ON CONFLICT(attacker_id,target_id) DO UPDATE SET until_ts=excluded.until_ts",
+                (defender_id, organizer_id, now + REINFECT_CD_SEC)
             )
 
             c.execute(
@@ -1045,8 +1051,8 @@ PREMIUM_EMOJI_IDS: Dict[str, str] = {
     "💥": "5197414236413786044",
     "🦠": "5451936901772616837",
     "☠️": "5370842086658546991",
-    "🧿": "5296426834748002089",
-    "🛡️": "5210988351703771812",
+    "🧿": "5348470396582665977",
+    "🛡️": "5348259539458236641",
     "⚗️": "5262680005393025261",
     "💉": "5472317878801800869",
     "🧪": "5411512278740640309",
@@ -1094,7 +1100,7 @@ PREMIUM_EMOJI_IDS: Dict[str, str] = {
     "🎁": "5199749070830197566",
     "🔹": "5258255531948146531",
     "💬": "5255727011686553638",
-    "👋": "5208853155957209306",
+    "👋": "5348172574960427760",
     "⚙️": "5445347129155419150",
 }
 _RAW_INLINE_KEYBOARD_BUTTON = InlineKeyboardButton
@@ -1472,15 +1478,71 @@ def _premiumize_caption_kwargs(kwargs: dict) -> dict:
         kwargs["caption"] = premiumize_html_text(kwargs["caption"])
     return kwargs
 
+def _is_send_text_forbidden_error(exc: Exception) -> bool:
+    s = str(exc or "").lower()
+    return (
+        "not enough rights to send text messages to the chat" in s
+        or "have no rights to send a message" in s
+        or "chat_write_forbidden" in s
+    )
+
+def _try_send_result_to_pm_from_message(message, text, *args, **kwargs):
+    try:
+        u = getattr(message, "from_user", None)
+        if not u or not getattr(u, "id", None):
+            return None
+
+        pm_kwargs = dict(kwargs)
+        pm_kwargs.pop("reply_parameters", None)
+        pm_kwargs.pop("reply_to_message_id", None)
+
+        msg = _REAL_BOT_SEND_MESSAGE(
+            int(u.id),
+            _premium_text_payload(text),
+            *args,
+            **pm_kwargs
+        )
+        remember_bot_message_for_autodelete(msg)
+        return msg
+    except Exception:
+        return None
+
 def _bot_send_message_premium(chat_id, text, *args, **kwargs):
     msg = _REAL_BOT_SEND_MESSAGE(chat_id, _premium_text_payload(text), *args, **kwargs)
     remember_bot_message_for_autodelete(msg)
     return msg
 
 def _bot_reply_to_premium(message, text, *args, **kwargs):
-    msg = _REAL_BOT_REPLY_TO(message, _premium_text_payload(text), *args, **kwargs)
-    remember_bot_message_for_autodelete(msg)
-    return msg
+    try:
+        send_kwargs = dict(kwargs)
+
+        if "reply_parameters" in send_kwargs:
+            send_kwargs.pop("reply_parameters", None)
+
+        if "reply_to_message_id" not in send_kwargs:
+            mid = int(getattr(message, "message_id", 0) or 0)
+            if mid > 0:
+                send_kwargs["reply_to_message_id"] = mid
+
+        msg = _REAL_BOT_SEND_MESSAGE(
+            int(message.chat.id),
+            _premium_text_payload(text),
+            *args,
+            **send_kwargs
+        )
+        remember_bot_message_for_autodelete(msg)
+        return msg
+
+    except Exception as e:
+        chat_type = (getattr(getattr(message, "chat", None), "type", "") or "").lower()
+
+        if chat_type in ("group", "supergroup") and _is_send_text_forbidden_error(e):
+            pm_msg = _try_send_result_to_pm_from_message(message, text, *args, **kwargs)
+            if pm_msg is not None:
+                return pm_msg
+            return None
+
+        raise
 
 def _bot_edit_message_text_premium(text, *args, **kwargs):
     return _REAL_BOT_EDIT_MESSAGE_TEXT(_premium_text_payload(text), *args, **kwargs)
@@ -2614,7 +2676,7 @@ def build_lab_deleted_text() -> str:
     return (
         "❎ Вы исключили себя из участия в мини-игре «Био-атака»\n\n"
         "💬 У Вас есть 3 дня на восстановление Лаборатории. "
-        "Команда <code>Био восстановить лабу</code>\n"
+        "Команда \"<code>Био восстановить лабу</code>\"\n"
         f"Для отслеживания состояния лаборатории перейдите в {_bot_pm_link_html()}"
     )
 
@@ -3885,7 +3947,7 @@ def _corp_invite_resolve(invite_id: int, actor_id: int, accepted: bool) -> tuple
     except Exception:
         pass
 
-    return True, "❎ Приглашение отклонено."
+    return True, "🗑️ Приглашение отклонено."
 
 def kb_corp_info(corp_id: int, viewer_id: int, is_member: bool) -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup(row_width=2)
@@ -6180,6 +6242,20 @@ def strict_single_target_args_ok(message, parsed: Optional["Parsed"], *, allow_e
 
     return _strict_single_target_token(toks[0]) is not None
 
+def strict_single_numeric_arg_ok(parsed: Optional["Parsed"]) -> bool:
+    args = (parsed.args or "").strip() if parsed else ""
+    if not args:
+        return False
+    toks = args.split()
+    return len(toks) == 1 and toks[0].isdigit()
+
+def strict_single_word_arg_ok(parsed: Optional["Parsed"]) -> bool:
+    args = (parsed.args or "").strip() if parsed else ""
+    if not args:
+        return False
+    toks = args.split()
+    return len(toks) == 1
+
 def is_bot_target(target_id: Optional[int], target_user_obj, token: str = "") -> bool:
     try:
         my_bot_id = int(getattr(_me, "id", 0) or 0)
@@ -6251,6 +6327,35 @@ def has_explicit_bot_prefix(text: str) -> bool:
     if s.startswith("/") or s.startswith("."):
         return True
     return bool(re.match(r"^(био|бот)\s+", s, flags=re.IGNORECASE))
+
+def leading_sign_after_bot_prefix(text: str) -> str:
+    s = normalize(text or "").strip()
+    if not s:
+        return ""
+
+    s = strip_bio_prefix(s).lstrip()
+    if not s:
+        return ""
+
+    if s.startswith("++"):
+        return "+"
+    if s[0] in "+-":
+        return s[0]
+    return ""
+
+SIGNED_COMMANDS_ALLOWED = {
+    "timer_add_rel", "timer_add_abs", "timer_add_cycle", "timer_delete", "timer_clear_all",
+    "chat_autodel_set", "chat_autodel_off",
+    "balance_show", "balance_hide", "lab_show", "lab_hide",
+    "notify_on", "notify_off",
+    "mrp_add", "mrp_delete",
+    "autoanswer_on", "autoanswer_off",
+    "corp_open", "corp_close",
+    "corp_deputy", "corp_deputy_remove",
+    "labname_clear", "pathogenname_clear",
+    "name_lock_lab", "name_lock_pat",
+    "upgrade_preview", "upgrade_buy",
+}
 
 def parse_message_as_command(text: str) -> Optional[Parsed]:
     if not text:
@@ -6954,7 +7059,7 @@ def build_start_text(user) -> str:
     lines.append(f'📑 Список всех команд <a href="{h(URL_COMMANDS)}">с их описанием</a>')
     lines.append(f'📑 Чат <a href="{h(URL_SUPPORT_CHAT)}">тех.поддержки</a>')
     lines.append(f'📑 Основной <a href="{h(URL_DEV_CHANNEL)}">канал разработки бота</a>')
-    lines.append(f'💬 Для повторного вызова агент-листа, введите в чат <code>.помощь</code>')
+    lines.append(f'💬 Для повторного вызова агент-листа, введите в чат \"<code>.помощь</code>\"')
 
 
     return "\n".join(lines)
@@ -7453,7 +7558,7 @@ def handle_admin_name_restriction_command(message, parsed: Parsed):
         set_name_restriction(int(target_id), "lab", locked, int(uid), reason)
         bot.reply_to(
             message,
-            f"✅ Для пользователя <code>{int(target_id)}</code> {'запрещено' if locked == 1 else 'разрешено'} менять имя лаборатории.",
+            f"✅ Пользователю <code>{int(target_id)}</code> {'запрещено' if locked == 1 else 'разрешено'} менять имя лаборатории.",
             parse_mode="HTML"
         )
         return
@@ -7462,7 +7567,7 @@ def handle_admin_name_restriction_command(message, parsed: Parsed):
     set_name_restriction(int(target_id), "pat", locked, int(uid), reason)
     bot.reply_to(
         message,
-        f"✅ Для пользователя <code>{int(target_id)}</code> {'запрещено' if locked == 1 else 'разрешено'} менять имя патогена.",
+        f"✅ Пользователю <code>{int(target_id)}</code> {'запрещено' if locked == 1 else 'разрешено'} менять имя патогена.",
         parse_mode="HTML"
     )
 
@@ -8508,7 +8613,7 @@ def render_auto_delete_status(chat_id: int, chat_title: str) -> str:
     return (
         f"🔏 Авто-удаление сообщений чата <b>{h(chat_title)}</b>\n"
         f"{val}\n\n"
-        f"💬 Чтобы изменить время, введите <code>Био +автоудаление</code> + период"
+        f"💬 Чтобы изменить время, введите \"<code>Био +автоудаление</code> + период\""
     )
 
 # Таймеры
@@ -8856,7 +8961,7 @@ def render_timer_list_text(user_id: int) -> str:
     lines.append("")
 
     if not rows:
-        lines.append("Список пока пуст.")
+        lines.append("<blockquote>Список пока пуст.</blockquote>")
     else:
         lines.append("<blockquote expandable>")
         for i, row in enumerate(rows, 1):
@@ -8866,7 +8971,7 @@ def render_timer_list_text(user_id: int) -> str:
         lines.append("</blockquote>")
 
     lines.append("")
-    lines.append("💬 Вы можете создать таймер командой <code>таймер через {период}</code>, <code>таймер на {период}</code> или <code>таймер цикл {число срабатываний} {период}</code> и далее ввести текст команды на исполнения")
+    lines.append("💬 Вы можете создать таймер командами:\n\"<code>таймер через</code> {период}\"\n\"<code>таймер на</code> {период}\"\n\"<code>таймер цикл</code> {число срабатываний} {период}\"\nи далее ввести текст команды на исполнения")
     return "\n".join(lines)
 
 def _make_fake_timer_message(user_id: int, chat_id: int, text: str):
@@ -10369,7 +10474,7 @@ def _build_upgrade_preview(uid: int, code: str, steps: int) -> str:
         f"{skill['emoji']} {h(skill['title_1'])} на {steps} ур ({final_lvl})\n"
         f"{extra_lines}"
         f"🏷️ Цена: 🧬 <b>{_ru_dots(price)}</b> ({_fmt_k(price)})\n\n"
-        f"💬 Чтобы подтвердить усиление навыка, введите команду <code>Био ++{h(skill['title_2'])} {steps}</code>"
+        f"💬 Чтобы подтвердить усиление навыка, введите команду \"<code>Био ++{h(skill['title_2'])} {steps}</code>\""
     )
 
 def _execute_upgrade(uid: int, code: str, steps: int):
@@ -10544,10 +10649,16 @@ STRICT_NO_EXTRA_ARGS_CMDS = {
     "buy_vaccine", "use_vaccine",
     "lab_delete", "restore_lab",
     "corp_delete", "corp_open", "corp_close",
-    "corp_req_list", "corp_leave",
+    "corp_req_list", "corp_leave", "corp_my",
     "rp_stats",
     "blacklist", "users_list", "agents_panel",
     "synth",
+    "balance_show", "balance_hide", "lab_show", "lab_hide",
+    "notify_on", "notify_off",
+    "promo_generate", "promo_all",
+    "chat_autodel_status", "chat_autodel_off",
+    "timer_list", "timer_clear_all",
+    "cof_inf_stats",
 }
 
 CALC_UPGRADE_PUBLIC_VARS = [
@@ -11205,7 +11316,7 @@ def render_balance(user_id: int) -> str:
         f"🧬 {_fmt_k(all_bio_res)} {res_word}\n"
         f"💊 {_fmt_k(all_bio_mater)} {mat_word}\n"
         f"{pts_line}"
-        f"💬 Запасы можно пополнить командой <code>Синтез</code>"
+        f"💬 Запасы можно пополнить командой \"<code>Синтез</code>\""
     )
 
 def _balui_data(uid: int, act: str) -> str:
@@ -11313,8 +11424,8 @@ def _vaccine_fail_pct(target_id: int) -> float:
     )
     heavy = int(hrow["h"] if hrow and hrow["h"] is not None else 0)
 
-    _, p_fail = _calc_heaviness_success_fail_pct(heavy, qual)
-    return float(p_fail)
+    p_success, _ = _calc_heaviness_success_fail_pct(heavy, qual)
+    return float(p_success)
 
 def kb_vaccine_retry(uid: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup()
@@ -11638,7 +11749,7 @@ def on_new_chat_members(message):
                 f'<a href="{h(URL_COMMANDS)}">списком всех команд</a>.\n\n'
                 "⚪️ В целях безопасности от спама и стабильной работы в боте по умолчанию установлен лимит на ответ в 2-3 секунды\n"
                 "❗Для более корректной работы команд, рекомендую выдать мне приписку администратора. Права администратора выдавать не обязательно.\n\n"
-                f'Остались вопросы? Можете обратиться в <a href="{h(URL_SUPPORT_CHAT)}">наш официальный чат</a>'
+                f'Остались вопросы? Можете обратиться в <a href="{h(URL_SUPPORT_CHAT)}">наш официальный чат тех.поддержки</a>.'
             )
             bot.send_message(message.chat.id, txt, disable_web_page_preview=True)
     except Exception as e:
@@ -11803,7 +11914,7 @@ def cb_buy_vaccine(cq):
             rm.add(InlineKeyboardButton("💉 Использовать вакцину", callback_data=_cb_use_vaccine(uid)), style="primary")
             text = (
                 "💉 У вас нет необходимости покупать вакцину. Для быстрого выздоровления используйте вакцину\n"
-                "команда <code>Био использовать вакцину</code>"
+                "команда \"<code>Био использовать вакцину</code>\""
             )
             if cq.inline_message_id:
                 limited_edit_message_text(
@@ -11897,7 +12008,7 @@ def cb_use_vaccine(cq):
                 price_txt = _fmt_bio_res(get_vaccine_price(uid))
                 text = (
                     "💉 Сейчас у вас нет ни одной вакцины. Для быстрого выздоровления вы можете купить вакцину: "
-                    f"{price_txt}, команда <code>Био купить вакцину</code>"
+                    f"{price_txt}, команда \"<code>Био купить вакцину</code>\""
                 )
                 rm = InlineKeyboardMarkup()
                 rm.add(InlineKeyboardButton("💉 Купить вакцину", callback_data=_cb_buy_vaccine(uid), style="primary"))
@@ -11971,7 +12082,7 @@ def cb_use_vaccine_x(cq):
                 price_txt = _fmt_bio_res(get_vaccine_price(uid))
                 text = prefix + (
                     "💉 Сейчас у вас нет ни одной вакцины. Для быстрого выздоровления вы можете купить вакцину: "
-                    f"{price_txt}, команда <code>Био купить вакцину</code>"
+                    f"{price_txt}, команда \"<code>Био купить вакцину</code>\""
                 )
                 rm = InlineKeyboardMarkup()
                 rm.add(InlineKeyboardButton("💉 Купить вакцину", callback_data=_cb_buy_vaccine(uid), style="primary"))
@@ -13282,7 +13393,7 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
                 f"🌡️ У вас горячка, вызванная {_pat_for_fever(fever_pat)}. Придётся отлежаться, пока она не пройдёт\n"
                 f"Время выздоровления {_format_hms(left)}"
                 f"\n\n💉 Для быстрого выздоровления используйте вакцину\n"
-                f"команда <code>Био использовать вакцину</code>",
+                f"команда \"<code>Био использовать вакцину</code>\"",
                 reply_markup=kb
             )
         else:
@@ -13293,7 +13404,7 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
                 f"🌡️ У вас горячка, вызванная {_pat_for_fever(fever_pat)}. Придётся отлежаться, пока она не пройдёт\n"
                 f"Время выздоровления {_format_hms(left)}"
                 f"\n\n💉 Сейчас у вас нет ни одной вакцины. Для быстрого выздоровления вы можете купить вакцину: {price_txt}, "
-                f"команда <code>Био купить вакцину</code>",
+                f"команда \"<code>Био купить вакцину</code>\"",
                 reply_markup=kb
             )
         return
@@ -13391,7 +13502,7 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
             f"🧪 Ячеек для патогенов: {total_pathogens} | +1 = {pat_price_line}\n"
             f"👨‍🔬 Квалификация учёных: {qual} ур ({_format_hm_from_seconds(craft_sec)})\n"
             "💬 Вы также можете заказать дополнительные ячейки с патогенами в лабораторию командой "
-            "<code>Био +патоген</code> + количество необходимых ячеек",
+            "\"<code>Био +патоген</code>\" + количество необходимых ячеек",
             reply_markup=kb
         )
 
@@ -13436,7 +13547,7 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
             _emit(
                 "📝 Объект ещё не создал свою лабораторию.\n\n"
                 "💬 Вы можете первый раз заразить его только в общей с вами беседе.\n"
-                "Либо пригласите его присоединиться к мини-игре «Био-атака», попросив его ввести команду <code>Био лаб</code>"
+                "Либо пригласите его присоединиться к мини-игре «Био-атака», попросив его ввести команду \"<code>Био лаб</code>\""
             )
             return
 
@@ -14147,9 +14258,9 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
             known_cnt = _known_chat_member_count(int(chat_id), int(attacker_id))
             if known_cnt <= 0:
                 _emit(
-                    "📑 Бот пока не знает участников этого чата для команды <code>заразить чат</code>.\n\n"
-                    "d связи с ограничениями Telegram Bot API.\n"
-                    "💬 Для большей эффективности в запоминании новых пользователей, рекомаендую использовать команду <code>заразить</code> в ответ на сообщение другого игрока."
+                    "📑 Бот пока не знает участников этого чата для команды \"<code>заразить чат</code>.\"\n\n"
+                    "В связи с ограничениями Telegram Bot API.\n"
+                    "💬 Для большей эффективности в запоминании новых пользователей, рекомаендую использовать команду \"<code>заразить</code>\" в ответ на сообщение другого игрока."
                 )
             else:
                 _emit("📑 Подходящая цель в этом чате не найдена.")
@@ -14757,7 +14868,7 @@ def handle_corp_commands(message, parsed: Parsed):
         "corp_create", "corp_delete", "corp_open", "corp_close", "corp_reg", "corp_join",
         "corp_send_res", "corp_send_mat"
     ):
-        bot.reply_to(message, "📑 Сначала создайте лабораторию. Команда <code>Био лаб</code>.")
+        bot.reply_to(message, "📑 Сначала создайте лабораторию. Команда \"<code>Био лаб</code>\".")
         return
 
     my_cid, my_cname = get_user_corp_resolved(uid)
@@ -15006,7 +15117,7 @@ def handle_corp_commands(message, parsed: Parsed):
             return
 
         if sent_to_pm:
-            bot.reply_to(message, "📄 Приглашение отправлено игроку в личные сообщения.")
+            bot.reply_to(message, "📨 Приглашение отправлено игроку в личные сообщения.")
         return
 
     if parsed.cmd == "corp_deputy":
@@ -15142,7 +15253,7 @@ def handle_corp_commands(message, parsed: Parsed):
             return
 
         if int(target_id) == int(uid):
-            bot.reply_to(message, "📑 Нельзя исключить самого себя. Используйте команду <code>Био покинуть</code>.", parse_mode="HTML", disable_web_page_preview=True)
+            bot.reply_to(message, "📑 Нельзя исключить самого себя. Используйте команду \"<code>Био покинуть</code>\".", parse_mode="HTML", disable_web_page_preview=True)
             return
 
         if target_user_obj is not None:
@@ -15424,7 +15535,7 @@ def handle_corp_commands(message, parsed: Parsed):
                 bot.reply_to(
                     message,
                     "📑 Вы не состоите ни в одной Корпорации.\n"
-                    "Команда вступления <code>Био вступить</code> + название Корпорации",
+                    "Команда вступления \"<code>Био вступить</code> + название Корпорации\"",
                     parse_mode="HTML",
                     disable_web_page_preview=True
                 )
@@ -15461,7 +15572,7 @@ def handle_corp_commands(message, parsed: Parsed):
             nm = (corp["name"] or "").strip()
             text = (
                 f"🔒 Досье Корпорации {corp_name_display(nm)} недоступно для посторонних.\n"
-                f"Подайте заявку на вступление, команда <code>Био вступить {h(nm)}</code>"
+                f"Подайте заявку на вступление, команда \"<code>Био вступить {h(nm)}</code>\""
             )
             rm = kb_corp_info(int(corp["corp_id"]), viewer_id, False)
 
@@ -15562,7 +15673,7 @@ def _render_inline_corp_for_viewer(viewer_id: int, target_id: int) -> tuple[str,
         nm = (corp["name"] or "").strip()
         text = (
             f"🔒 Досье Корпорации {corp_name_display(nm)} недоступно для посторонних.\n"
-            f"Подайте заявку на вступление, команда <code>Био вступить {h(nm)}</code>"
+            f"Подайте заявку на вступление, команда \"<code>Био вступить {h(nm)}</code>\""
         )
         rm = kb_corp_info(int(corp["corp_id"]), int(viewer_id), False)
 
@@ -16007,8 +16118,21 @@ def text_router(message):
                 return
             return
 
+        sign0 = leading_sign_after_bot_prefix(message.text or "")
+        if sign0 and parsed.cmd not in SIGNED_COMMANDS_ALLOWED:
+            return
+
         if parsed.cmd in STRICT_NO_EXTRA_ARGS_CMDS and (parsed.args or "").strip():
             return
+        
+        if parsed.cmd in ("timer_delete",):
+            if not strict_single_numeric_arg_ok(parsed):
+                return
+
+        if parsed.cmd in ("promo_delete", "promo_use", "bot_ban", "bot_unban", "remake_lab", "edit_k", "edit_b"):
+            if not strict_single_word_arg_ok(parsed):
+                return
+
         if parsed.cmd in (
             "top_users", "top_users_chat",
             "top_diseases", "top_diseases_chat",
@@ -16218,7 +16342,7 @@ def text_router(message):
                 bot.reply_to(
                     message,
                     f"💉 Сейчас у вас нет ни одной вакцины. Для быстрого выздоровления вы можете купить вакцину: {price_txt}, "
-                    f"команда <code>Био купить вакцину</code>",
+                    f"команда \"<code>Био купить вакцину</code>\"",
                     disable_web_page_preview=True,
                     reply_markup=kb
                 )
@@ -16242,7 +16366,7 @@ def text_router(message):
                 bot.reply_to(
                     message,
                     "💉 У вас нет необходимости покупать вакцину.  Для быстрого выздоровления используйте вакцину\n"
-                    "команда <code>Био использовать вакцину</code>",
+                    "команда \"<code>Био использовать вакцину</code>\"",
                     disable_web_page_preview=True,
                     reply_markup=kb
                 )
