@@ -10,6 +10,7 @@ import random
 import sqlite3
 import calendar
 import itertools
+import functools
 import threading
 import traceback
 import unicodedata
@@ -95,6 +96,11 @@ RP_ACTIONS_PATH = os.path.join(DATA_DIR, "rp_actions.txt")
 _RP_ACTIONS_CACHE: Optional[dict] = None
 _RP_ACTIONS_CACHE_MTIME: float = -1.0
 
+# Miss texts
+DUEL_MISALIGN_PATH = os.path.join(DATA_DIR, "misalign.txt")
+_DUEL_MISALIGN_CACHE: Optional[list[str]] = None
+_DUEL_MISALIGN_CACHE_MTIME: float = -1.0
+
 # emoji pack viewer cache
 EMOJI_PACK_PAGE_SIZE = 50
 _EMOJI_PACK_VIEW_CACHE: Dict[str, dict] = {}
@@ -127,6 +133,44 @@ def pick_random_event_text() -> str:
         return random.choice(items)
     except Exception:
         return "Произошёл непредвиденный сбой во время операции."
+
+def load_duel_misalign_texts() -> list[str]:
+    global _DUEL_MISALIGN_CACHE, _DUEL_MISALIGN_CACHE_MTIME
+
+    try:
+        mtime = float(os.path.getmtime(DUEL_MISALIGN_PATH))
+    except Exception:
+        mtime = -1.0
+
+    if _DUEL_MISALIGN_CACHE is not None and mtime == _DUEL_MISALIGN_CACHE_MTIME:
+        return _DUEL_MISALIGN_CACHE
+
+    items: list[str] = []
+    try:
+        with open(DUEL_MISALIGN_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                s = (line or "").strip()
+                if not s or s.startswith("#"):
+                    continue
+                items.append(s)
+    except Exception:
+        pass
+
+    if not items:
+        items = [
+            "внезапным манёвром сбил концентрацию соперника",
+        ]
+
+    _DUEL_MISALIGN_CACHE = items
+    _DUEL_MISALIGN_CACHE_MTIME = mtime
+    return items
+
+def pick_duel_misalign_text() -> str:
+    items = load_duel_misalign_texts()
+    try:
+        return random.choice(items)
+    except Exception:
+        return "ловко сбил концентрацию соперника"
 
 def load_rp_actions() -> dict:
     global _RP_ACTIONS_CACHE, _RP_ACTIONS_CACHE_MTIME
@@ -827,6 +871,36 @@ DB_LOCK = threading.RLock()
 # BOT threaded
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML", threaded=True, num_threads=8)
 
+_ORIG_BOT_CALLBACK_QUERY_HANDLER = bot.callback_query_handler
+
+def _callback_chat_name_ctx_chat_id(cq) -> int:
+    try:
+        msg = getattr(cq, "message", None)
+        chat = getattr(msg, "chat", None)
+        return int(getattr(chat, "id", 0) or 0)
+    except Exception:
+        return 0
+
+def _wrap_callback_with_chat_name_context(fn):
+    @functools.wraps(fn)
+    def _wrapped(cq, *args, **kwargs):
+        set_chat_name_context(_callback_chat_name_ctx_chat_id(cq))
+        try:
+            return fn(cq, *args, **kwargs)
+        finally:
+            clear_chat_name_context()
+    return _wrapped
+
+def _callback_query_handler_with_chat_name_context(*handler_args, **handler_kwargs):
+    decorator = _ORIG_BOT_CALLBACK_QUERY_HANDLER(*handler_args, **handler_kwargs)
+
+    def _decorator(fn):
+        return decorator(_wrap_callback_with_chat_name_context(fn))
+
+    return _decorator
+
+bot.callback_query_handler = _callback_query_handler_with_chat_name_context
+
 @dataclass
 class _EditJob:
     due: float
@@ -1405,16 +1479,109 @@ def _is_decorative_only_name(s: str) -> bool:
 
     return True
 
-def display_name(first_name: str, last_name: str, username: str, user_id: int) -> str:
+# имена в боте
+_CHAT_USER_NAME_MAX_LEN = 20
+_CHAT_NAME_CTX = threading.local()
+
+def _chat_name_ctx_chat_id() -> int:
+    try:
+        return int(getattr(_CHAT_NAME_CTX, "chat_id", 0) or 0)
+    except Exception:
+        return 0
+
+def _chat_name_ctx_force_standard() -> bool:
+    return bool(getattr(_CHAT_NAME_CTX, "force_standard", False))
+
+def set_chat_name_context(chat_id: int = 0, *, force_standard: bool = False):
+    _CHAT_NAME_CTX.chat_id = int(chat_id or 0)
+    _CHAT_NAME_CTX.force_standard = bool(force_standard)
+
+def clear_chat_name_context():
+    _CHAT_NAME_CTX.chat_id = 0
+    _CHAT_NAME_CTX.force_standard = False
+
+class chat_name_context:
+    def __init__(self, chat_id: int = 0, *, force_standard: bool = False):
+        self.chat_id = int(chat_id or 0)
+        self.force_standard = bool(force_standard)
+        self.prev_chat_id = 0
+        self.prev_force_standard = False
+
+    def __enter__(self):
+        self.prev_chat_id = _chat_name_ctx_chat_id()
+        self.prev_force_standard = _chat_name_ctx_force_standard()
+        set_chat_name_context(self.chat_id, force_standard=self.force_standard)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        set_chat_name_context(self.prev_chat_id, force_standard=self.prev_force_standard)
+        return False
+
+def _normalize_chat_user_name(name: str) -> str:
+    return str(name or "").replace("\r", " ").replace("\n", " ").strip()
+
+def get_chat_user_name(chat_id: int, user_id: int) -> str:
+    if int(chat_id or 0) == 0 or int(user_id or 0) == 0:
+        return ""
+    row = db_one(
+        "SELECT display_name FROM chat_user_names WHERE chat_id=? AND user_id=? LIMIT 1",
+        (int(chat_id), int(user_id))
+    )
+    if not row:
+        return ""
+    return (row["display_name"] or "").strip()
+
+def set_chat_user_name(chat_id: int, user_id: int, name: str):
+    nm = _normalize_chat_user_name(name)
+    ts = int(now_ts())
+    db_exec(
+        "INSERT INTO chat_user_names(chat_id, user_id, display_name, created_at, updated_at) "
+        "VALUES (?,?,?,?,?) "
+        "ON CONFLICT(chat_id, user_id) DO UPDATE SET "
+        "display_name=excluded.display_name, updated_at=excluded.updated_at",
+        (int(chat_id), int(user_id), nm, ts, ts),
+        commit=True
+    )
+
+def clear_chat_user_name(chat_id: int, user_id: int):
+    db_exec(
+        "DELETE FROM chat_user_names WHERE chat_id=? AND user_id=?",
+        (int(chat_id), int(user_id)),
+        commit=True
+    )
+
+def _chat_user_name_is_invalid(name: str) -> bool:
+    nm = _normalize_chat_user_name(name)
+    if not nm:
+        return True
+    if len(nm) > _CHAT_USER_NAME_MAX_LEN:
+        return True
+    return _is_transparent_or_zalgo_only_name(nm)
+
+def standard_display_name(first_name: str, last_name: str, username: str, user_id: int) -> str:
     full = _strip_invisible(((first_name or "").strip() + " " + (last_name or "").strip())).strip()
     if full and (not _is_bad_single_char_name(full)) and (not _is_decorative_only_name(full)):
         return full
 
-    un = _strip_invisible(username or "")  # username без "@"
+    un = _strip_invisible(username or "")
     if un:
         return un
 
     return str(int(user_id))
+
+def display_name(first_name: str, last_name: str, username: str, user_id: int) -> str:
+    base = standard_display_name(first_name, last_name, username, user_id)
+
+    if _chat_name_ctx_force_standard():
+        return base
+
+    chat_id = _chat_name_ctx_chat_id()
+    if chat_id != 0:
+        alias = get_chat_user_name(chat_id, int(user_id))
+        if alias:
+            return alias
+
+    return base
 
 def user_full_name(u) -> str:
     return display_name(
@@ -1484,6 +1651,19 @@ def _is_send_text_forbidden_error(exc: Exception) -> bool:
         "not enough rights to send text messages to the chat" in s
         or "have no rights to send a message" in s
         or "chat_write_forbidden" in s
+    )
+
+def _is_transient_telegram_network_error(exc: Exception) -> bool:
+    s = str(exc or "").lower()
+    return (
+        "network is unreachable" in s
+        or "failed to establish a new connection" in s
+        or "max retries exceeded" in s
+        or "connectionerror" in s
+        or "read timed out" in s
+        or "connect timeout" in s
+        or "remotedisconnected" in s
+        or "remote end closed connection without response" in s
     )
 
 def _try_send_result_to_pm_from_message(message, text, *args, **kwargs):
@@ -1908,6 +2088,11 @@ def _housekeeping_daemon():
                 except Exception as e:
                     send_error_report("_corp_invite_expire", e)
 
+            try:
+                _duel_housekeeping_once(int(now))
+            except Exception as e:
+                send_error_report("_duel_housekeeping_once", e)
+
             purge_deleted_db(now)
             _run_due_timers(now)
             run_chat_autodelete_once()
@@ -1928,7 +2113,8 @@ def init_db():
         notify_chat_id  INTEGER DEFAULT 0,
         notify_off      INTEGER DEFAULT 0,
         last_seen       INTEGER DEFAULT 0,
-        is_placeholder  INTEGER DEFAULT 0
+        is_placeholder  INTEGER DEFAULT 0,
+        is_bot          INTEGER DEFAULT 0
     );
     """, commit=True)
 
@@ -2084,6 +2270,90 @@ def init_db():
     """, commit=True)
 
     db_exec("""
+    CREATE TABLE IF NOT EXISTS duel_invites (
+        invite_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id        INTEGER NOT NULL,
+        challenger_id  INTEGER NOT NULL,
+        target_id      INTEGER NOT NULL,
+        stake_amount   INTEGER NOT NULL DEFAULT 0,
+        created_at     INTEGER NOT NULL DEFAULT 0,
+        expires_at     INTEGER NOT NULL DEFAULT 0,
+        status         TEXT NOT NULL DEFAULT 'pending', -- pending|accepted|declined|expired|superseded|cancelled
+        msg_chat_id    INTEGER NOT NULL DEFAULT 0,
+        msg_id         INTEGER NOT NULL DEFAULT 0
+    );
+    """, commit=True)
+
+    db_exec("""
+    CREATE TABLE IF NOT EXISTS duels (
+        duel_id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        invite_id            INTEGER NOT NULL DEFAULT 0,
+        chat_id              INTEGER NOT NULL,
+        challenger_id        INTEGER NOT NULL,
+        target_id            INTEGER NOT NULL,
+        stake_amount         INTEGER NOT NULL DEFAULT 0,
+        started_at           INTEGER NOT NULL DEFAULT 0,
+        next_action_until    INTEGER NOT NULL DEFAULT 0,
+        current_turn_user_id INTEGER NOT NULL DEFAULT 0,
+        turns_done           INTEGER NOT NULL DEFAULT 0,
+        challenger_aim_bonus INTEGER NOT NULL DEFAULT 0,
+        target_aim_bonus     INTEGER NOT NULL DEFAULT 0,
+        status               TEXT NOT NULL DEFAULT 'active', -- active|finished|cancelled|draw
+        winner_id            INTEGER NOT NULL DEFAULT 0,
+        loser_id             INTEGER NOT NULL DEFAULT 0,
+        msg_chat_id          INTEGER NOT NULL DEFAULT 0,
+        msg_id               INTEGER NOT NULL DEFAULT 0,
+        ended_at             INTEGER NOT NULL DEFAULT 0
+    );
+    """, commit=True)
+
+    db_exec("""
+    CREATE TABLE IF NOT EXISTS duel_bets (
+        bet_id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        duel_id        INTEGER NOT NULL,
+        chat_id        INTEGER NOT NULL,
+        bettor_id      INTEGER NOT NULL,
+        candidate_id   INTEGER NOT NULL,
+        amount         INTEGER NOT NULL DEFAULT 0,
+        created_at     INTEGER NOT NULL DEFAULT 0,
+        status         TEXT NOT NULL DEFAULT 'active' -- active|paid|refunded|lost
+    );
+    """, commit=True)
+
+    db_exec("""
+    CREATE TABLE IF NOT EXISTS duel_stats (
+        user_id             INTEGER PRIMARY KEY,
+        wins                INTEGER NOT NULL DEFAULT 0,
+        draws               INTEGER NOT NULL DEFAULT 0,
+        losses              INTEGER NOT NULL DEFAULT 0,
+        max_win_materials   INTEGER NOT NULL DEFAULT 0,
+        max_lose_materials  INTEGER NOT NULL DEFAULT 0,
+        win_streak          INTEGER NOT NULL DEFAULT 0,
+        best_win_streak     INTEGER NOT NULL DEFAULT 0
+    );
+    """, commit=True)
+
+    try:
+        db_exec("CREATE INDEX IF NOT EXISTS idx_duel_invites_target_chat ON duel_invites(chat_id, target_id, status, invite_id DESC);", commit=True)
+    except Exception:
+        pass
+
+    try:
+        db_exec("CREATE INDEX IF NOT EXISTS idx_duel_invites_challenger_chat ON duel_invites(chat_id, challenger_id, status, invite_id DESC);", commit=True)
+    except Exception:
+        pass
+
+    try:
+        db_exec("CREATE INDEX IF NOT EXISTS idx_duels_chat_status ON duels(chat_id, status, duel_id DESC);", commit=True)
+    except Exception:
+        pass
+
+    try:
+        db_exec("CREATE INDEX IF NOT EXISTS idx_duel_bets_duel ON duel_bets(duel_id, candidate_id, status);", commit=True)
+    except Exception:
+        pass
+
+    db_exec("""
     CREATE TABLE IF NOT EXISTS report_state (
         user_id     INTEGER PRIMARY KEY,
         category    TEXT NOT NULL DEFAULT '',
@@ -2137,6 +2407,17 @@ def init_db():
         pat_by             INTEGER NOT NULL DEFAULT 0,
         pat_at             INTEGER NOT NULL DEFAULT 0,
         pat_reason         TEXT NOT NULL DEFAULT ''
+    );
+    """, commit=True)
+
+    db_exec("""
+    CREATE TABLE IF NOT EXISTS chat_user_names (
+        chat_id       INTEGER NOT NULL,
+        user_id       INTEGER NOT NULL,
+        display_name  TEXT NOT NULL DEFAULT '',
+        created_at    INTEGER NOT NULL DEFAULT 0,
+        updated_at    INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (chat_id, user_id)
     );
     """, commit=True)
 
@@ -2269,8 +2550,10 @@ def init_db():
     # миграции users
     for sql in (
         "ALTER TABLE users ADD COLUMN notify_chat_id INTEGER DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN pm_opened INTEGER DEFAULT 0",
         "ALTER TABLE users ADD COLUMN notify_off INTEGER DEFAULT 0",
         "ALTER TABLE users ADD COLUMN is_placeholder INTEGER DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN is_bot INTEGER DEFAULT 0",
     ):
         try:
             db_exec(sql, commit=True)
@@ -2998,20 +3281,23 @@ def _restore_deleted_lab(user_id: int, *, support_mode: bool = False) -> tuple[b
 
 def upsert_user(tg_user):
     db_exec("""
-        INSERT INTO users(user_id, username, first_name, last_name, last_seen, is_placeholder)
-        VALUES(?,?,?,?,?,0)
+        INSERT INTO users(user_id, username, first_name, last_name, last_seen, is_placeholder, is_bot)
+        VALUES(?,?,?,?,?,?,?)
         ON CONFLICT(user_id) DO UPDATE SET
             username=excluded.username,
             first_name=excluded.first_name,
             last_name=excluded.last_name,
             last_seen=excluded.last_seen,
-            is_placeholder=0
+            is_placeholder=0,
+            is_bot=excluded.is_bot
     """, (
         int(tg_user.id),
         (tg_user.username or "").lower() if tg_user.username else None,
         tg_user.first_name,
         tg_user.last_name,
-        now_ts()
+        now_ts(),
+        0,
+        1 if bool(getattr(tg_user, "is_bot", False)) else 0
     ), commit=True)
 
 def ensure_creator_is_support():
@@ -4435,24 +4721,38 @@ def _resolve_or_create_infect_target(token: str) -> Optional[int]:
     if not s:
         return None
 
-    uname = _extract_public_username_token(s)
-    if uname:
-        return _ensure_placeholder_user_by_username(uname)
+    m = re.search(r"tg://openmessage\?user_id=(\d+)", s, flags=re.IGNORECASE)
+    if m:
+        return _ensure_placeholder_user_by_uid(int(m.group(1)))
+
+    m = re.search(r"tg://user\?id=(\d+)", s, flags=re.IGNORECASE)
+    if m:
+        return _ensure_placeholder_user_by_uid(int(m.group(1)))
 
     if re.fullmatch(r"-?\d{1,20}", s):
         uid = int(s)
         row = get_user_row(uid)
         if row:
             return int(uid)
-
         if uid > 0 and len(str(uid)) >= 7:
             return _ensure_placeholder_user_by_uid(uid)
-
         return None
 
-    m = re.search(r"tg://user\?id=(\d+)", s)
+    uname = _extract_public_username_token(s)
+    if uname:
+        return _ensure_placeholder_user_by_username(uname)
+
+    m = re.search(r"@([A-Za-z0-9_]{3,64})", s)
     if m:
-        return _ensure_placeholder_user_by_uid(int(m.group(1)))
+        return _ensure_placeholder_user_by_username(m.group(1))
+
+    m = re.search(
+        r"(?:https?://)?(?:t\.me|telegram\.me)/([A-Za-z0-9_]{3,64})/?",
+        s,
+        flags=re.IGNORECASE
+    )
+    if m:
+        return _ensure_placeholder_user_by_username(m.group(1))
 
     return None
 
@@ -4543,19 +4843,39 @@ def _best_known_display_by_uid(user_id: int) -> tuple[str, str, int]:
 
     return "неизвестный пользователь", "", uid
 
-def public_user_tag(user_id: int) -> str:
+def public_user_tag(user_id: int, force_standard: bool = False) -> str:
     uid = int(user_id)
     row = get_user_row(uid)
 
-    if row and int(row["is_placeholder"] or 0) == 1:
+    alias = ""
+    if (not force_standard) and (not _chat_name_ctx_force_standard()):
+        alias = get_chat_user_name(_chat_name_ctx_chat_id(), uid)
+
+    if row:
         un = _normalize_username_for_link((row["username"] or ""))
-        if un:
-            return tg_mention(uid, un, username=un)
-        if uid > 0:
-            return tg_mention(uid, str(uid))
-        return "неизвестный пользователь"
+
+        if alias:
+            return tg_mention(uid, alias, username=un)
+
+        if int(row["is_placeholder"] or 0) == 1:
+            if un:
+                return tg_mention(uid, un, username=un)
+            if uid > 0:
+                return tg_mention(uid, str(uid))
+            return "неизвестный пользователь"
+
+        disp = (
+            standard_display_name(row["first_name"] or "", row["last_name"] or "", row["username"] or "", uid)
+            if force_standard
+            else display_name(row["first_name"] or "", row["last_name"] or "", row["username"] or "", uid)
+        )
+        label = _safe_clickable_name_or_uid(disp, uid)
+        return tg_mention(uid, label, username=un)
 
     disp, un, real_uid = _best_known_display_by_uid(uid)
+
+    if alias and uid > 0:
+        return tg_mention(uid, alias, username=un)
 
     if real_uid > 0:
         label = _safe_clickable_name_or_uid(disp, real_uid)
@@ -4565,6 +4885,9 @@ def public_user_tag(user_id: int) -> str:
         return tg_mention(real_uid, un, username=un)
 
     return "неизвестный пользователь"
+
+def standard_user_tag(user_id: int) -> str:
+    return public_user_tag(int(user_id), force_standard=True)
 
 def rp_premium_emoji_html(emoji: str, premium_id: str) -> str:
     emo = str(emoji or "")
@@ -4589,15 +4912,15 @@ def resolve_rp_target(message, actor_id: int, args_text: str):
         if is_channel_sender_message(message.reply_to_message):
             return None, None
 
-        if getattr(message.reply_to_message, "from_user", None):
-            u = message.reply_to_message.from_user
-            if not bool(getattr(u, "is_bot", False)):
-                capture_user_context(message, u)
-                return int(u.id), u
-
-        tid = _resolve_target_from_bot_reply(message, int(actor_id))
+        tid = _pick_reply_target_id(message, exclude_user_ids={int(actor_id)})
         if tid is not None:
             return int(tid), None
+
+        if getattr(message.reply_to_message, "from_user", None):
+            u = message.reply_to_message.from_user
+            if not bool(getattr(u, "is_bot", False)) and int(getattr(u, "id", 0) or 0) != int(actor_id):
+                capture_user_context(message, u)
+                return int(u.id), u
 
     token = (args_text or "").strip().split()[0] if (args_text or "").strip() else ""
     if not token:
@@ -5015,13 +5338,13 @@ def _user_display_from_any(uid: int, username: str = "", first_name: str = "", l
         un = (u["username"] or "").strip()
         fn = (u["first_name"] or "").strip()
         ln = (u["last_name"] or "").strip()
-        return tg_mention(uid, display_name(fn, ln, un, uid), username=un)
+        return tg_mention(uid, standard_display_name(fn, ln, un, uid), username=un)
 
     un = (username or "").strip()
     fn = (first_name or "").strip()
     ln = (last_name or "").strip()
     if fn or ln or un:
-        return tg_mention(uid, display_name(fn, ln, un, uid), username=un)
+        return tg_mention(uid, standard_display_name(fn, ln, un, uid), username=un)
 
     return f"<code>{uid}</code>"
 
@@ -5029,7 +5352,7 @@ def _agent_name_by_id(uid: int) -> str:
     u = get_user_row(int(uid))
     if u:
         un = (u["username"] or "").strip()
-        disp = display_name(u["first_name"] or "", u["last_name"] or "", un, int(uid))
+        disp = standard_display_name(u["first_name"] or "", u["last_name"] or "", un, int(uid))
         return tg_mention(int(uid), disp, username=un)
     return f"<code>{int(uid)}</code>"
 
@@ -5167,7 +5490,7 @@ def _known_chats_collect_rows() -> list[dict]:
             rr = db_one("SELECT COALESCE(owner_id,0) AS owner_id FROM bot_group_chats WHERE chat_id=?", (chat_id,))
             owner_id = int(rr["owner_id"] or 0) if rr else 0
 
-        owner_tag = public_user_tag(owner_id) if owner_id > 0 else "неизвестно"
+        owner_tag = public_user_tag(owner_id, force_standard=True) if owner_id > 0 else "неизвестно"
 
         out.append({
             "chat_id": chat_id,
@@ -5237,7 +5560,9 @@ def render_known_chats_text(page: int) -> tuple[str, Optional[InlineKeyboardMark
 
 def _users_collect_rows() -> list[dict]:
     rows = db_all(
-        "SELECT u.user_id, u.username, u.first_name, u.last_name, u.last_seen, u.is_placeholder, "
+        "SELECT u.user_id, u.username, u.first_name, u.last_name, u.last_seen, "
+        "COALESCE(u.is_placeholder,0) AS is_placeholder, "
+        "COALESCE(u.is_bot,0) AS is_bot, "
         "COALESCE(l.lab_active,0) AS lab_active "
         "FROM users u "
         "LEFT JOIN labs l ON l.user_id=u.user_id "
@@ -5250,18 +5575,25 @@ def _users_collect_rows() -> list[dict]:
         un = (r["username"] or "").strip()
         fn = (r["first_name"] or "").strip()
         ln = (r["last_name"] or "").strip()
+        is_bot = int(r["is_bot"] or 0)
 
         nm = "no name"
         if fn or ln or un:
-            nm = display_name(fn, ln, un, uid)
+            nm = standard_display_name(fn, ln, un, uid)
             if not nm or nm == str(uid):
                 nm = _raw_name_fallback(fn, ln) or (f"@{un}" if un else "no name")
+
+        if is_bot == 1:
+            lab_text = "бот"
+        else:
+            lab_text = "есть лаба" if int(r["lab_active"] or 0) == 1 else "нет лабы"
 
         out.append({
             "user_id": uid,
             "name": nm,
             "username": f"@{un}" if un else "—",
-            "lab_text": "есть лаба" if int(r["lab_active"] or 0) == 1 else "нет лабы",
+            "lab_text": lab_text,
+            "is_bot": is_bot,
         })
     return out
 
@@ -5278,13 +5610,15 @@ def render_users_text(page: int) -> tuple[str, Optional[InlineKeyboardMarkup]]:
     part = rows[start:start + USERS_PAGE_SIZE]
 
     total_users = _users_total_count()
+    total_bots = _users_bot_count()
     total_chats = _bot_group_chat_count()
 
     lines = []
     lines.append("📑 Список пользователей")
     lines.append("")
-    lines.append(f"👤 Кол-во пользователей: {total_users}")
-    lines.append(f"👥 Кол-во чатов: {total_chats}")
+    lines.append(f"👥 Кол-во пользователей: {total_users}")
+    lines.append(f"🤖 Кол-во ботов: {total_bots}")
+    lines.append(f"🗨️ Кол-во чатов: {total_chats}")
     lines.append("")
     lines.append("<blockquote expandable>")
 
@@ -5666,6 +6000,93 @@ def set_notify_prefs(user_id: int, chat_id: int, off: int):
         commit=True
     )
 
+# логика уведомлениий
+def get_pm_opened(user_id: int) -> int:
+    r = db_one(
+        "SELECT COALESCE(pm_opened,0) AS p FROM users WHERE user_id=?",
+        (int(user_id),)
+    )
+    return int(r["p"] or 0) if r else 0
+
+def set_pm_opened(user_id: int, value: int = 1):
+    db_exec(
+        "UPDATE users SET pm_opened=? WHERE user_id=?",
+        (int(value), int(user_id)),
+        commit=True
+    )
+
+def _known_common_chat_ids_for_user(user_id: int) -> list[int]:
+    rows = db_all(
+        "SELECT DISTINCT cm.chat_id "
+        "FROM chat_members cm "
+        "LEFT JOIN bot_group_chats bg ON bg.chat_id=cm.chat_id "
+        "WHERE cm.user_id=? "
+        "  AND (bg.chat_id IS NULL OR COALESCE(bg.is_active,0)=1) "
+        "ORDER BY cm.chat_id ASC",
+        (int(user_id),)
+    ) or []
+    return [int(r["chat_id"]) for r in rows]
+
+def _pick_random_common_chat_for_user(user_id: int) -> int:
+    chats = _known_common_chat_ids_for_user(int(user_id))
+    if not chats:
+        return 0
+    cid = int(random.choice(chats))
+    set_notify_prefs(int(user_id), cid, 0)
+    return cid
+
+def send_user_notification(user_id: int, text: str):
+    """
+    Отправляет уведомление пользователю по правилам:
+    - если уведомления отключены -> None
+    - если выбран чат -> туда
+    - если выбранного чата нет:
+        * если ЛС уже открывались -> в ЛС
+        * иначе -> в случайный общий чат и запоминаем его
+    Если ничего не удалось — молча None.
+    """
+    uid = int(user_id)
+
+    try:
+        notify_chat_id, notify_off = get_notify_prefs(uid)
+        if int(notify_off) == 1 and int(notify_chat_id) == 0:
+            return None
+
+        pm_opened = get_pm_opened(uid)
+        if int(notify_chat_id) != 0:
+            dest = int(notify_chat_id)
+        else:
+            dest = int(uid) if int(pm_opened) == 1 else int(_pick_random_common_chat_for_user(uid) or 0)
+
+        if dest == 0:
+            return None
+
+        try:
+            return bot.send_message(dest, text, parse_mode="HTML", disable_web_page_preview=True)
+        except Exception:
+            if int(notify_chat_id) != 0:
+                try:
+                    set_notify_prefs(uid, 0, 0)
+                except Exception:
+                    pass
+
+            if int(pm_opened) == 1:
+                try:
+                    return bot.send_message(uid, text, parse_mode="HTML", disable_web_page_preview=True)
+                except Exception:
+                    return None
+
+            alt = _pick_random_common_chat_for_user(uid)
+            if alt != 0 and alt != dest:
+                try:
+                    return bot.send_message(int(alt), text, parse_mode="HTML", disable_web_page_preview=True)
+                except Exception:
+                    return None
+
+            return None
+    except Exception:
+        return None
+
 _CHAT_TITLE_CACHE: Dict[int, tuple[str, int]] = {}
 _CHAT_TITLE_CACHE_TTL = 600
 
@@ -5827,7 +6248,11 @@ def render_settings_text(user_id: int) -> str:
 
     return "\n".join(lines)
 
-def kb_settings(user_id: int) -> InlineKeyboardMarkup:
+def kb_settings(
+        user_id: int,
+        current_chat_id: int = 0, 
+        current_chat_type: str = "private"
+) -> InlineKeyboardMarkup:
     uid = int(user_id)
     kb = InlineKeyboardMarkup(row_width=2)
 
@@ -5866,6 +6291,10 @@ def kb_settings(user_id: int) -> InlineKeyboardMarkup:
             _ikb("Отключить уведомления", callback_data=_settings_cb(uid, "NOFF"), style="danger")
         )
 
+    if str(current_chat_type or "").lower() in ("group", "supergroup") and int(current_chat_id) != 0:
+        if int(notify_chat_id) != int(current_chat_id) or int(notify_off) == 1:
+            kb.add(_ikb("Перевести уведомления в этот чат", callback_data=_settings_cb(uid, "NCHAT"), style="primary"))
+
     _cid, _cname, role = _user_corp_role_soft(uid)
     if role in ("owner", "deputy"):
         en = corp_notify_enabled(uid)
@@ -5880,10 +6309,6 @@ def kb_settings(user_id: int) -> InlineKeyboardMarkup:
     return kb
 
 def handle_settings_command(message):
-    if message.chat.type != "private":
-        bot.reply_to(message, "📑 Эта команда работает только в личных сообщениях бота.")
-        return
-
     uid = int(message.from_user.id)
     upsert_user(message.from_user)
 
@@ -5892,7 +6317,7 @@ def handle_settings_command(message):
         render_settings_text(uid),
         parse_mode="HTML",
         disable_web_page_preview=True,
-        reply_markup=kb_settings(uid)
+        reply_markup=kb_settings(uid, int(message.chat.id), str(message.chat.type or "private"))
     )
 
 def report_set_state(user_id: int, category: str, stage: str):
@@ -6099,6 +6524,22 @@ def handle_report_command(message):
 
 def remember_chat_member(chat_id: int, tg_user):
     upsert_user(tg_user)
+
+    try:
+        _merge_placeholder_to_real_user(tg_user)
+    except Exception:
+        pass
+
+    if bool(getattr(tg_user, "is_bot", False)):
+        try:
+            db_exec(
+                "UPDATE users SET is_bot=1, is_placeholder=0 WHERE user_id=?",
+                (int(tg_user.id),),
+                commit=True
+            )
+        except Exception:
+            pass
+
     uname = (getattr(tg_user, "username", None) or "").strip().lower() or None
     db_exec(
         "INSERT INTO chat_members(chat_id,user_id,username,last_seen) VALUES(?,?,?,?) "
@@ -6125,7 +6566,11 @@ def remember_bot_group_chat(chat_id: int, title: str = "", chat_type: str = "gro
     )
 
 def _users_total_count() -> int:
-    row = db_one("SELECT COUNT(*) AS c FROM users")
+    row = db_one("SELECT COUNT(*) AS c FROM users WHERE COALESCE(is_bot,0)=0")
+    return int(row["c"] or 0) if row else 0
+
+def _users_bot_count() -> int:
+    row = db_one("SELECT COUNT(*) AS c FROM users WHERE COALESCE(is_bot,0)=1")
     return int(row["c"] or 0) if row else 0
 
 def _bot_group_chat_count() -> int:
@@ -6190,27 +6635,238 @@ def capture_user_context(message, tg_user):
     except Exception:
         pass
 
+def _collect_target_tokens_from_text(text: str) -> list[str]:
+    s = str(text or "")
+    out: list[str] = []
+    seen = set()
+
+    def _add(tok: str):
+        tok = (tok or "").strip()
+        if tok and tok not in seen:
+            seen.add(tok)
+            out.append(tok)
+
+    pure = s.strip()
+    if pure:
+        _add(pure)
+
+    for m in re.finditer(r"tg://openmessage\?user_id=\d+", s, flags=re.IGNORECASE):
+        _add(m.group(0))
+
+    for m in re.finditer(r"tg://user\?id=\d+", s, flags=re.IGNORECASE):
+        _add(m.group(0))
+
+    for m in re.finditer(r"(?:https?://)?(?:t\.me|telegram\.me)/([A-Za-z0-9_]{3,64})/?", s, flags=re.IGNORECASE):
+        _add("@" + m.group(1))
+
+    for m in re.finditer(r"(?<![\w/])@([A-Za-z0-9_]{3,64})", s):
+        _add("@" + m.group(1))
+
+    for m in re.finditer(r"(?<!\d)(-?\d{1,20})(?!\d)", s):
+        _add(m.group(1))
+
+    return out
+
+def _resolve_single_target_from_text(text: str, resolver) -> Optional[int]:
+    resolved: list[int] = []
+    seen_ids = set()
+
+    for tok in _collect_target_tokens_from_text(text):
+        try:
+            tid = resolver(tok)
+        except Exception:
+            tid = None
+
+        if tid is None:
+            continue
+
+        tid = int(tid)
+        if tid not in seen_ids:
+            seen_ids.add(tid)
+            resolved.append(tid)
+
+    if len(resolved) == 1:
+        return int(resolved[0])
+
+    return None
+
+def _reply_message_text_and_entities(rm):
+    raw = (getattr(rm, "text", None) or getattr(rm, "caption", None) or "")
+    ents = []
+    try:
+        ents.extend(list(getattr(rm, "entities", None) or []))
+    except Exception:
+        pass
+    try:
+        ents.extend(list(getattr(rm, "caption_entities", None) or []))
+    except Exception:
+        pass
+    return raw, ents
+
+def _entity_slice_text(raw: str, ent) -> str:
+    try:
+        off = int(getattr(ent, "offset", 0) or 0)
+        ln = int(getattr(ent, "length", 0) or 0)
+        if ln <= 0:
+            return ""
+        return str(raw or "")[off:off + ln]
+    except Exception:
+        return ""
+
+def _collect_reply_target_ids(message, *, exclude_user_ids=None) -> list[int]:
+    rm = getattr(message, "reply_to_message", None)
+    if not rm:
+        return []
+
+    exclude = {int(x) for x in (exclude_user_ids or []) if int(x or 0) != 0}
+    raw, ents = _reply_message_text_and_entities(rm)
+
+    out: list[int] = []
+    seen = set()
+
+    def _add(uid: Optional[int]):
+        if uid is None:
+            return
+        uid = int(uid)
+        if uid in exclude or uid in seen:
+            return
+        seen.add(uid)
+        out.append(uid)
+
+    for e in ents:
+        et = (getattr(e, "type", "") or "").strip().lower()
+
+        if et == "text_mention":
+            u = getattr(e, "user", None)
+            if u and getattr(u, "id", None):
+                try:
+                    capture_user_context(message, u)
+                except Exception:
+                    pass
+                _add(int(u.id))
+            continue
+
+        token = ""
+        if et == "text_link":
+            token = (getattr(e, "url", "") or "").strip()
+        elif et == "url":
+            token = _entity_slice_text(raw, e).strip()
+        elif et == "mention":
+            token = _entity_slice_text(raw, e).strip()
+
+        if token:
+            try:
+                tid = _strict_single_target_token(token)
+            except Exception:
+                tid = None
+            _add(tid)
+
+    for tok in _collect_target_tokens_from_text(raw):
+        try:
+            tid = _strict_single_target_token(tok)
+        except Exception:
+            tid = None
+        _add(tid)
+
+    return out
+
+def _pick_reply_target_id(message, *, exclude_user_ids=None) -> Optional[int]:
+    ids = _collect_reply_target_ids(message, exclude_user_ids=exclude_user_ids)
+    if not ids:
+        return None
+    if len(ids) == 1:
+        return int(ids[0])
+    return int(random.choice(ids))
+
+def _reply_message_text_and_entities(rm):
+    raw = (getattr(rm, "text", None) or getattr(rm, "caption", None) or "")
+    ents = []
+    try:
+        ents.extend(list(getattr(rm, "entities", None) or []))
+    except Exception:
+        pass
+    try:
+        ents.extend(list(getattr(rm, "caption_entities", None) or []))
+    except Exception:
+        pass
+    return raw, ents
+
+def _entity_slice_text(raw: str, ent) -> str:
+    try:
+        off = int(getattr(ent, "offset", 0) or 0)
+        ln = int(getattr(ent, "length", 0) or 0)
+        if ln <= 0:
+            return ""
+        return str(raw or "")[off:off + ln]
+    except Exception:
+        return ""
+
+def _resolve_target_from_reply_message_content(message, *, exclude_user_id: int = 0) -> Optional[int]:
+    rm = getattr(message, "reply_to_message", None)
+    if not rm:
+        return None
+
+    exclude_user_id = int(exclude_user_id or 0)
+    raw, ents = _reply_message_text_and_entities(rm)
+
+    for e in ents:
+        et = (getattr(e, "type", "") or "").strip().lower()
+
+        if et == "text_mention":
+            u = getattr(e, "user", None)
+            if u and getattr(u, "id", None):
+                uid = int(u.id)
+                if uid != exclude_user_id:
+                    try:
+                        capture_user_context(message, u)
+                    except Exception:
+                        pass
+                    return uid
+
+        token = ""
+        if et == "text_link":
+            token = (getattr(e, "url", "") or "").strip()
+        elif et == "url":
+            token = _entity_slice_text(raw, e).strip()
+        elif et == "mention":
+            token = _entity_slice_text(raw, e).strip()
+
+        if token:
+            tid = _strict_single_target_token(token)
+            if tid is not None and int(tid) != exclude_user_id:
+                return int(tid)
+
+    tid = _resolve_single_target_from_text(raw, _strict_single_target_token)
+    if tid is not None and int(tid) != exclude_user_id:
+        return int(tid)
+
+    return None
+
 def resolve_target_from_reply_or_args(message, parsed: Optional["Parsed"]):
     """
     Возвращает (target_id, target_user_obj_or_None).
-    При reply — всегда берём user из reply_to_message и сразу фиксируем его.
-    При args — поддерживает РОВНО ОДИН target token:
-        @username / uid / ссылка
-    Если токенов больше одного — считаем ввод невалидным.
+
+    При reply:
+      1) если в replied-сообщении есть ссылки/упоминания пользователей —
+         берём цель из них, исключая самого вызывающего команду;
+         если после исключения остаётся несколько целей — берём случайную.
+      2) если целей в тексте нет — fallback на автора replied-сообщения.
+    При args — поддерживает один целевой uid, @username или ссылку даже внутри текста args.
     """
-    if message.reply_to_message and message.reply_to_message.from_user:
-        u = message.reply_to_message.from_user
-        capture_user_context(message, u)
-        return int(u.id), u
+    actor_id = int(getattr(getattr(message, "from_user", None), "id", 0) or 0)
+
+    if message.reply_to_message:
+        tid = _pick_reply_target_id(message, exclude_user_ids={actor_id})
+        if tid is not None:
+            return int(tid), None
+
+        u = getattr(message.reply_to_message, "from_user", None)
+        if u and int(getattr(u, "id", 0) or 0) != actor_id:
+            capture_user_context(message, u)
+            return int(u.id), u
 
     if parsed and parsed.args:
-        args = (parsed.args or "").strip()
-        toks = args.split()
-        if len(toks) != 1:
-            return None, None
-
-        token = toks[0].strip()
-        tid = _strict_single_target_token(token)
+        tid = _resolve_single_target_from_text((parsed.args or "").strip(), _strict_single_target_token)
         if tid is not None:
             return int(tid), None
 
@@ -6236,11 +6892,7 @@ def strict_single_target_args_ok(message, parsed: Optional["Parsed"], *, allow_e
     if not args:
         return bool(allow_empty)
 
-    toks = args.split()
-    if len(toks) != 1:
-        return False
-
-    return _strict_single_target_token(toks[0]) is not None
+    return _resolve_single_target_from_text(args, _strict_single_target_token) is not None
 
 def strict_single_numeric_arg_ok(parsed: Optional["Parsed"]) -> bool:
     args = (parsed.args or "").strip() if parsed else ""
@@ -6353,6 +7005,7 @@ SIGNED_COMMANDS_ALLOWED = {
     "corp_open", "corp_close",
     "corp_deputy", "corp_deputy_remove",
     "labname_clear", "pathogenname_clear",
+    "chatname_set", "chatname_clear",
     "name_lock_lab", "name_lock_pat",
     "upgrade_preview", "upgrade_buy",
 }
@@ -6543,12 +7196,67 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
     if low in ("рпстат", "рпстата", "рп стата", "рп стат"):
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="rp_stats", args="")
 
+    if low in ("патогены", "паты", "заряды", "патроны"):
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="pathogens_info", args="")
+
+    if low in ("патоген инфо", "пат инфо", "пи"):
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="pathogen_info", args="")
+
     if low.startswith("пак айди ") or low.startswith("пак ид ") or low.startswith("пак id ") \
        or low.startswith("эмодзипак айди ") or low.startswith("эмодзипак ид ") or low.startswith("эмодзипак id "):
         parts = t.split(" ", 2)
         if len(parts) >= 3:
             if parts[0].lower() in ("пак", "эмодзипак"):
                 return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="emoji_pack_ids", args=parts[2].strip())
+
+    # дуэли
+    if low in ("выстрел", "дуэль выстрел"):
+        return Parsed(raw=raw_multiline, has_prefix_char=False, prefix_char=None, cmd="duel_fire", args="")
+
+    if low in ("прицелиться", "прицел", "дуэль прицелиться", "дуэль прицел"):
+        return Parsed(raw=raw_multiline, has_prefix_char=False, prefix_char=None, cmd="duel_aim", args="")
+
+    if low in ("сбить прицел", "дуэль сбить прицел"):
+        return Parsed(raw=raw_multiline, has_prefix_char=False, prefix_char=None, cmd="duel_break_aim", args="")
+
+    if low in ("сдаться", "дуэль сдаться"):
+        return Parsed(raw=raw_multiline, has_prefix_char=False, prefix_char=None, cmd="duel_surrender", args="")
+
+    if low in ("дуэли стата", "дуэль стата", "дуэли стат", "дуэль стат"):
+        return Parsed(raw=raw_multiline, has_prefix_char=False, prefix_char=None, cmd="duel_stats", args="")
+
+    if low in ("дуэль да", "дуэль принять"):
+        return Parsed(raw=raw_multiline, has_prefix_char=False, prefix_char=None, cmd="duel_accept", args="")
+
+    if low in ("дуэль отмена", "дуэль отменить"):
+        return Parsed(raw=raw_multiline, has_prefix_char=False, prefix_char=None, cmd="duel_cancel", args="")
+
+    if low in ("дуэли ставки", "ставки дуэлей", "дуэль ставки"):
+        return Parsed(raw=raw_multiline, has_prefix_char=False, prefix_char=None, cmd="duel_bets_list", args="")
+
+    if low in ("дуэль нет", "дуэль отказ", "дуэль отказаться", "дуэль отказать"):
+        return Parsed(raw=raw_multiline, has_prefix_char=False, prefix_char=None, cmd="duel_decline", args="")
+
+    if low.startswith("дуэль ставка "):
+        rest = ""
+        parts = t.split(" ", 2)
+        if len(parts) >= 3:
+            rest = parts[2].strip()
+        return Parsed(raw=raw_multiline, has_prefix_char=False, prefix_char=None, cmd="duel_call_stake", args=rest)
+
+    if low.startswith("ставка "):
+        rest = ""
+        parts = t.split(" ", 1)
+        if len(parts) > 1:
+            rest = parts[1].strip()
+        return Parsed(raw=raw_multiline, has_prefix_char=False, prefix_char=None, cmd="duel_bet", args=rest)
+
+    if low == "дуэль" or low.startswith("дуэль "):
+        rest = ""
+        parts = t.split(" ", 1)
+        if len(parts) > 1:
+            rest = parts[1].strip()
+        return Parsed(raw=raw_multiline, has_prefix_char=False, prefix_char=None, cmd="duel_call", args=rest)
 
     # агент команды
     if low == "bot_ban" or low.startswith("bot_ban "):
@@ -6976,6 +7684,35 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
             rest = spl[2].strip()
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="pathogenname", args=rest)
 
+    # "+имя" / "-имя" / "имя" / "текущее имя"
+    if sign == "+" and (low == "имя" or low.startswith("имя ")):
+        rest = ""
+        parts = t.split(" ", 1)
+        if len(parts) > 1:
+            rest = parts[1].strip()
+        return Parsed(raw=raw_multiline, has_prefix_char=False, prefix_char=None, cmd="chatname_set", args=rest)
+
+    if sign == "-" and (low == "имя" or low.startswith("имя ")):
+        rest = ""
+        parts = t.split(" ", 1)
+        if len(parts) > 1:
+            rest = parts[1].strip()
+        return Parsed(raw=raw_multiline, has_prefix_char=False, prefix_char=None, cmd="chatname_clear", args=rest)
+
+    if low == "имя" or low.startswith("имя "):
+        rest = ""
+        parts = t.split(" ", 1)
+        if len(parts) > 1:
+            rest = parts[1].strip()
+        return Parsed(raw=raw_multiline, has_prefix_char=False, prefix_char=None, cmd="chatname_show", args=rest)
+
+    if low == "текущее имя" or low.startswith("текущее имя "):
+        rest = ""
+        parts = t.split(" ", 2)
+        if len(parts) == 3:
+            rest = parts[2].strip()
+        return Parsed(raw=raw_multiline, has_prefix_char=False, prefix_char=None, cmd="chatname_show", args=rest)
+
     return None
 
 # MRP FILTER
@@ -7030,7 +7767,7 @@ def format_agent_line(a: sqlite3.Row) -> str:
     fn = (a["first_name"] or "").strip()
     ln = (a["last_name"] or "").strip()
     username = (a["username"] or "").strip()
-    name = display_name(fn, ln, username, uid)
+    name = standard_display_name(fn, ln, username, uid)
     return tg_mention(uid, name, username=username)
 
 def build_start_text(user) -> str:
@@ -7884,8 +8621,7 @@ def handle_chat_autodelete_commands(message, parsed: Parsed):
     )
 
 # RESOLVE TARGETS
-def resolve_target_id(token: str) -> Optional[int]:
-    """/owner target: @username | tg://user?id=... | user_id. Пользователь должен запускать бота."""
+def _resolve_known_target_token(token: str) -> Optional[int]:
     if not token:
         return None
     s = token.strip()
@@ -7893,7 +8629,12 @@ def resolve_target_id(token: str) -> Optional[int]:
     def _user_exists(uid: int) -> bool:
         return bool(db_one("SELECT 1 FROM users WHERE user_id=? LIMIT 1", (int(uid),)))
 
-    m = re.search(r"tg://user\?id=(\d+)", s)
+    m = re.search(r"tg://openmessage\?user_id=(\d+)", s, flags=re.IGNORECASE)
+    if m:
+        uid = int(m.group(1))
+        return uid if _user_exists(uid) else None
+
+    m = re.search(r"tg://user\?id=(\d+)", s, flags=re.IGNORECASE)
     if m:
         uid = int(m.group(1))
         return uid if _user_exists(uid) else None
@@ -7902,10 +8643,19 @@ def resolve_target_id(token: str) -> Optional[int]:
         uid = int(s)
         return uid if _user_exists(uid) else None
 
-    if s.startswith("@"):
-        return find_user_id_by_username(s)
+    uname = _extract_public_username_token(s)
+    if uname:
+        return find_user_id_by_username("@" + uname)
+
+    m = re.search(r"@([A-Za-z0-9_]{3,64})", s)
+    if m:
+        return find_user_id_by_username("@" + m.group(1))
 
     return None
+
+def resolve_target_id(token: str) -> Optional[int]:
+    """/owner target: @username | tg://user?id=... | tg://openmessage?user_id=... | user_id | текст с упоминанием."""
+    return _resolve_single_target_from_text(token or "", _resolve_known_target_token)
 
 # LAB TEXT
 def default_lab_name(user_row: Optional[sqlite3.Row], user_id: int) -> str:
@@ -8078,7 +8828,7 @@ def kb_lab_dev(owner_id: int) -> InlineKeyboardMarkup:
         _ikb_premium_icon_only("⚗️", callback_data=_upg_cb("P", owner_id, "SYN", 1, "D")),
         _ikb_premium_icon_only("🧫", callback_data=_upg_cb("P", owner_id, "ACC", 1, "D")),
     )
-    kb.row(InlineKeyboardButton("Вернуться к досье", callback_data=_labui_data(owner_id, "D")))
+    kb.row(InlineKeyboardButton("Вернуться к досье", callback_data=_labui_data(owner_id, "D"), style="primary"))
     return kb
 
 def kb_lab_sec(owner_id: int) -> InlineKeyboardMarkup:
@@ -8088,14 +8838,14 @@ def kb_lab_sec(owner_id: int) -> InlineKeyboardMarkup:
         _ikb_premium_icon_only("🛰️", callback_data=_upg_cb("P", owner_id, "IDS", 1, "D")),
         _ikb_premium_icon_only("📟", callback_data=_upg_cb("P", owner_id, "IPS", 1, "D")),
     )
-    kb.row(InlineKeyboardButton("Вернуться к досье", callback_data=_labui_data(owner_id, "D")))
+    kb.row(InlineKeyboardButton("Вернуться к досье", callback_data=_labui_data(owner_id, "D"), style="primary"))
     return kb
 
 def kb_lab_infected(owner_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup()
     kb.row(
         _ikb_premium_lead("🤒", "Ваши болезни", callback_data=_labui_data(owner_id, "B"), style="primary"),
-        InlineKeyboardButton("Вернуться к досье", callback_data=_labui_data(owner_id, "D")),
+        InlineKeyboardButton("Вернуться к досье", callback_data=_labui_data(owner_id, "D"), style="primary"),
     )
     return kb
 
@@ -8103,7 +8853,7 @@ def kb_lab_diseases(owner_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup()
     kb.row(
         _ikb_premium_lead("🤧", "Заражённые", callback_data=_labui_data(owner_id, "I"), style="primary"),
-        InlineKeyboardButton("Вернуться к досье", callback_data=_labui_data(owner_id, "D")),
+        InlineKeyboardButton("Вернуться к досье", callback_data=_labui_data(owner_id, "D"), style="primary"),
     )
     return kb
 
@@ -8120,8 +8870,8 @@ def kb_lab_dossier_inline(owner_id: int) -> InlineKeyboardMarkup:
         InlineKeyboardButton("🛡️", callback_data=_upg_cb("P", owner_id, "IMM", 1, "D")),
     )
     kb.row(
-        InlineKeyboardButton("🤧 Заражённые", callback_data=_labui_data(owner_id, "I")),
-        InlineKeyboardButton("🤒 Ваши болезни", callback_data=_labui_data(owner_id, "B")),
+        InlineKeyboardButton("🤧 Заражённые", callback_data=_labui_data(owner_id, "I"), style="primary"),
+        InlineKeyboardButton("🤒 Ваши болезни", callback_data=_labui_data(owner_id, "B"), style="primary"),
     )
     return kb
 
@@ -8133,7 +8883,7 @@ def kb_lab_dev_inline(owner_id: int) -> InlineKeyboardMarkup:
         InlineKeyboardButton("⚗️", callback_data=_upg_cb("P", owner_id, "SYN", 1, "D")),
         InlineKeyboardButton("🧫", callback_data=_upg_cb("P", owner_id, "ACC", 1, "D")),
     )
-    kb.row(InlineKeyboardButton("Вернуться к досье", callback_data=_labui_data(owner_id, "D")))
+    kb.row(InlineKeyboardButton("Вернуться к досье", callback_data=_labui_data(owner_id, "D"), style="primary"))
     return kb
 
 def kb_lab_sec_inline(owner_id: int) -> InlineKeyboardMarkup:
@@ -8143,22 +8893,22 @@ def kb_lab_sec_inline(owner_id: int) -> InlineKeyboardMarkup:
         InlineKeyboardButton("🛰️", callback_data=_upg_cb("P", owner_id, "IDS", 1, "D")),
         InlineKeyboardButton("📟", callback_data=_upg_cb("P", owner_id, "IPS", 1, "D")),
     )
-    kb.row(InlineKeyboardButton("Вернуться к досье", callback_data=_labui_data(owner_id, "D")))
+    kb.row(InlineKeyboardButton("Вернуться к досье", callback_data=_labui_data(owner_id, "D"), style="primary"))
     return kb
 
 def kb_lab_infected_inline(owner_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup()
     kb.row(
-        InlineKeyboardButton("🤒 Ваши болезни", callback_data=_labui_data(owner_id, "B")),
-        InlineKeyboardButton("Вернуться к досье", callback_data=_labui_data(owner_id, "D")),
+        InlineKeyboardButton("🤒 Ваши болезни", callback_data=_labui_data(owner_id, "B"), style="primary"),
+        InlineKeyboardButton("Вернуться к досье", callback_data=_labui_data(owner_id, "D"), style="primary"),
     )
     return kb
 
 def kb_lab_diseases_inline(owner_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup()
     kb.row(
-        InlineKeyboardButton("🤧 Заражённые", callback_data=_labui_data(owner_id, "I")),
-        InlineKeyboardButton("Вернуться к досье", callback_data=_labui_data(owner_id, "D")),
+        InlineKeyboardButton("🤧 Заражённые", callback_data=_labui_data(owner_id, "I"), style="primary"),
+        InlineKeyboardButton("Вернуться к досье", callback_data=_labui_data(owner_id, "D"), style="primary"),
     )
     return kb
 
@@ -9083,10 +9833,18 @@ def _run_due_timers(now_value: int):
         user_id = int(row["user_id"])
         chat_id = int(row["chat_id"] or user_id)
 
+        transient_failed = False
+
         try:
             _execute_timer_command_text(user_id, chat_id, row["command_text"] or "")
         except Exception as e:
-            send_error_report(f"_run_due_timers#{timer_id}", e)
+            if _is_transient_telegram_network_error(e):
+                transient_failed = True
+            else:
+                send_error_report(f"_run_due_timers#{timer_id}", e)
+
+        if transient_failed:
+            continue
 
         next_cycle_ts, new_left = _timer_reschedule_from_row(row, now_value)
         if next_cycle_ts is None:
@@ -9959,111 +10717,13 @@ def _pick_target_from_db(attacker_id: int, mode: str, chat_id: int, chat_filter:
 
 def _resolve_target_from_bot_reply(message, attacker_id: int) -> Optional[int]:
     """
-    Reply на сообщение бота: пытаемся определить цель заражения по:
-      1) entities/caption_entities (text_mention / text_link / mention)
-      2) tg://user?id=... в тексте/подписи
-      3) @username в тексте/подписи
-    Берём первого найденного, кто НЕ attacker.
+    Reply на сообщение бота/бота-подобное сообщение:
+    ищем все ссылки/упоминания пользователей, исключаем самого атакующего.
+    Если остаётся одна цель — берём её.
+    Если остаётся несколько — берём случайную.
     """
-    rm = message.reply_to_message
-    if not rm:
-        return None
-
-    ents = getattr(rm, "entities", None) or getattr(rm, "caption_entities", None) or []
-    for e in ents:
-        et = getattr(e, "type", "") or ""
-
-        if et == "text_mention":
-            u = getattr(e, "user", None)
-            if u and getattr(u, "id", None):
-                uid = int(u.id)
-                if uid != int(attacker_id):
-                    try:
-                        capture_user_context(message, u)
-                    except Exception:
-                        pass
-                    return uid
-
-        if et in ("text_link", "url"):
-            url = getattr(e, "url", "") or ""
-            if (not url) and et == "url":
-                try:
-                    txt = (getattr(rm, "text", None) or getattr(rm, "caption", None) or "")
-                    off = int(getattr(e, "offset", 0) or 0)
-                    ln = int(getattr(e, "length", 0) or 0)
-                    if ln > 0:
-                        url = txt[off:off + ln]
-                except Exception:
-                    url = ""
-
-            m = re.search(r"tg://user\?id=(\d+)", url)
-            if m:
-                uid = int(m.group(1))
-                if uid != int(attacker_id):
-                    return _ensure_placeholder_user_by_uid(uid)
-
-            m2 = re.search(r"https?://t\.me/([A-Za-z0-9_]+)", url)
-            if m2:
-                uname = m2.group(1).lower()
-                uid = find_user_id_by_username("@" + uname)
-                if uid is None and message.chat.type in ("group", "supergroup"):
-                    r = db_one(
-                        "SELECT user_id FROM chat_members WHERE chat_id=? AND username=? LIMIT 1",
-                        (int(message.chat.id), uname)
-                    )
-                    if r:
-                        uid = int(r["user_id"])
-                if uid is None:
-                    uid = _ensure_placeholder_user_by_username(uname)
-                if uid is not None and int(uid) != int(attacker_id):
-                    return int(uid)
-
-        if et == "mention":
-            try:
-                txt = (getattr(rm, "text", None) or getattr(rm, "caption", None) or "")
-                off = int(getattr(e, "offset", 0) or 0)
-                ln = int(getattr(e, "length", 0) or 0)
-                if ln > 0:
-                    token = txt[off:off + ln]
-                    if token.startswith("@"):
-                        uname = token[1:].lower()
-                        uid = find_user_id_by_username("@" + uname)
-                        if uid is None and message.chat.type in ("group", "supergroup"):
-                            r = db_one(
-                                "SELECT user_id FROM chat_members WHERE chat_id=? AND username=? LIMIT 1",
-                                (int(message.chat.id), uname)
-                            )
-                            if r:
-                                uid = int(r["user_id"])
-                        if uid is None:
-                            uid = _ensure_placeholder_user_by_username(uname)
-                        if uid is not None and int(uid) != int(attacker_id):
-                            return int(uid)
-            except Exception:
-                pass
-
-    raw = (getattr(rm, "text", None) or getattr(rm, "caption", None) or "")
-    for m in re.finditer(r"tg://user\?id=(\d+)", raw):
-        uid = int(m.group(1))
-        if uid != int(attacker_id):
-            return _ensure_placeholder_user_by_uid(uid)
-
-    for m in re.finditer(r"@([A-Za-z0-9_]{5,32})", raw):
-        uname = m.group(1).lower()
-        uid = find_user_id_by_username("@" + uname)
-        if uid is None and message.chat.type in ("group", "supergroup"):
-            r = db_one(
-                "SELECT user_id FROM chat_members WHERE chat_id=? AND username=? LIMIT 1",
-                (int(message.chat.id), uname)
-            )
-            if r:
-                uid = int(r["user_id"])
-        if uid is None:
-            uid = _ensure_placeholder_user_by_username(uname)
-        if uid is not None and int(uid) != int(attacker_id):
-            return int(uid)
-
-    return None
+    tid = _pick_reply_target_id(message, exclude_user_ids={int(attacker_id)})
+    return int(tid) if tid is not None else None
 
 def _parse_infect_request(message, parsed: "Parsed", attacker_id: int) -> dict:
     """
@@ -10379,7 +11039,7 @@ def _pay_cost(uid: int, cost: int):
 
 def _upg_cb(action: str, uid: int, code: str, steps: int, src: str = "C") -> str:
     src = (src or "C")
-    if src not in ("C", "D", "I"):
+    if src not in ("C", "D", "I", "PB"):
         src = "C"
     return f"{UPGUI_TAG}:{action}:{int(uid)}:{code}:{int(steps)}:{src}"
 
@@ -10395,7 +11055,7 @@ def _upg_cb_parse(data: str):
             return None
         info = {"action": p[1], "uid": int(p[2]), "code": p[3], "steps": int(p[4])}
         info["src"] = p[5] if len(p) >= 6 else "C"
-        if info["src"] not in ("C", "D", "I"):
+        if info["src"] not in ("C", "D", "I", "PB"):
             info["src"] = "C"
         if len(p) >= 8:
             info["ictype"] = p[6]
@@ -10643,6 +11303,12 @@ CALC_CHANCE_METRIC_ALIASES = {
     "тяжести": "HEA", "тяжесть": "HEA", "тяж": "HEA",
 }
 
+CALC_BUFF_METRIC_ALIASES = {
+    "синтез": "SYN", "синтеза": "SYN", "синт": "SYN",
+    "ускорение": "ACC", "ускорения": "ACC", "ускор": "ACC", "ускр": "ACC",
+    "летальность": "FEV", "летальности": "FEV", "летальн": "FEV", "летал": "FEV",
+}
+
 STRICT_NO_EXTRA_ARGS_CMDS = {
     "help", "commands_link", "report", "settings",
     "autoanswer_status", "autoanswer_on", "autoanswer_off",
@@ -10659,6 +11325,14 @@ STRICT_NO_EXTRA_ARGS_CMDS = {
     "chat_autodel_status", "chat_autodel_off",
     "timer_list", "timer_clear_all",
     "cof_inf_stats",
+    "chatname_clear",
+    "duel_accept", "duel_decline", "duel_cancel",
+    "duel_fire", "duel_aim", "duel_break_aim", "duel_surrender",
+    "duel_bets_list", "duel_stats",
+}
+
+CALC_BUFF_MODE_ALIASES = {
+    "усиления", "усилений", "кс", "кус"
 }
 
 CALC_UPGRADE_PUBLIC_VARS = [
@@ -10668,6 +11342,10 @@ CALC_UPGRADE_PUBLIC_VARS = [
 
 CALC_CHANCE_PUBLIC_VARS = [
     "заражения", "обнаружения", "диверсии", "тяжести"
+]
+
+CALC_BUFF_PUBLIC_VARS = [
+    "синтез", "ускорение", "горячка"
 ]
 
 def _calc_inline_hint_keyboard(prefix: str):
@@ -10689,7 +11367,7 @@ def _calc_inline_error_text(mode_label: str, hint_text: str) -> str:
 def _calc_upgrade_hint_text() -> str:
     vars_txt = "\n".join([f"<code>{h(x)}</code>" for x in CALC_UPGRADE_PUBLIC_VARS])
     return (
-        "📋 Доступные переменные для подсчёта улучшения:\n"
+        "📋 Доступные переменные для подсчёта улучшений:\n"
         "<blockquote expandable>"
         f"{vars_txt}\n"
         "</blockquote>"
@@ -10702,6 +11380,15 @@ def _calc_chance_hint_text() -> str:
         "<blockquote expandable>"
         f"{vars_txt}\n"
         "</blockquote>"
+    )
+
+def _calc_buff_hint_text() -> str:
+    vars_txt = "\n".join([f"<code>{h(x)}</code>" for x in CALC_BUFF_PUBLIC_VARS]) 
+    return (
+        "📋 Доступные переменные для подсчёта усилений:\n"
+        "<blockquote expandable>"
+        f"{vars_txt}\n"
+        "\n</blockquote>"
     )
 
 def _fmt_pct_text(v: float) -> str:
@@ -10778,11 +11465,6 @@ def _calc_chance_payload(metric_token: str, lvl1: int, lvl2: int):
         )
     }
 
-CALC_BUFF_METRIC_ALIASES = {
-    "синтез": "SYN", "синтеза": "SYN", "синт": "SYN",
-    "ускорение": "ACC", "ускорения": "ACC", "ускор": "ACC", "ускр": "ACC",
-}
-
 def _calc_buff_payload(metric_token: str, lvl1: int, lvl2: int):
     key = CALC_BUFF_METRIC_ALIASES.get((metric_token or "").strip().lower())
     if not key:
@@ -10800,7 +11482,17 @@ def _calc_buff_payload(metric_token: str, lvl1: int, lvl2: int):
             "text": (
                 f"🧮 Калькулятор: ⚗️ Усиления синтеза <b>{n1}</b> → <b>{n2}</b>\n"
                 f"📈 Постоянный бонус: <b>{b1}</b> → <b>{b2}</b>\n"
-                f"🎲 Диапазон базового значения: <b>{1 + b1}</b>..<b>{100 + b1}</b> → <b>{1 + b2}</b>..<b>{100 + b2}</b>"
+                f"🎲 Диапазон базового значения: <b>1</b>..<b>100</b> → <b>{1 + b2}</b>..<b>{100 + b2}</b>"
+            )
+        }
+
+    if key == "FEV":
+        f1 = _calc_fever_sec(n1)
+        f2 = _calc_fever_sec(n2)
+        return {
+            "text": (
+                f"🧮 Калькулятор: ☠️ Усиления летальности <b>{n1}</b> → <b>{n2}</b>\n"
+                f"🌡️ Горячка: <b>{_format_hm_from_seconds(f1)}</b> → <b>{_format_hm_from_seconds(f2)}</b>"
             )
         }
 
@@ -10884,6 +11576,12 @@ def _inline_calc_req_from_query(query: str):
         prefix_for_button = toks_raw[0]
         toks_raw = toks_raw[1:]
         toks = toks[1:]
+    elif toks[0] in CALC_BUFF_MODE_ALIASES:
+        explicit = True
+        mode = "BUFF"
+        prefix_for_button = toks_raw[0]
+        toks_raw = toks_raw[1:]
+        toks = toks[1:]
     elif toks[0] in ("ку", "кпк"):
         explicit = True
         mode = "UPG"
@@ -10896,6 +11594,46 @@ def _inline_calc_req_from_query(query: str):
         prefix_for_button = toks_raw[0]
         toks_raw = toks_raw[1:]
         toks = toks[1:]
+    elif toks[0] in ("кс", "кус"):
+        explicit = True
+        mode = "BUFF"
+        prefix_for_button = toks_raw[0]
+        toks_raw = toks_raw[1:]
+        toks = toks[1:]
+
+    if mode == "BUFF":
+        hint_text = _calc_buff_hint_text()
+        err_text = _calc_inline_error_text("усиления", hint_text)
+
+        if len(toks) < 3:
+            return {
+                "kind": "BUFF",
+                "ready": False,
+                "title": "Калькулятор усилений",
+                "desc": "Введите переменную и уровни",
+                "text": err_text,
+                "reply_markup": _calc_inline_hint_keyboard(prefix_for_button),
+            }
+
+        payload = _calc_buff_payload(toks[0], toks[1], toks[2])
+        if not payload:
+            return {
+                "kind": "BUFF",
+                "ready": False,
+                "title": "Калькулятор усилений",
+                "desc": "Введите переменную и уровни",
+                "text": err_text,
+                "reply_markup": _calc_inline_hint_keyboard(prefix_for_button),
+            }
+
+        return {
+            "kind": "BUFF",
+            "ready": True,
+            "title": "Калькулятор усилений",
+            "desc": "Расчёты выполнены",
+            "text": payload["text"],
+            "reply_markup": None,
+        }
 
     if mode == "UPG":
         if not explicit:
@@ -11168,7 +11906,9 @@ def cb_upgrade(cq):
             ok, txt, _ = _execute_upgrade_by_skill_point(uid, code)
             rm = kb_upgrade(uid, code, 1, src, ictype=ictype, ictx=ictx) if ok else None
             if ok and src == "D":
-                rm.row(InlineKeyboardButton("Вернуться к досье", callback_data=_labui_data(uid, "D")))
+                rm.row(InlineKeyboardButton("Вернуться к досье", callback_data=_labui_data(uid, "D"), style="primary"))
+            elif ok and src == "PB":
+                rm.row(InlineKeyboardButton("Вернуться к сводке", callback_data=_pathogens_ui_data(uid, "INFO", 0), style="primary"))
             _edit(txt, reply_markup=rm)
             bot.answer_callback_query(cq.id)
             return
@@ -11177,7 +11917,9 @@ def cb_upgrade(cq):
             txt = _build_upgrade_preview(uid, code, steps)
             rm = kb_upgrade(uid, code, steps, src, ictype=ictype, ictx=ictx)
             if src == "D":
-                rm.row(InlineKeyboardButton("Вернуться к досье", callback_data=_labui_data(uid, "D")))
+                rm.row(InlineKeyboardButton("Вернуться к досье", callback_data=_labui_data(uid, "D"), style="primary"))
+            elif src == "PB":
+                rm.row(InlineKeyboardButton("Вернуться к сводке", callback_data=_pathogens_ui_data(uid, "INFO", 0), style="primary"))
             _edit(txt, reply_markup=rm)
             bot.answer_callback_query(cq.id)
             return
@@ -11189,7 +11931,9 @@ def cb_upgrade(cq):
             rm = kb_upgrade(uid, code, steps, src, ictype=ictype, ictx=ictx)
 
             if src == "D":
-                rm.row(InlineKeyboardButton("Вернуться к досье", callback_data=_labui_data(uid, "D")))
+                rm.row(InlineKeyboardButton("Вернуться к досье", callback_data=_labui_data(uid, "D"), style="primary"))
+            elif src == "PB":
+                rm.row(InlineKeyboardButton("Вернуться к сводке", callback_data=_pathogens_ui_data(uid, "INFO", 0), style="primary"))
 
             if src == "I" and ictype:
                 try:
@@ -11219,7 +11963,10 @@ def cb_upgrade(cq):
         else:
             if src == "D":
                 rm = InlineKeyboardMarkup()
-                rm.add(InlineKeyboardButton("Вернуться к досье", callback_data=_labui_data(uid, "D")))
+                rm.add(InlineKeyboardButton("Вернуться к досье", callback_data=_labui_data(uid, "D"), style="primary"))
+            elif src == "PB":
+                rm = InlineKeyboardMarkup()
+                rm.add(InlineKeyboardButton("Вернуться к сводке", callback_data=_pathogens_ui_data(uid, "INFO", 0), style="primary"))
             else:
                 rm = None
 
@@ -11393,6 +12140,74 @@ def handle_synth_command(message):
     text = synth_attempt(uid)
     bot.reply_to(message, text, reply_markup=kb_synth(uid), disable_web_page_preview=True)
 
+#             краткая сводка
+def _pathogens_ui_data(uid: int, kind: str, count: int = 1) -> str:
+    return f"PATHUI:{int(uid)}:{kind}:{int(count)}"
+
+def _pathogens_ui_parse(data: str):
+    try:
+        p = (data or "").split(":")
+        if len(p) != 4 or p[0] != "PATHUI":
+            return None
+        return int(p[1]), str(p[2]), int(p[3])
+    except Exception:
+        return None
+
+def kb_pathogens(uid: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup()
+    kb.row(_ikb("Провести быстрое заражение", callback_data=_pathogens_ui_data(uid, "R", 1), style="success"))
+    kb.row(
+        _ikb("× 2", callback_data=_pathogens_ui_data(uid, "R", 2), style="success"),
+        _ikb("× 5", callback_data=_pathogens_ui_data(uid, "R", 5), style="success"),
+        _ikb("× 10", callback_data=_pathogens_ui_data(uid, "R", 10), style="success"),
+    )
+    return kb
+
+def render_pathogens_info(uid: int) -> str:
+    ensure_lab_exists(int(uid))
+    lab = get_lab(int(uid))
+    pathogen_name = (lab["pathogen_name"] or "").strip() or "неизвестный патоген"
+
+    lines = []
+    lines.append("📋 Краткая сводка")
+    lines.append(f'🏷 Имя патогена: {h(pathogen_name)}')
+    lines.append(f'🧪 Кол-во патогенов: {int(lab["ready_pathogens"] or 0)} из {int(lab["total_pathogens"] or 0)}')
+    npi = int(lab["next_pathogen_in"] or 0)
+    if npi > 0:
+        lines.append(f'⏱️ Новый патоген через {_format_hms(npi)}')
+    else:
+        lines.append('⏱️ Достигнут лимит производства')
+    return "\n".join(lines)
+
+def kb_pathogen_info(uid: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=4)
+    kb.row(
+        _ikb_premium_icon_only("🦠", callback_data=_upg_cb("P", uid, "INF", 1, "PB")),
+        _ikb_premium_icon_only("☠️", callback_data=_upg_cb("P", uid, "LET", 1, "PB")),
+        _ikb_premium_icon_only("🧿", callback_data=_upg_cb("P", uid, "HEA", 1, "PB")),
+        _ikb_premium_icon_only("🛡️", callback_data=_upg_cb("P", uid, "IMM", 1, "PB")),
+    )
+    return kb
+
+def kb_pathogen_brief_back(uid: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("Вернуться к сводке", callback_data=_pathogens_ui_data(uid, "INFO", 0), ))
+    return kb
+
+def render_pathogen_brief(uid: int) -> str:
+    ensure_lab_exists(int(uid))
+    lab = get_lab(int(uid))
+    pathogen_name = (lab["pathogen_name"] or "").strip() or "неизвестный патоген"
+
+    lines = []
+    lines.append("📋 Краткая сводка")
+    lines.append(f'🏷 Имя патогена: {h(pathogen_name)}')
+    lines.append(f'🦠 Заразность: {int(lab["infectivity"] or 0)} ур')
+    lines.append(f'☠️ Летальность: {int(lab["lethality"] or 0)} ур')
+    lines.append(f'🧿 Тяжесть: {int(lab["heaviness"] or 0)} ур')
+    lines.append(f'🛡 Иммунитет: {int(lab["immunity"] or 0)} ур')
+    return "\n".join(lines)
+
 #             вакцина
 def get_fever_and_vaccines(user_id: int) -> tuple[int, str, int]:
     uid = int(user_id)
@@ -11430,9 +12245,9 @@ def _vaccine_fail_pct(target_id: int) -> float:
 def kb_vaccine_retry(uid: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup()
     kb.row(
-        _ikb_premium_counter("💉", "× 1", callback_data=_cb_use_vaccine_x(int(uid), 1)),
-        _ikb_premium_counter("💉", "× 5", callback_data=_cb_use_vaccine_x(int(uid), 5)),
-        _ikb_premium_counter("💉", "× 10", callback_data=_cb_use_vaccine_x(int(uid), 10)),
+        _ikb_premium_counter("💉", "× 1", callback_data=_cb_use_vaccine_x(int(uid), 1), style="primary"),
+        _ikb_premium_counter("💉", "× 5", callback_data=_cb_use_vaccine_x(int(uid), 5), style="primary"),
+        _ikb_premium_counter("💉", "× 10", callback_data=_cb_use_vaccine_x(int(uid), 10), style="primary"),
     )
     return kb
 
@@ -11866,6 +12681,8 @@ def on_my_chat_member_update(update):
             fake_user.first_name = None
             fake_user.last_name = None
             upsert_user(fake_user)
+            set_pm_opened(int(chat_id), 1)
+            set_notify_prefs(int(chat_id), 0, 0)
 
     except Exception as e:
         send_error_report("on_my_chat_member_update", e)
@@ -12274,6 +13091,8 @@ def cb_infect_retry(cq):
                 parsed.args = f"р {count}"
             elif mode == "p":
                 parsed.args = f"больше {count}"
+            elif mode == "e":
+                parsed.args = f"равный {count}"
             else:
                 parsed.args = f"меньше {count}"
 
@@ -12313,6 +13132,97 @@ def cb_infect_retry(cq):
         bot.answer_callback_query(cq.id)
     except Exception as e:
         send_error_report("cb_infect_retry", e)
+        try:
+            bot.answer_callback_query(cq.id)
+        except Exception:
+            pass
+
+@bot.callback_query_handler(func=lambda cq: (cq.data or "").startswith("PATHUI:"))
+def cb_pathogens_ui(cq):
+    try:
+        info = _pathogens_ui_parse(cq.data or "")
+        if not info:
+            bot.answer_callback_query(cq.id)
+            return
+
+        owner_id, kind, count = info
+        if int(cq.from_user.id) != int(owner_id):
+            bot.answer_callback_query(cq.id)
+            return
+
+        if kind == "INFO":
+            text = render_pathogen_brief(int(owner_id))
+            rm = kb_pathogen_info(int(owner_id))
+
+            if cq.inline_message_id:
+                limited_edit_message_text(
+                    text=text,
+                    inline_id=cq.inline_message_id,
+                    parse_mode="HTML",
+                    reply_markup=rm,
+                    disable_web_page_preview=True
+                )
+            elif cq.message:
+                limited_edit_message_text(
+                    text=text,
+                    chat_id=cq.message.chat.id,
+                    msg_id=cq.message.message_id,
+                    parse_mode="HTML",
+                    reply_markup=rm,
+                    disable_web_page_preview=True
+                )
+
+            bot.answer_callback_query(cq.id)
+            return
+
+        class _P:
+            cmd = "infect"
+            has_prefix_char = False
+            prefix_char = None
+            raw = ""
+            args = ""
+
+        parsed = _P()
+        if kind == "R":
+            parsed.args = f"р {int(count)}"
+
+        class _FakeChat:
+            pass
+
+        class _FakeMsg:
+            pass
+
+        fm = _FakeMsg()
+        fm.from_user = cq.from_user
+        fm.reply_to_message = None
+        fm.text = ""
+        fm.via_bot = None
+        fm.chat = _FakeChat()
+
+        edit_ctx = {"pathogens_summary": True}
+
+        if cq.message:
+            fm.chat = cq.message.chat
+            fm.message_id = int(cq.message.message_id)
+            fm.text = getattr(cq.message, "text", "") or ""
+            edit_ctx.update({"chat_id": cq.message.chat.id, "msg_id": cq.message.message_id})
+        else:
+            fm.chat.id = 0
+            fm.chat.type = "inline"
+            fm.message_id = 0
+            if cq.inline_message_id:
+                edit_ctx.update({"inline_id": cq.inline_message_id})
+
+        handle_infect_command(
+            fm,
+            parsed,
+            edit_ctx=edit_ctx,
+            actor_user=cq.from_user
+        )
+
+        bot.answer_callback_query(cq.id)
+    except Exception as e:
+        send_error_report("cb_pathogens_ui", e)
         try:
             bot.answer_callback_query(cq.id)
         except Exception:
@@ -12724,6 +13634,12 @@ def cb_settings_ui(cq):
         elif act == "NOFF":
             set_notify_prefs(int(uid), 0, 1)
 
+        elif act == "NCHAT":
+            if not cq.message or (cq.message.chat.type not in ("group", "supergroup")):
+                bot.answer_callback_query(cq.id)
+                return
+            set_notify_prefs(int(uid), int(cq.message.chat.id), 0)
+
         elif act == "CN":
             _cid, _cname, role = _user_corp_role_soft(int(uid))
             if role not in ("owner", "deputy"):
@@ -12736,8 +13652,10 @@ def cb_settings_ui(cq):
             bot.answer_callback_query(cq.id)
             return
 
+        current_chat_id = int(cq.message.chat.id) if cq.message else 0
+        current_chat_type = (cq.message.chat.type if cq.message else "private")
         text = render_settings_text(int(uid))
-        rm = kb_settings(int(uid))
+        rm = kb_settings(int(uid), current_chat_id, current_chat_type)
 
         if cq.inline_message_id:
             limited_edit_message_text(
@@ -13260,6 +14178,2002 @@ def cb_lab_delete_cancel(cq):
         except Exception:
             pass
 
+# DUELS
+CB_DUEL_ACCEPT = "DUEL_ACCEPT"
+CB_DUEL_DECLINE = "DUEL_DECLINE"
+CB_DUEL_FIRE = "DUEL_FIRE"
+CB_DUEL_AIM = "DUEL_AIM"
+CB_DUEL_BREAK_AIM = "DUEL_BREAK_AIM"
+CB_DUEL_SURRENDER = "DUEL_SURRENDER"
+CB_DUEL_CANCEL = "DUEL_CANCEL"
+CB_DUEL_INV_CANCEL = "DUEL_INV_CANCEL"
+CB_DUEL_REMATCH = "DUEL_REMATCH"
+
+DUEL_INVITE_TIMEOUT_SEC = 5 * 60
+DUEL_TURN_TIMEOUT_SEC = 5 * 60
+DUEL_BASE_HIT_PCT = 20
+DUEL_MAX_TURNS = 15
+
+def _duel_stake_text(amount: int) -> str:
+    n = int(amount or 0)
+    return f"{_fmt_k(n)} {_ru_form(n, 'био-материал', 'био-материала', 'био-материалов')}"
+
+def _duel_accept_cb(invite_id: int, target_id: int) -> str:
+    return f"{CB_DUEL_ACCEPT}:{int(invite_id)}:{int(target_id)}"
+
+def _duel_decline_cb(invite_id: int, target_id: int) -> str:
+    return f"{CB_DUEL_DECLINE}:{int(invite_id)}:{int(target_id)}"
+
+def _duel_inv_cancel_cb(invite_id: int, challenger_id: int) -> str:
+    return f"{CB_DUEL_INV_CANCEL}:{int(invite_id)}:{int(challenger_id)}"
+
+def _duel_rematch_cb(duel_id: int, actor_id: int = 0) -> str:
+    return f"{CB_DUEL_REMATCH}:{int(duel_id)}:{int(actor_id)}"
+
+def kb_duel_invite(invite_id: int, target_id: int, challenger_id: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.row(
+        _ikb("🗡️ Принять", callback_data=_duel_accept_cb(int(invite_id), int(target_id)), style="success"),
+        _ikb("🏳️ Отказать", callback_data=_duel_decline_cb(int(invite_id), int(target_id)), style="danger"),
+    )
+    kb.row(
+        _ikb("✖️ Отменить дуэль", callback_data=_duel_inv_cancel_cb(int(invite_id), int(challenger_id)), style="danger")
+    )
+    return kb
+
+def kb_duel_rematch(duel_row) -> Optional[InlineKeyboardMarkup]:
+    if not duel_row:
+        return None
+
+    status = (duel_row["status"] or "").strip()
+    if status not in ("finished", "draw"):
+        return None
+
+    duel_id = int(duel_row["duel_id"])
+    allowed_id = int(duel_row["loser_id"] or 0) if status == "finished" else 0
+
+    kb = InlineKeyboardMarkup()
+    kb.row(
+        _ikb("⚔️ Реванш", callback_data=_duel_rematch_cb(int(duel_id), int(allowed_id)), style="primary")
+    )
+    return kb
+
+def _duel_user_tag(chat_id: int, user_id: int) -> str:
+    with chat_name_context(int(chat_id)):
+        return public_user_tag(int(user_id))
+
+def _duel_invite_text(chat_id: int, challenger_id: int, target_id: int, stake_amount: int = 0) -> str:
+    with chat_name_context(int(chat_id)):
+        target_tag = public_user_tag(int(target_id))
+        challenger_tag = public_user_tag(int(challenger_id))
+
+    lines = [
+        f"⚔️ <b>{target_tag}</b>, минуточку внимания!",
+        f"<b>{challenger_tag}</b> вызывает Вас на дуэль",
+    ]
+    if int(stake_amount or 0) > 0:
+        lines.append(f"Ставка: 💊 {_duel_stake_text(int(stake_amount))}")
+    lines.append("")
+    lines.append('💬 Чтобы принять вызов, введите "<code>Био дуэль да</code>", или отменить "<code>Био дуэль нет</code>"')
+    lines.append("На принятие решения у вас есть 5 минут")
+    return "\n".join(lines)
+
+def _duel_declined_text(chat_id: int, challenger_id: int, target_id: int) -> str:
+    with chat_name_context(int(chat_id)):
+        challenger_tag = public_user_tag(int(challenger_id))
+        target_tag = public_user_tag(int(target_id))
+    return f"🏳️ <b>{target_tag}</b> отказался от дуэли с <b>{challenger_tag}</b>."
+
+def _duel_invite_expired_text() -> str:
+    return "📜 Никто из участников дуэли не проявил активности.\nДуэль отменена."
+
+def _duel_started_text(chat_id: int, challenger_id: int, target_id: int, stake_amount: int, first_turn_id: int) -> str:
+    with chat_name_context(int(chat_id)):
+        target_tag = public_user_tag(int(target_id))
+        challenger_tag = public_user_tag(int(challenger_id))
+        first_tag = public_user_tag(int(first_turn_id))
+
+    lines = [
+        f"✅ <b>{target_tag}</b> принял вызов <b>{challenger_tag}</b> на дуэль" + (
+            f" со ставкой 💊 {_duel_stake_text(int(stake_amount))}" if int(stake_amount or 0) > 0 else ""
+        ),
+        'На время дуэли другие игроки могут делать свои ставки, команда "<code>Био ставка</code> [кол-во био-материалов] {кандидат}"',
+        "",
+        f"Право первого выстрела предоставляется <b>{first_tag}</b>",
+        "На каждый выстрел у вас есть 5 минут",
+        '💬 Произвести выстрел: "<code>Био выстрел</code>"',
+    ]
+    return "\n".join(lines)
+
+def _duel_superseded_text(chat_id: int, challenger_id: int, target_id: int, accepted_challenger_id: int) -> str:
+    with chat_name_context(int(chat_id)):
+        challenger_tag = public_user_tag(int(challenger_id))
+        target_tag = public_user_tag(int(target_id))
+        accepted_tag = public_user_tag(int(accepted_challenger_id))
+
+    return (
+        f"📜 <b>{challenger_tag}</b>, смеем Вам сообщить!\n"
+        f"<b>{target_tag}</b> принял вызов на дуэль <b>{accepted_tag}</b>.\n"
+        "Вызовите на дуэль другого игрока или подождите, пока этот игрок завершит текущую дуэль."
+    )
+
+def _duel_inactive_text(chat_id: int, current_turn_user_id: int) -> str:
+    with chat_name_context(int(chat_id)):
+        cur_tag = public_user_tag(int(current_turn_user_id))
+    return f"📜 <b>{cur_tag}</b> не проявил активности.\nДуэль отменена."
+
+def _duel_refund_materials(user_id: int, amount: int):
+    amt = int(amount or 0)
+    if amt <= 0:
+        return
+    db_exec(
+        "UPDATE labs SET all_bio_mater=COALESCE(all_bio_mater,0)+? WHERE user_id=?",
+        (amt, int(user_id)),
+        commit=True
+    )
+
+def _duel_take_materials(user_id: int, amount: int) -> bool:
+    amt = int(amount or 0)
+    if amt <= 0:
+        return True
+
+    row = db_one("SELECT COALESCE(all_bio_mater,0) AS m FROM labs WHERE user_id=?", (int(user_id),))
+    have = int(row["m"] or 0) if row else 0
+    if have < amt:
+        return False
+
+    db_exec(
+        "UPDATE labs SET all_bio_mater=COALESCE(all_bio_mater,0)-? WHERE user_id=?",
+        (amt, int(user_id)),
+        commit=True
+    )
+    return True
+
+def _duel_user_has_active_duel_in_chat(chat_id: int, user_id: int) -> bool:
+    row = db_one(
+        "SELECT 1 FROM duels "
+        "WHERE chat_id=? AND status='active' AND (challenger_id=? OR target_id=?) "
+        "LIMIT 1",
+        (int(chat_id), int(user_id), int(user_id))
+    )
+    return row is not None
+
+def _duel_user_has_outgoing_pending_invite_in_chat(chat_id: int, user_id: int) -> bool:
+    row = db_one(
+        "SELECT 1 FROM duel_invites "
+        "WHERE chat_id=? AND status='pending' AND challenger_id=? "
+        "LIMIT 1",
+        (int(chat_id), int(user_id))
+    )
+    return row is not None
+
+def _duel_latest_pending_invite_for_target(chat_id: int, target_id: int):
+    return db_one(
+        "SELECT invite_id, chat_id, challenger_id, target_id, stake_amount, created_at, expires_at, status, msg_chat_id, msg_id "
+        "FROM duel_invites "
+        "WHERE chat_id=? AND target_id=? AND status='pending' "
+        "ORDER BY invite_id DESC LIMIT 1",
+        (int(chat_id), int(target_id))
+    )
+
+def _duel_invite_by_id(invite_id: int):
+    return db_one(
+        "SELECT invite_id, chat_id, challenger_id, target_id, stake_amount, created_at, expires_at, status, msg_chat_id, msg_id "
+        "FROM duel_invites WHERE invite_id=? LIMIT 1",
+        (int(invite_id),)
+    )
+
+def _duel_latest_outgoing_pending_invite(chat_id: int, challenger_id: int):
+    return db_one(
+        "SELECT invite_id, chat_id, challenger_id, target_id, stake_amount, created_at, expires_at, status, msg_chat_id, msg_id "
+        "FROM duel_invites "
+        "WHERE chat_id=? AND challenger_id=? AND status='pending' "
+        "ORDER BY invite_id DESC LIMIT 1",
+        (int(chat_id), int(challenger_id))
+    )
+
+def _duel_invite_cancelled_text(chat_id: int, challenger_id: int, target_id: int, stake_amount: int = 0) -> str:
+    with chat_name_context(int(chat_id)):
+        ctag = public_user_tag(int(challenger_id))
+        ttag = public_user_tag(int(target_id))
+
+    txt = f"✖️ <b>{ctag}</b> отменил вызов на дуэль для <b>{ttag}</b>."
+    if int(stake_amount or 0) > 0:
+        txt += "\n💊 Ставка инициатора возвращена."
+    return txt
+
+def _duel_cancel_pending_invite(invite_row, actor_id: int, *, via_message=None, edit_existing: bool = True) -> tuple[bool, str]:
+    if not invite_row:
+        return False, "📑 Вызов на дуэль не найден."
+
+    if (invite_row["status"] or "").strip() != "pending":
+        return False, "📑 Этот вызов уже неактивен."
+
+    challenger_id = int(invite_row["challenger_id"] or 0)
+    if int(actor_id) != int(challenger_id):
+        return False, "📑 Отменить вызов может только его инициатор."
+
+    db_exec(
+        "UPDATE duel_invites SET status='cancelled' WHERE invite_id=?",
+        (int(invite_row["invite_id"]),),
+        commit=True
+    )
+    _duel_refund_invite_stake(invite_row)
+
+    txt = _duel_invite_cancelled_text(
+        int(invite_row["chat_id"]),
+        int(invite_row["challenger_id"]),
+        int(invite_row["target_id"]),
+        int(invite_row["stake_amount"] or 0)
+    )
+
+    if edit_existing:
+        _duel_edit_invite_message(invite_row, txt, reply_markup=None)
+    else:
+        try:
+            if via_message is not None:
+                bot.reply_to(via_message, txt, parse_mode="HTML", disable_web_page_preview=True)
+            else:
+                bot.send_message(
+                    int(invite_row["chat_id"]),
+                    txt,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True
+                )
+        except Exception:
+            pass
+
+    return True, "❎ Вызов на дуэль отменён."
+
+def _duel_rematch_started_text(chat_id: int, challenger_id: int, target_id: int, stake_amount: int, first_turn_id: int) -> str:
+    with chat_name_context(int(chat_id)):
+        ctag = public_user_tag(int(challenger_id))
+        ttag = public_user_tag(int(target_id))
+        ftag = public_user_tag(int(first_turn_id))
+
+    lines = [
+        f"⚔️ <b>{ctag}</b> и <b>{ttag}</b> начинают реванш" + (
+            f" на ставку 💊 {_duel_stake_text(int(stake_amount))}" if int(stake_amount or 0) > 0 else ""
+        ),
+        "",
+        f"Право первого выстрела предоставляется <b>{ftag}</b>",
+        "На каждый выстрел у вас есть 5 минут",
+        '💬 Произвести выстрел: "<code>Био выстрел</code>"',
+    ]
+    return "\n".join(lines)
+
+def _duel_start_rematch_from_finished(duel_row, actor_id: int) -> tuple[bool, str]:
+    if not duel_row:
+        return False, "📑 Дуэль не найдена."
+
+    status = (duel_row["status"] or "").strip()
+    if status not in ("finished", "draw"):
+        return False, "📑 Реванш доступен только после завершения дуэли."
+
+    challenger_id = int(duel_row["challenger_id"] or 0)
+    target_id = int(duel_row["target_id"] or 0)
+    stake_amount = int(duel_row["stake_amount"] or 0)
+    chat_id = int(duel_row["chat_id"] or 0)
+
+    allowed = set()
+    if status == "finished":
+        loser_id = int(duel_row["loser_id"] or 0)
+        allowed = {loser_id} if loser_id > 0 else set()
+        if int(actor_id) not in allowed:
+            return False, "📑 Реванш может начать только проигравший игрок."
+    else:
+        allowed = {challenger_id, target_id}
+        if int(actor_id) not in allowed:
+            return False, "📑 При ничьей реванш может начать только один из участников дуэли."
+
+    if not is_lab_active(int(challenger_id)) or not is_lab_active(int(target_id)):
+        return False, "📑 Один из участников ещё не создал лабораторию."
+
+    if _duel_user_has_active_duel_in_chat(int(chat_id), int(challenger_id)) or _duel_user_has_outgoing_pending_invite_in_chat(int(chat_id), int(challenger_id)):
+        return False, "📑 Один из участников уже занят другой дуэлью или ожидает ответа."
+    if _duel_user_has_active_duel_in_chat(int(chat_id), int(target_id)) or _duel_user_has_outgoing_pending_invite_in_chat(int(chat_id), int(target_id)):
+        return False, "📑 Один из участников уже занят другой дуэлью или ожидает ответа."
+
+    if stake_amount > 0:
+        if not _duel_take_materials(int(challenger_id), int(stake_amount)):
+            return False, "📑 У одного из участников недостаточно био-материалов для реванша."
+        if not _duel_take_materials(int(target_id), int(stake_amount)):
+            _duel_refund_materials(int(challenger_id), int(stake_amount))
+            return False, "📑 У одного из участников недостаточно био-материалов для реванша."
+
+    now = int(now_ts())
+    first_turn_id = random.choice([int(challenger_id), int(target_id)])
+
+    with DB_LOCK:
+        c = conn.cursor()
+        try:
+            c.execute("BEGIN")
+            c.execute(
+                "INSERT INTO duels("
+                "invite_id, chat_id, challenger_id, target_id, stake_amount, "
+                "started_at, next_action_until, current_turn_user_id, "
+                "turns_done, challenger_aim_bonus, target_aim_bonus, "
+                "status, winner_id, loser_id, msg_chat_id, msg_id, ended_at"
+                ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    0,                                  # invite_id
+                    int(chat_id),                       # chat_id
+                    int(challenger_id),                 # challenger_id
+                    int(target_id),                     # target_id
+                    int(stake_amount),                  # stake_amount
+                    int(now),                           # started_at
+                    int(now + DUEL_TURN_TIMEOUT_SEC),   # next_action_until
+                    int(first_turn_id),                 # current_turn_user_id
+                    0,                                  # turns_done
+                    0,                                  # challenger_aim_bonus
+                    0,                                  # target_aim_bonus
+                    "active",                           # status
+                    0,                                  # winner_id
+                    0,                                  # loser_id
+                    int(duel_row["msg_chat_id"] or 0),  # msg_chat_id
+                    int(duel_row["msg_id"] or 0),       # msg_id
+                    0,                                  # ended_at
+                )
+            )
+            new_duel_id = int(c.lastrowid)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            if stake_amount > 0:
+                _duel_refund_materials(int(challenger_id), int(stake_amount))
+                _duel_refund_materials(int(target_id), int(stake_amount))
+            raise
+        finally:
+            try:
+                c.close()
+            except Exception:
+                pass
+
+    fresh = _duel_by_id(int(new_duel_id))
+    txt = _duel_rematch_started_text(
+        int(chat_id),
+        int(challenger_id),
+        int(target_id),
+        int(stake_amount),
+        int(first_turn_id)
+    )
+    _duel_emit_state(fresh, txt, reply_markup=kb_duel_actions(fresh), edit_existing=True)
+    return True, "✅ Реванш начался."
+
+def _duel_mark_invite_message(invite_id: int, chat_id: int, msg_id: int):
+    db_exec(
+        "UPDATE duel_invites SET msg_chat_id=?, msg_id=? WHERE invite_id=?",
+        (int(chat_id), int(msg_id), int(invite_id)),
+        commit=True
+    )
+
+def _duel_edit_invite_message(invite_row, text: str, reply_markup=None):
+    try:
+        mch = int(invite_row["msg_chat_id"] or 0)
+        mid = int(invite_row["msg_id"] or 0)
+        if mch != 0 and mid != 0:
+            limited_edit_message_text(
+                text=text,
+                chat_id=mch,
+                msg_id=mid,
+                parse_mode="HTML",
+                reply_markup=reply_markup,
+                disable_web_page_preview=True
+            )
+    except Exception:
+        pass
+
+def _duel_edit_duel_message(duel_row, text: str, reply_markup=None):
+    try:
+        mch = int(duel_row["msg_chat_id"] or 0)
+        mid = int(duel_row["msg_id"] or 0)
+        if mch != 0 and mid != 0:
+            limited_edit_message_text(
+                text=text,
+                chat_id=mch,
+                msg_id=mid,
+                parse_mode="HTML",
+                reply_markup=reply_markup,
+                disable_web_page_preview=True
+            )
+    except Exception:
+        pass
+
+def _duel_refund_invite_stake(invite_row):
+    amt = int(invite_row["stake_amount"] or 0)
+    if amt > 0:
+        _duel_refund_materials(int(invite_row["challenger_id"]), amt)
+
+def _duel_refund_duel_stakes(duel_row):
+    amt = int(duel_row["stake_amount"] or 0)
+    if amt <= 0:
+        return
+    _duel_refund_materials(int(duel_row["challenger_id"]), amt)
+    _duel_refund_materials(int(duel_row["target_id"]), amt)
+
+def _duel_by_id(duel_id: int):
+    return db_one(
+        "SELECT duel_id, invite_id, chat_id, challenger_id, target_id, stake_amount, started_at, next_action_until, current_turn_user_id, "
+        "turns_done, challenger_aim_bonus, target_aim_bonus, status, winner_id, loser_id, msg_chat_id, msg_id, ended_at "
+        "FROM duels WHERE duel_id=? LIMIT 1",
+        (int(duel_id),)
+    )
+
+def _duel_active_by_user_in_chat(chat_id: int, user_id: int):
+    return db_one(
+        "SELECT duel_id, invite_id, chat_id, challenger_id, target_id, stake_amount, started_at, next_action_until, current_turn_user_id, "
+        "turns_done, challenger_aim_bonus, target_aim_bonus, status, winner_id, loser_id, msg_chat_id, msg_id, ended_at "
+        "FROM duels "
+        "WHERE chat_id=? AND status='active' AND (challenger_id=? OR target_id=?) "
+        "ORDER BY duel_id DESC LIMIT 1",
+        (int(chat_id), int(user_id), int(user_id))
+    )
+
+def _duel_set_message_ref(duel_id: int, chat_id: int, msg_id: int):
+    db_exec(
+        "UPDATE duels SET msg_chat_id=?, msg_id=? WHERE duel_id=?",
+        (int(chat_id), int(msg_id), int(duel_id)),
+        commit=True
+    )
+
+def _duel_started_text_from_row(duel_row) -> str:
+    return _duel_started_text(
+        int(duel_row["chat_id"]),
+        int(duel_row["challenger_id"]),
+        int(duel_row["target_id"]),
+        int(duel_row["stake_amount"] or 0),
+        int(duel_row["current_turn_user_id"] or 0),
+    )
+
+def _duel_actor_bonus_cols(duel_row, actor_id: int) -> tuple[str, str]:
+    if int(actor_id) == int(duel_row["challenger_id"]):
+        return "challenger_aim_bonus", "target_aim_bonus"
+    return "target_aim_bonus", "challenger_aim_bonus"
+
+def _duel_opponent_id(duel_row, actor_id: int) -> int:
+    if int(actor_id) == int(duel_row["challenger_id"]):
+        return int(duel_row["target_id"])
+    return int(duel_row["challenger_id"])
+
+def _duel_actor_bonus(duel_row, actor_id: int) -> int:
+    if int(actor_id) == int(duel_row["challenger_id"]):
+        return int(duel_row["challenger_aim_bonus"] or 0)
+    return int(duel_row["target_aim_bonus"] or 0)
+
+def _duel_action_cb(tag: str, duel_id: int, actor_id: int) -> str:
+    return f"{str(tag)}:{int(duel_id)}:{int(actor_id)}"
+
+def kb_duel_actions(duel_row) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=2)
+    duel_id = int(duel_row["duel_id"])
+    actor_id = int(duel_row["current_turn_user_id"] or 0)
+
+    kb.row(
+        _ikb("🔫 Выстрел", callback_data=_duel_action_cb(CB_DUEL_FIRE, duel_id, actor_id), style="success"),
+        _ikb("👁️‍🗨️ Прицелиться", callback_data=_duel_action_cb(CB_DUEL_AIM, duel_id, actor_id)),
+    )
+
+    opponent_id = _duel_opponent_id(duel_row, actor_id)
+    if _duel_actor_bonus(duel_row, opponent_id) > 0:
+        kb.row(
+            _ikb("🪃 Сбить прицел", callback_data=_duel_action_cb(CB_DUEL_BREAK_AIM, duel_id, actor_id))
+        )
+
+    if int(duel_row["turns_done"] or 0) == 0:
+        kb.row(
+            _ikb(
+                "✖️ Отменить дуэль",
+                callback_data=_duel_action_cb(CB_DUEL_CANCEL, duel_id, int(duel_row["challenger_id"])),
+                style="danger"
+            )
+        )
+
+    kb.row(
+        _ikb("🏳️ Сдаться", callback_data=_duel_action_cb(CB_DUEL_SURRENDER, duel_id, actor_id), style="danger")
+    )
+    return kb
+
+def _duel_emit_state(duel_row, text: str, reply_markup=None, *, via_message=None, edit_existing: bool = True):
+    if edit_existing:
+        mch = int(duel_row["msg_chat_id"] or 0)
+        mid = int(duel_row["msg_id"] or 0)
+        if mch != 0 and mid != 0:
+            _duel_edit_duel_message(duel_row, text, reply_markup=reply_markup)
+            return
+
+    if via_message is not None:
+        sent = bot.reply_to(
+            via_message,
+            text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=reply_markup
+        )
+    else:
+        sent = bot.send_message(
+            int(duel_row["chat_id"]),
+            text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=reply_markup
+        )
+
+    try:
+        _duel_set_message_ref(int(duel_row["duel_id"]), int(sent.chat.id), int(sent.message_id))
+    except Exception:
+        pass
+
+def _duel_win_extra_line(chat_id: int, winner_id: int, stake_amount: int) -> str:
+    amt = int(stake_amount or 0)
+    if amt <= 0:
+        return ""
+    with chat_name_context(int(chat_id)):
+        wtag = public_user_tag(int(winner_id))
+    return f"\nПобедитель <b>{wtag}</b> получает на свой счёт +{_fmt_k(amt)} 💊"
+
+def _duel_hit_text(chat_id: int, winner_id: int, loser_id: int, stake_amount: int) -> str:
+    with chat_name_context(int(chat_id)):
+        wtag = public_user_tag(int(winner_id))
+        ltag = public_user_tag(int(loser_id))
+    return (
+        f"💀🔫 Попадание!\n"
+        f"<b>{wtag}</b> попал в <b>{ltag}</b>"
+        f"{_duel_win_extra_line(int(chat_id), int(winner_id), int(stake_amount))}"
+    )
+
+def _duel_miss_text(chat_id: int, actor_id: int, next_id: int) -> str:
+    with chat_name_context(int(chat_id)):
+        atag = public_user_tag(int(actor_id))
+        ntag = public_user_tag(int(next_id))
+    return (
+        f"🔫 <b>{atag}</b> стреляет, но не попадает\n"
+        f"Ход <b>{ntag}</b>:"
+    )
+
+def _duel_aim_text(chat_id: int, actor_id: int, next_id: int, multiplier: int) -> str:
+    with chat_name_context(int(chat_id)):
+        atag = public_user_tag(int(actor_id))
+        ntag = public_user_tag(int(next_id))
+    return (
+        f"👁️‍🗨️ <b>{atag}</b> прицеливается получше (×{int(multiplier)})\n"
+        f"Ход <b>{ntag}</b>:"
+    )
+
+def _duel_break_aim_text(chat_id: int, actor_id: int, next_id: int) -> str:
+    with chat_name_context(int(chat_id)):
+        atag = public_user_tag(int(actor_id))
+        ntag = public_user_tag(int(next_id))
+    action_text = h(pick_duel_misalign_text())
+    return (
+        f"🪃 <b>{atag}</b> {action_text} и сбил прицел <b>{ntag}</b>.\n"
+        f"Ход <b>{ntag}</b>:"
+    )
+
+def _duel_surrender_text(chat_id: int, winner_id: int, loser_id: int, stake_amount: int) -> str:
+    with chat_name_context(int(chat_id)):
+        wtag = public_user_tag(int(winner_id))
+        ltag = public_user_tag(int(loser_id))
+    return (
+        f"🏳️ <b>{ltag}</b> сдаётся.\n"
+        f"Победитель дуэли — <b>{wtag}</b>"
+        f"{_duel_win_extra_line(int(chat_id), int(winner_id), int(stake_amount))}"
+    )
+
+def _duel_cancelled_text(chat_id: int, challenger_id: int, target_id: int, stake_amount: int) -> str:
+    with chat_name_context(int(chat_id)):
+        ctag = public_user_tag(int(challenger_id))
+        ttag = public_user_tag(int(target_id))
+
+    txt = f"✖️ <b>{ctag}</b> отменил дуэль с <b>{ttag}</b>."
+    if int(stake_amount or 0) > 0:
+        txt += "\n💊 Ставки дуэлянтов возвращены."
+    return txt
+
+def _duel_cancel_before_moves(duel_row, actor_id: int, *, via_message=None, edit_existing: bool = True) -> tuple[bool, str]:
+    if not duel_row:
+        return False, "📑 Дуэль не найдена."
+
+    if (duel_row["status"] or "").strip() != "active":
+        return False, "📑 Эта дуэль уже завершена."
+
+    challenger_id = int(duel_row["challenger_id"] or 0)
+    target_id = int(duel_row["target_id"] or 0)
+    stake_amount = int(duel_row["stake_amount"] or 0)
+    duel_id = int(duel_row["duel_id"] or 0)
+
+    if int(actor_id) != int(challenger_id):
+        return False, "📑 Отменить дуэль до начала ходов может только её инициатор."
+
+    if int(duel_row["turns_done"] or 0) != 0:
+        return False, "📑 Дуэль уже началась. Отменить её больше нельзя."
+
+    now = int(now_ts())
+
+    db_exec(
+        "UPDATE duels SET status='cancelled', ended_at=?, next_action_until=0 WHERE duel_id=?",
+        (int(now), int(duel_id)),
+        commit=True
+    )
+
+    _duel_refund_duel_stakes(duel_row)
+    _duel_mark_bets_refunded(int(duel_id))
+
+    fresh = _duel_by_id(int(duel_id)) or duel_row
+    txt = _duel_cancelled_text(
+        int(duel_row["chat_id"]),
+        int(challenger_id),
+        int(target_id),
+        int(stake_amount)
+    )
+    _duel_emit_state(fresh, txt, reply_markup=None, via_message=via_message, edit_existing=edit_existing)
+    return True, "❎ Дуэль отменена."
+
+def _duel_draw_text(chat_id: int, challenger_id: int, target_id: int) -> str:
+    with chat_name_context(int(chat_id)):
+        ctag = public_user_tag(int(challenger_id))
+        ttag = public_user_tag(int(target_id))
+    return (
+        "Ход завершён."
+        f"🤝 <b>{ctag}</b> и <b>{ttag}</b> не смогли определить победителя.\n"
+        f"Ничья."
+    )
+
+def _duel_stats_ensure(user_id: int):
+    db_exec("INSERT OR IGNORE INTO duel_stats(user_id) VALUES (?)", (int(user_id),), commit=True)
+
+def _duel_stats_add_win(user_id: int, stake_amount: int):
+    _duel_stats_ensure(int(user_id))
+    row = db_one(
+        "SELECT wins, draws, losses, max_win_materials, max_lose_materials, win_streak, best_win_streak "
+        "FROM duel_stats WHERE user_id=?",
+        (int(user_id),)
+    )
+    cur_streak = int(row["win_streak"] or 0) if row else 0
+    best_streak = int(row["best_win_streak"] or 0) if row else 0
+    max_win = int(row["max_win_materials"] or 0) if row else 0
+
+    new_streak = cur_streak + 1
+    new_best = max(best_streak, new_streak)
+    new_max_win = max(max_win, int(stake_amount or 0))
+
+    db_exec(
+        "UPDATE duel_stats SET wins=COALESCE(wins,0)+1, win_streak=?, best_win_streak=?, max_win_materials=? WHERE user_id=?",
+        (int(new_streak), int(new_best), int(new_max_win), int(user_id)),
+        commit=True
+    )
+
+def _duel_stats_add_loss(user_id: int, stake_amount: int):
+    _duel_stats_ensure(int(user_id))
+    row = db_one(
+        "SELECT max_lose_materials FROM duel_stats WHERE user_id=?",
+        (int(user_id),)
+    )
+    max_lose = int(row["max_lose_materials"] or 0) if row else 0
+    new_max_lose = max(max_lose, int(stake_amount or 0))
+
+    db_exec(
+        "UPDATE duel_stats SET losses=COALESCE(losses,0)+1, win_streak=0, max_lose_materials=? WHERE user_id=?",
+        (int(new_max_lose), int(user_id)),
+        commit=True
+    )
+
+def _duel_stats_add_draw(user_id: int):
+    _duel_stats_ensure(int(user_id))
+    db_exec(
+        "UPDATE duel_stats SET draws=COALESCE(draws,0)+1 WHERE user_id=?",
+        (int(user_id),),
+        commit=True
+    )
+
+def _duel_finish_victory(duel_row, winner_id: int, loser_id: int, text: str, *, via_message=None, edit_existing: bool = True):
+    duel_id = int(duel_row["duel_id"])
+    stake_amount = int(duel_row["stake_amount"] or 0)
+    now = int(now_ts())
+
+    if stake_amount > 0:
+        db_exec(
+            "UPDATE labs SET all_bio_mater=COALESCE(all_bio_mater,0)+? WHERE user_id=?",
+            (int(stake_amount * 2), int(winner_id)),
+            commit=True
+        )
+
+    db_exec(
+        "UPDATE duels SET status='finished', winner_id=?, loser_id=?, ended_at=?, next_action_until=0 WHERE duel_id=?",
+        (int(winner_id), int(loser_id), int(now), int(duel_id)),
+        commit=True
+    )
+
+    _duel_stats_add_win(int(winner_id), int(stake_amount))
+    _duel_stats_add_loss(int(loser_id), int(stake_amount))
+
+    fresh = _duel_by_id(int(duel_id)) or duel_row
+    _duel_emit_state(
+        fresh,
+        text,
+        reply_markup=kb_duel_rematch(fresh),
+        via_message=via_message,
+        edit_existing=edit_existing
+    )
+
+    try:
+        _duel_settle_bets_victory(fresh, int(winner_id))
+    except Exception as e:
+        send_error_report("_duel_settle_bets_victory", e)
+
+def _duel_finish_draw(duel_row, *, via_message=None, edit_existing: bool = True):
+    duel_id = int(duel_row["duel_id"])
+    now = int(now_ts())
+
+    db_exec(
+        "UPDATE duels SET status='draw', ended_at=?, next_action_until=0 WHERE duel_id=?",
+        (int(now), int(duel_id)),
+        commit=True
+    )
+
+    _duel_refund_duel_stakes(duel_row)
+    _duel_mark_bets_refunded(int(duel_id))
+    _duel_stats_add_draw(int(duel_row["challenger_id"]))
+    _duel_stats_add_draw(int(duel_row["target_id"]))
+
+    fresh = _duel_by_id(int(duel_id)) or duel_row
+    txt = _duel_draw_text(
+        int(duel_row["chat_id"]),
+        int(duel_row["challenger_id"]),
+        int(duel_row["target_id"])
+    )
+    _duel_emit_state(
+        fresh,
+        txt,
+        reply_markup=kb_duel_rematch(fresh),
+        via_message=via_message,
+        edit_existing=edit_existing
+    )
+
+def _duel_finish_pass_turn(
+    duel_row,
+    *,
+    actor_id: int,
+    challenger_bonus: int,
+    target_bonus: int,
+    text: str,
+    via_message=None,
+    edit_existing: bool = True
+):
+    duel_id = int(duel_row["duel_id"])
+    turns_done = int(duel_row["turns_done"] or 0) + 1
+
+    if turns_done >= DUEL_MAX_TURNS:
+        db_exec(
+            "UPDATE duels SET turns_done=?, challenger_aim_bonus=?, target_aim_bonus=? WHERE duel_id=?",
+            (int(turns_done), int(challenger_bonus), int(target_bonus), int(duel_id)),
+            commit=True
+        )
+        fresh = _duel_by_id(int(duel_id)) or duel_row
+        _duel_finish_draw(fresh, via_message=via_message, edit_existing=edit_existing)
+        return
+
+    next_id = _duel_opponent_id(duel_row, int(actor_id))
+    db_exec(
+        "UPDATE duels SET current_turn_user_id=?, next_action_until=?, turns_done=?, challenger_aim_bonus=?, target_aim_bonus=? WHERE duel_id=?",
+        (
+            int(next_id),
+            int(now_ts() + DUEL_TURN_TIMEOUT_SEC),
+            int(turns_done),
+            int(challenger_bonus),
+            int(target_bonus),
+            int(duel_id),
+        ),
+        commit=True
+    )
+
+    fresh = _duel_by_id(int(duel_id)) or duel_row
+    _duel_emit_state(
+        fresh,
+        text,
+        reply_markup=kb_duel_actions(fresh),
+        via_message=via_message,
+        edit_existing=edit_existing
+    )
+
+def _duel_perform_action(duel_row, actor_id: int, action: str, *, via_message=None, edit_existing: bool = True) -> tuple[bool, str]:
+    if not duel_row:
+        return False, "📑 Дуэль не найдена."
+    if (duel_row["status"] or "").strip() != "active":
+        return False, "📑 Эта дуэль уже завершена."
+
+    current_turn = int(duel_row["current_turn_user_id"] or 0)
+    if int(actor_id) != current_turn:
+        return False, "📑 Сейчас не ваш ход."
+
+    challenger_id = int(duel_row["challenger_id"])
+    target_id = int(duel_row["target_id"])
+    stake_amount = int(duel_row["stake_amount"] or 0)
+
+    actor_bonus_col, opponent_bonus_col = _duel_actor_bonus_cols(duel_row, int(actor_id))
+    opponent_id = _duel_opponent_id(duel_row, int(actor_id))
+
+    challenger_bonus = int(duel_row["challenger_aim_bonus"] or 0)
+    target_bonus = int(duel_row["target_aim_bonus"] or 0)
+
+    actor_bonus = challenger_bonus if actor_bonus_col == "challenger_aim_bonus" else target_bonus
+    opponent_bonus = challenger_bonus if opponent_bonus_col == "challenger_aim_bonus" else target_bonus
+
+    if action == "fire":
+        hit_chance = max(0, min(100, DUEL_BASE_HIT_PCT + int(actor_bonus)))
+        if random.randint(1, 100) <= int(hit_chance):
+            txt = _duel_hit_text(int(duel_row["chat_id"]), int(actor_id), int(opponent_id), int(stake_amount))
+            _duel_finish_victory(
+                duel_row,
+                int(actor_id),
+                int(opponent_id),
+                txt,
+                via_message=via_message,
+                edit_existing=edit_existing
+            )
+            return True, ""
+
+        txt = _duel_miss_text(int(duel_row["chat_id"]), int(actor_id), int(opponent_id))
+        _duel_finish_pass_turn(
+            duel_row,
+            actor_id=int(actor_id),
+            challenger_bonus=int(challenger_bonus),
+            target_bonus=int(target_bonus),
+            text=txt,
+            via_message=via_message,
+            edit_existing=edit_existing
+        )
+        return True, ""
+
+    if action == "aim":
+        actor_bonus += 10
+        multiplier = max(1, int(actor_bonus // 10))
+
+        if actor_bonus_col == "challenger_aim_bonus":
+            challenger_bonus = int(actor_bonus)
+        else:
+            target_bonus = int(actor_bonus)
+
+        txt = _duel_aim_text(int(duel_row["chat_id"]), int(actor_id), int(opponent_id), int(multiplier))
+        _duel_finish_pass_turn(
+            duel_row,
+            actor_id=int(actor_id),
+            challenger_bonus=int(challenger_bonus),
+            target_bonus=int(target_bonus),
+            text=txt,
+            via_message=via_message,
+            edit_existing=edit_existing
+        )
+        return True, ""
+
+    if action == "break":
+        if int(opponent_bonus) <= 0:
+            return False, "📑 У соперника нет активного прицела."
+
+        if opponent_bonus_col == "challenger_aim_bonus":
+            challenger_bonus = 0
+        else:
+            target_bonus = 0
+
+        txt = _duel_break_aim_text(int(duel_row["chat_id"]), int(actor_id), int(opponent_id))
+        _duel_finish_pass_turn(
+            duel_row,
+            actor_id=int(actor_id),
+            challenger_bonus=int(challenger_bonus),
+            target_bonus=int(target_bonus),
+            text=txt,
+            via_message=via_message,
+            edit_existing=edit_existing
+        )
+        return True, ""
+
+    if action == "surrender":
+        txt = _duel_surrender_text(int(duel_row["chat_id"]), int(opponent_id), int(actor_id), int(stake_amount))
+        _duel_finish_victory(
+            duel_row,
+            int(opponent_id),
+            int(actor_id),
+            txt,
+            via_message=via_message,
+            edit_existing=edit_existing
+        )
+        return True, ""
+
+    return False, "📑 Неизвестное действие дуэли."
+
+def _duel_active_rows_in_chat(chat_id: int):
+    return db_all(
+        "SELECT duel_id, invite_id, chat_id, challenger_id, target_id, stake_amount, started_at, next_action_until, "
+        "current_turn_user_id, turns_done, challenger_aim_bonus, target_aim_bonus, status, winner_id, loser_id, "
+        "msg_chat_id, msg_id, ended_at "
+        "FROM duels "
+        "WHERE chat_id=? AND status='active' "
+        "ORDER BY duel_id ASC",
+        (int(chat_id),)
+    ) or []
+
+def _duel_find_active_by_candidate(chat_id: int, candidate_id: int):
+    return db_one(
+        "SELECT duel_id, invite_id, chat_id, challenger_id, target_id, stake_amount, started_at, next_action_until, "
+        "current_turn_user_id, turns_done, challenger_aim_bonus, target_aim_bonus, status, winner_id, loser_id, "
+        "msg_chat_id, msg_id, ended_at "
+        "FROM duels "
+        "WHERE chat_id=? AND status='active' AND (challenger_id=? OR target_id=?) "
+        "ORDER BY duel_id DESC LIMIT 1",
+        (int(chat_id), int(candidate_id), int(candidate_id))
+    )
+
+def _duel_active_bets(duel_id: int):
+    return db_all(
+        "SELECT bet_id, duel_id, chat_id, bettor_id, candidate_id, amount, created_at, status "
+        "FROM duel_bets WHERE duel_id=? AND status='active' ORDER BY bet_id ASC",
+        (int(duel_id),)
+    ) or []
+
+def _duel_bet_by_user(duel_id: int, bettor_id: int):
+    return db_one(
+        "SELECT bet_id, duel_id, chat_id, bettor_id, candidate_id, amount, created_at, status "
+        "FROM duel_bets WHERE duel_id=? AND bettor_id=? AND status='active' LIMIT 1",
+        (int(duel_id), int(bettor_id))
+    )
+
+def _duel_bettors_count(duel_id: int, candidate_id: int) -> int:
+    row = db_one(
+        "SELECT COUNT(*) AS c FROM duel_bets WHERE duel_id=? AND candidate_id=? AND status='active'",
+        (int(duel_id), int(candidate_id))
+    )
+    return int(row["c"] or 0) if row else 0
+
+def _duel_bet_count_text(cnt: int, highlighted: bool) -> str:
+    s = str(int(cnt))
+    return f"<u>{s}</u>" if highlighted else s
+
+def render_duel_bets_text(chat_id: int, viewer_id: int, chat_title: str) -> str:
+    rows = _duel_active_rows_in_chat(int(chat_id))
+    title = (chat_title or "").strip() or f"Чат {int(chat_id)}"
+
+    lines = [
+        f"💰 Текущие дуэли чата <b>{h(title)}</b>",
+        "№|имя1|став1|имя2|став2|ваша ставка",
+    ]
+
+    if not rows:
+        lines.append("Активных дуэлей нет.")
+        return "\n".join(lines)
+
+    with chat_name_context(int(chat_id)):
+        for i, row in enumerate(rows, 1):
+            duel_id = int(row["duel_id"])
+            c_id = int(row["challenger_id"])
+            t_id = int(row["target_id"])
+
+            my_bet = _duel_bet_by_user(int(duel_id), int(viewer_id))
+            my_candidate = int(my_bet["candidate_id"]) if my_bet else 0
+            my_amount = int(my_bet["amount"] or 0) if my_bet else 0
+
+            c_cnt = _duel_bettors_count(int(duel_id), int(c_id))
+            t_cnt = _duel_bettors_count(int(duel_id), int(t_id))
+
+            c_tag = public_user_tag(int(c_id))
+            t_tag = public_user_tag(int(t_id))
+
+            right = f" | +{_fmt_k(int(my_amount))}💊" if my_bet else ""
+            lines.append(
+                f"{i}. <b>{c_tag}</b> ({_duel_bet_count_text(c_cnt, my_candidate == c_id)}) | "
+                f"<b>{t_tag}</b> ({_duel_bet_count_text(t_cnt, my_candidate == t_id)}){right}"
+            )
+
+    return "\n".join(lines)
+
+def _duel_parse_bet_args(message, parsed: Parsed):
+    tail = (parsed.args or "").strip()
+    parts = tail.split(None, 1)
+
+    if not parts or not parts[0].isdigit():
+        return 0, None, None, "📑 Укажите количество био-материалов и пользователя."
+
+    amount = int(parts[0])
+    if amount <= 0:
+        return 0, None, None, "📑 Ставка должна быть больше нуля."
+
+    target_tail = parts[1].strip() if len(parts) > 1 else ""
+    fake = Parsed(
+        raw=parsed.raw,
+        has_prefix_char=parsed.has_prefix_char,
+        prefix_char=parsed.prefix_char,
+        cmd=parsed.cmd,
+        args=target_tail
+    )
+    target_id, target_user_obj = resolve_target_from_reply_or_args(message, fake)
+    if target_id is None:
+        return 0, None, None, "📑 Укажите пользователя через @username, ссылку, user_id или reply."
+
+    return int(amount), int(target_id), target_user_obj, ""
+
+def _duel_place_bet(chat_id: int, bettor_id: int, candidate_id: int, amount: int):
+    duel_row = _duel_find_active_by_candidate(int(chat_id), int(candidate_id))
+    if not duel_row:
+        return False, "📑 В этом чате у указанного игрока сейчас нет активной дуэли.", None
+
+    duel_id = int(duel_row["duel_id"])
+    challenger_id = int(duel_row["challenger_id"])
+    target_id = int(duel_row["target_id"])
+
+    if int(bettor_id) in (int(challenger_id), int(target_id)):
+        return False, "📑 Участники дуэли не могут ставить на себя и на своего соперника.", duel_row
+
+    have_row = db_one("SELECT COALESCE(all_bio_mater,0) AS m FROM labs WHERE user_id=?", (int(bettor_id),))
+    have = int(have_row["m"] or 0) if have_row else 0
+    if have < int(amount):
+        return False, "📑 У вас нет столько био-материалов для ставки.", duel_row
+
+    old_bet = _duel_bet_by_user(int(duel_id), int(bettor_id))
+    if old_bet:
+        return False, "📑 Вы уже сделали ставку на эту дуэль.", duel_row
+
+    db_exec(
+        "INSERT INTO duel_bets(duel_id, chat_id, bettor_id, candidate_id, amount, created_at, status) "
+        "VALUES (?,?,?,?,?,?, 'active')",
+        (int(duel_id), int(chat_id), int(bettor_id), int(candidate_id), int(amount), int(now_ts())),
+        commit=True
+    )
+
+    return True, "", duel_row
+
+def _duel_mark_bets_refunded(duel_id: int):
+    db_exec(
+        "UPDATE duel_bets SET status='refunded' WHERE duel_id=? AND status='active'",
+        (int(duel_id),),
+        commit=True
+    )
+
+def _duel_post_winning_bets_summary(chat_id: int, payouts: list[tuple[int, int]]):
+    if not payouts:
+        return
+
+    with chat_name_context(int(chat_id)):
+        lines = ["📜 Игроки, поставившие на победителя:"]
+        for bettor_id, payout in payouts:
+            btag = public_user_tag(int(bettor_id))
+            lines.append(f"<b>{btag}</b> +{_fmt_k(int(payout))}💊")
+
+    try:
+        bot.send_message(
+            int(chat_id),
+            "\n".join(lines),
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
+    except Exception:
+        pass
+
+def _duel_bet_success_notice_text(chat_id: int, candidate_id: int, payout: int) -> str:
+    with chat_name_context(int(chat_id)):
+        ctag = public_user_tag(int(candidate_id))
+    return (
+        f"💵 УСПЕХ! Ставка на игрока <b>{ctag}</b> сыграла.\n"
+        f"+{_fmt_k(int(payout))}💊"
+    )
+
+def _duel_bet_fail_notice_text(chat_id: int, candidate_id: int) -> str:
+    with chat_name_context(int(chat_id)):
+        ctag = public_user_tag(int(candidate_id))
+    return (
+        f"💸 Сожалеем, но <b>{ctag}</b> проиграл. Ваша ставка сгорела."
+    )
+
+def _duel_send_bet_result_notice(chat_id: int, bettor_id: int, candidate_id: int, *, won: bool, payout: int = 0):
+    text = (
+        _duel_bet_success_notice_text(int(chat_id), int(candidate_id), int(payout))
+        if won else
+        _duel_bet_fail_notice_text(int(chat_id), int(candidate_id))
+    )
+    try:
+        send_user_notification(int(bettor_id), text)
+    except Exception:
+        pass
+
+def _duel_rating_pct_value(wins: int, draws: int, losses: int) -> float:
+    return ((int(wins) + int(draws)) / max(1, int(losses))) * 100.0
+
+def _duel_streak_label(streak: int) -> str:
+    s = int(streak or 0)
+    if s >= 10:
+        return "(Serial killer)"
+    if s == 9:
+        return "(Unstoppable)"
+    if s == 8:
+        return "(Monster Kill)"
+    if s == 7:
+        return "(Wicked Sick)"
+    if s == 6:
+        return "(Ultra Kill)"
+    if s == 5:
+        return "(Rampage)"
+    if s == 4:
+        return "(Overkill)"
+    if s == 3:
+        return "(Triple Kill)"
+    if s == 2:
+        return "(Double Kill)"
+    return ""
+
+def _duel_current_win_streak_from_history(history: list[str]) -> int:
+    streak = 0
+    for mark in reversed(list(history or [])):
+        m = str(mark or "").upper()
+        if m == "W":
+            streak += 1
+            continue
+        if m == "D":
+            continue
+        break
+    return int(streak)
+
+def _duel_collect_chat_stats(chat_id: int) -> list[dict]:
+    rows = db_all(
+        "SELECT duel_id, challenger_id, target_id, stake_amount, status, winner_id, loser_id, ended_at "
+        "FROM duels "
+        "WHERE chat_id=? AND status IN ('finished','draw') "
+        "ORDER BY COALESCE(ended_at,0) ASC, duel_id ASC",
+        (int(chat_id),)
+    ) or []
+
+    stats: dict[int, dict] = {}
+
+    def _ensure(uid: int) -> dict:
+        uid = int(uid)
+        if uid not in stats:
+            stats[uid] = {
+                "user_id": uid,
+                "wins": 0,
+                "draws": 0,
+                "losses": 0,
+                "max_win_materials": 0,
+                "max_lose_materials": 0,
+                "history": [],
+            }
+        return stats[uid]
+
+    for r in rows:
+        challenger_id = int(r["challenger_id"] or 0)
+        target_id = int(r["target_id"] or 0)
+        stake_amount = int(r["stake_amount"] or 0)
+        status = (r["status"] or "").strip()
+
+        if challenger_id > 0:
+            _ensure(int(challenger_id))
+        if target_id > 0:
+            _ensure(int(target_id))
+
+        if status == "finished":
+            winner_id = int(r["winner_id"] or 0)
+            loser_id = int(r["loser_id"] or 0)
+
+            if winner_id > 0:
+                w = _ensure(int(winner_id))
+                w["wins"] = int(w["wins"]) + 1
+                w["max_win_materials"] = max(int(w["max_win_materials"]), int(stake_amount))
+                w["history"].append("W")
+
+            if loser_id > 0:
+                l = _ensure(int(loser_id))
+                l["losses"] = int(l["losses"]) + 1
+                l["max_lose_materials"] = max(int(l["max_lose_materials"]), int(stake_amount))
+                l["history"].append("L")
+
+        elif status == "draw":
+            for uid in (challenger_id, target_id):
+                if int(uid) <= 0:
+                    continue
+                d = _ensure(int(uid))
+                d["draws"] = int(d["draws"]) + 1
+                d["history"].append("D")
+
+    out = list(stats.values())
+    for row in out:
+        row["pct"] = float(_duel_rating_pct_value(
+            int(row["wins"]),
+            int(row["draws"]),
+            int(row["losses"])
+        ))
+        row["streak"] = int(_duel_current_win_streak_from_history(row["history"]))
+
+    out.sort(
+        key=lambda x: (
+            -int(x["wins"]),
+            -float(x["pct"]),
+            int(x["losses"]),
+            int(x["user_id"]),
+        )
+    )
+    return out
+
+def render_duel_stats_text(chat_id: int, chat_title: str) -> str:
+    title = (chat_title or "").strip() or f"Чат {int(chat_id)}"
+    rows = _duel_collect_chat_stats(int(chat_id))
+
+    lines = [
+        f"⚔️ Рейтинг дуэлянтов беседы <b>{h(title)}</b>",
+        "№|имя|в|н|п|выигр/проигр",
+    ]
+
+    if not rows:
+        lines.append("Нет данных.")
+        return "\n".join(lines)
+
+    with chat_name_context(int(chat_id)):
+        for i, row in enumerate(rows, 1):
+            tag = public_user_tag(int(row["user_id"]))
+            pct_text = _fmt_pct_text(float(row["pct"]))
+            extra = _duel_streak_label(int(row["streak"]))
+            extra = f" {extra}" if extra else ""
+
+            lines.append(
+                f"{i}. <b>{tag}</b>: "
+                f"<b>{int(row['wins'])}</b> | "
+                f"<b>{int(row['draws'])}</b> | "
+                f"<b>{int(row['losses'])}</b> | "
+                f"({pct_text}) | "
+                f"💊 {_fmt_k(int(row['max_win_materials']))} / {_fmt_k(int(row['max_lose_materials']))} {extra}"
+            )
+
+    return "\n".join(lines)
+
+def _duel_settle_bets_victory(duel_row, winner_id: int):
+    duel_id = int(duel_row["duel_id"])
+    chat_id = int(duel_row["chat_id"])
+
+    rows = _duel_active_bets(int(duel_id))
+    if not rows:
+        return
+
+    winners = []
+    losers = []
+    for r in rows:
+        if int(r["candidate_id"]) == int(winner_id):
+            winners.append(r)
+        else:
+            losers.append(r)
+
+    total_lost = sum(int(r["amount"] or 0) for r in losers)
+    share = (int(total_lost) // len(winners)) if winners else 0
+
+    payouts_for_summary: list[tuple[int, int]] = []
+    winner_notices: list[tuple[int, int, int]] = []
+    loser_notices: list[tuple[int, int]] = []
+
+    with DB_LOCK:
+        c = conn.cursor()
+        try:
+            c.execute("BEGIN")
+
+            for r in losers:
+                bet_id = int(r["bet_id"])
+                bettor_id = int(r["bettor_id"])
+                candidate_id = int(r["candidate_id"])
+                amount = int(r["amount"] or 0)
+
+                c.execute(
+                    "UPDATE labs SET all_bio_mater=COALESCE(all_bio_mater,0)-? WHERE user_id=?",
+                    (int(amount), int(bettor_id))
+                )
+                c.execute("UPDATE duel_bets SET status='lost' WHERE bet_id=?", (int(bet_id),))
+                loser_notices.append((int(bettor_id), int(candidate_id)))
+
+            for r in winners:
+                bet_id = int(r["bet_id"])
+                bettor_id = int(r["bettor_id"])
+                candidate_id = int(r["candidate_id"])
+                amount = int(r["amount"] or 0)
+
+                own_bonus = int(amount * 0.1)
+                payout = int(share + own_bonus)
+
+                c.execute(
+                    "UPDATE labs SET all_bio_mater=COALESCE(all_bio_mater,0)+? WHERE user_id=?",
+                    (int(payout), int(bettor_id))
+                )
+                c.execute("UPDATE duel_bets SET status='paid' WHERE bet_id=?", (int(bet_id),))
+
+                payouts_for_summary.append((int(bettor_id), int(payout)))
+                winner_notices.append((int(bettor_id), int(candidate_id), int(payout)))
+
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            try:
+                c.close()
+            except Exception:
+                pass
+
+    _duel_post_winning_bets_summary(int(chat_id), payouts_for_summary)
+
+    for bettor_id, candidate_id, payout in winner_notices:
+        _duel_send_bet_result_notice(
+            int(chat_id),
+            int(bettor_id),
+            int(candidate_id),
+            won=True,
+            payout=int(payout)
+        )
+
+    for bettor_id, candidate_id in loser_notices:
+        _duel_send_bet_result_notice(
+            int(chat_id),
+            int(bettor_id),
+            int(candidate_id),
+            won=False,
+            payout=0
+        )
+
+def _duel_parse_call_args(message, parsed: Parsed, with_stake: bool):
+    chat_id = int(message.chat.id)
+    stake_amount = 0
+
+    if with_stake:
+        tail = (parsed.args or "").strip()
+        parts = tail.split(None, 1)
+        if not parts or not parts[0].isdigit():
+            return None, None, 0, "📑 Укажите ставку и пользователя."
+        stake_amount = int(parts[0])
+        if stake_amount <= 0:
+            return None, None, 0, "📑 Ставка должна быть больше нуля."
+        target_tail = parts[1].strip() if len(parts) > 1 else ""
+
+        fake = Parsed(
+            raw=parsed.raw,
+            has_prefix_char=parsed.has_prefix_char,
+            prefix_char=parsed.prefix_char,
+            cmd=parsed.cmd,
+            args=target_tail
+        )
+        target_id, target_user_obj = resolve_target_from_reply_or_args(message, fake)
+        if target_id is None:
+            return None, None, 0, "📑 Укажите пользователя через @username, ссылку, user_id или reply."
+        return int(target_id), target_user_obj, int(stake_amount), ""
+
+    target_id, target_user_obj = resolve_target_from_reply_or_args(message, parsed)
+    if target_id is None:
+        return None, None, 0, "📑 Укажите пользователя через @username, ссылку, user_id или reply."
+    return int(target_id), target_user_obj, 0, ""
+
+def _duel_create_invite(chat_id: int, challenger_id: int, target_id: int, stake_amount: int):
+    now = int(now_ts())
+    expires_at = int(now + DUEL_INVITE_TIMEOUT_SEC)
+
+    with DB_LOCK:
+        c = conn.cursor()
+        try:
+            c.execute("BEGIN")
+
+            c.execute(
+                "INSERT INTO duel_invites(chat_id, challenger_id, target_id, stake_amount, created_at, expires_at, status, msg_chat_id, msg_id) "
+                "VALUES (?,?,?,?,?,?, 'pending', 0, 0)",
+                (int(chat_id), int(challenger_id), int(target_id), int(stake_amount), int(now), int(expires_at))
+            )
+            invite_id = int(c.lastrowid)
+            conn.commit()
+            return invite_id
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            try:
+                c.close()
+            except Exception:
+                pass
+
+def _duel_cancel_other_invites_for_target(chat_id: int, target_id: int, accepted_invite_id: int, accepted_challenger_id: int):
+    rows = db_all(
+        "SELECT invite_id, chat_id, challenger_id, target_id, stake_amount, created_at, expires_at, status, msg_chat_id, msg_id "
+        "FROM duel_invites "
+        "WHERE chat_id=? AND target_id=? AND status='pending' AND invite_id<>? "
+        "ORDER BY invite_id ASC",
+        (int(chat_id), int(target_id), int(accepted_invite_id))
+    ) or []
+
+    for r in rows:
+        db_exec("UPDATE duel_invites SET status='superseded' WHERE invite_id=?", (int(r["invite_id"]),), commit=True)
+        _duel_refund_invite_stake(r)
+        txt = _duel_superseded_text(int(chat_id), int(r["challenger_id"]), int(target_id), int(accepted_challenger_id))
+        _duel_edit_invite_message(r, txt)
+
+def _duel_accept_invite(invite_id: int, actor_id: int, *, edit_invite_message: bool = True):
+    inv = _duel_invite_by_id(int(invite_id))
+    if not inv:
+        return False, "📑 Вызов на дуэль не найден."
+
+    if (inv["status"] or "").strip() != "pending":
+        return False, "📑 Этот вызов уже неактивен."
+
+    if int(inv["target_id"]) != int(actor_id):
+        return False, "📑 Этот вызов адресован не вам."
+
+    chat_id = int(inv["chat_id"])
+    challenger_id = int(inv["challenger_id"])
+    target_id = int(inv["target_id"])
+    stake_amount = int(inv["stake_amount"] or 0)
+
+    if _duel_user_has_active_duel_in_chat(chat_id, challenger_id):
+        return False, "📑 Вызвавший игрок уже участвует в другой дуэли в этом чате."
+    if _duel_user_has_active_duel_in_chat(chat_id, target_id):
+        return False, "📑 Вы уже участвуете в другой дуэли в этом чате."
+
+    if stake_amount > 0 and not _duel_take_materials(int(target_id), int(stake_amount)):
+        return False, "📑 У вас недостаточно био-материалов для дуэли со ставкой."
+
+    now = int(now_ts())
+    first_turn_id = random.choice([int(challenger_id), int(target_id)])
+
+    with DB_LOCK:
+        c = conn.cursor()
+        try:
+            c.execute("BEGIN")
+            c.execute("UPDATE duel_invites SET status='accepted' WHERE invite_id=?", (int(invite_id),))
+            c.execute(
+                "INSERT INTO duels(invite_id, chat_id, challenger_id, target_id, stake_amount, started_at, next_action_until, current_turn_user_id, turns_done, challenger_aim_bonus, target_aim_bonus, status, winner_id, loser_id, msg_chat_id, msg_id, ended_at) "
+                "VALUES (?,?,?,?,?,?,?,?,0,0,0,'active',0,0,0,0,0)",
+                (
+                    int(invite_id),
+                    int(chat_id),
+                    int(challenger_id),
+                    int(target_id),
+                    int(stake_amount),
+                    int(now),
+                    int(now + DUEL_TURN_TIMEOUT_SEC),
+                    int(first_turn_id),
+                )
+            )
+            duel_id = int(c.lastrowid)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            if stake_amount > 0:
+                _duel_refund_materials(int(target_id), int(stake_amount))
+            raise
+        finally:
+            try:
+                c.close()
+            except Exception:
+                pass
+
+    _duel_cancel_other_invites_for_target(chat_id, target_id, int(invite_id), int(challenger_id))
+
+    db_exec(
+        "UPDATE duels SET msg_chat_id=?, msg_id=? WHERE duel_id=?",
+        (int(inv["msg_chat_id"] or 0), int(inv["msg_id"] or 0), int(duel_id)),
+        commit=True
+    )
+
+    fresh_duel = _duel_by_id(int(duel_id))
+    txt = _duel_started_text(chat_id, challenger_id, target_id, stake_amount, first_turn_id)
+    if edit_invite_message:
+        _duel_edit_invite_message(inv, txt, reply_markup=kb_duel_actions(fresh_duel))
+
+    return True, "✅ Дуэль началась."
+
+def _duel_decline_invite(invite_id: int, actor_id: int, *, edit_invite_message: bool = True):
+    inv = _duel_invite_by_id(int(invite_id))
+    if not inv:
+        return False, "📑 Вызов на дуэль не найден."
+
+    if (inv["status"] or "").strip() != "pending":
+        return False, "📑 Этот вызов уже неактивен."
+
+    if int(inv["target_id"]) != int(actor_id):
+        return False, "📑 Этот вызов адресован не вам."
+
+    db_exec("UPDATE duel_invites SET status='declined' WHERE invite_id=?", (int(invite_id),), commit=True)
+    _duel_refund_invite_stake(inv)
+
+    txt = _duel_declined_text(int(inv["chat_id"]), int(inv["challenger_id"]), int(inv["target_id"]))
+    if edit_invite_message:
+        _duel_edit_invite_message(inv, txt)
+    return True, "❎ Вы отказались от дуэли."
+
+def _duel_housekeeping_once(now_value: int):
+    now_value = int(now_value)
+
+    pending = db_all(
+        "SELECT invite_id, chat_id, challenger_id, target_id, stake_amount, created_at, expires_at, status, msg_chat_id, msg_id "
+        "FROM duel_invites "
+        "WHERE status='pending' AND expires_at>0 AND expires_at<=? "
+        "ORDER BY invite_id ASC",
+        (int(now_value),)
+    ) or []
+    for inv in pending:
+        db_exec("UPDATE duel_invites SET status='expired' WHERE invite_id=?", (int(inv["invite_id"]),), commit=True)
+        _duel_refund_invite_stake(inv)
+        _duel_edit_invite_message(inv, _duel_invite_expired_text())
+
+    active = db_all(
+        "SELECT duel_id, invite_id, chat_id, challenger_id, target_id, stake_amount, started_at, next_action_until, current_turn_user_id, turns_done, "
+        "challenger_aim_bonus, target_aim_bonus, status, winner_id, loser_id, msg_chat_id, msg_id, ended_at "
+        "FROM duels "
+        "WHERE status='active' AND next_action_until>0 AND next_action_until<=? "
+        "ORDER BY duel_id ASC",
+        (int(now_value),)
+    ) or []
+    for duel in active:
+        db_exec(
+            "UPDATE duels SET status='cancelled', ended_at=? WHERE duel_id=?",
+            (int(now_value), int(duel["duel_id"])),
+            commit=True
+        )
+        _duel_refund_duel_stakes(duel)
+        _duel_mark_bets_refunded(int(duel["duel_id"]))
+        txt = _duel_inactive_text(int(duel["chat_id"]), int(duel["current_turn_user_id"] or 0))
+        _duel_edit_duel_message(duel, txt)
+
+def handle_duel_commands(message, parsed: Parsed):
+    if message.chat.type not in ("group", "supergroup"):
+        return
+
+    uid = int(message.from_user.id)
+    chat_id = int(message.chat.id)
+
+    if not is_lab_active(int(uid)):
+        bot.reply_to(message, "📑 Сначала создайте свою лабораторию.")
+        return
+
+    if parsed.cmd == "duel_stats":
+        text = render_duel_stats_text(
+            int(chat_id),
+            (getattr(message.chat, "title", None) or "").strip()
+        )
+        bot.reply_to(message, text, parse_mode="HTML", disable_web_page_preview=True)
+        return
+
+    if parsed.cmd == "duel_bets_list":
+        text = render_duel_bets_text(
+            int(chat_id),
+            int(uid),
+            (getattr(message.chat, "title", None) or "").strip()
+        )
+        bot.reply_to(message, text, parse_mode="HTML", disable_web_page_preview=True)
+        return
+
+    if parsed.cmd == "duel_bet":
+        amount, target_id, target_user_obj, err = _duel_parse_bet_args(message, parsed)
+        if target_id is None:
+            bot.reply_to(message, err)
+            return
+
+        if target_user_obj is not None:
+            capture_user_context(message, target_user_obj)
+
+        try:
+            ok, msg, duel_row = _duel_place_bet(int(chat_id), int(uid), int(target_id), int(amount))
+        except Exception as e:
+            send_error_report("duel_bet_place", e)
+            bot.reply_to(message, "📑 Не удалось сделать ставку.")
+            return
+
+        if not ok:
+            bot.reply_to(message, msg)
+            return
+
+        with chat_name_context(int(chat_id)):
+            target_tag = public_user_tag(int(target_id))
+
+        bot.reply_to(
+            message,
+            f"💰 Вы сделали ставку на дуэлянта <b>{target_tag}</b> в размере 💊 {_duel_stake_text(int(amount))}\n"
+            "Дождитесь окончания дуэли. Мы сообщим вам, если ваша ставка сыграет.",
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
+        return
+
+    if parsed.cmd in ("duel_accept", "duel_decline"):
+        inv = _duel_latest_pending_invite_for_target(int(chat_id), int(uid))
+        if not inv:
+            bot.reply_to(message, "📑 В этом чате нет активного вызова на дуэль для вас.")
+            return
+
+        try:
+            if parsed.cmd == "duel_accept":
+                ok, msg = _duel_accept_invite(int(inv["invite_id"]), int(uid), edit_invite_message=False)
+                if not ok:
+                    bot.reply_to(message, msg)
+                    return
+
+                duel_row = _duel_active_by_user_in_chat(int(chat_id), int(uid))
+                if not duel_row:
+                    bot.reply_to(message, "✅ Дуэль началась.")
+                    return
+
+                _duel_emit_state(
+                    duel_row,
+                    _duel_started_text_from_row(duel_row),
+                    reply_markup=kb_duel_actions(duel_row),
+                    via_message=message,
+                    edit_existing=False
+                )
+                return
+
+            ok, msg = _duel_decline_invite(int(inv["invite_id"]), int(uid), edit_invite_message=False)
+            if not ok:
+                bot.reply_to(message, msg)
+                return
+
+            bot.reply_to(
+                message,
+                _duel_declined_text(int(inv["chat_id"]), int(inv["challenger_id"]), int(inv["target_id"])),
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
+            return
+
+        except Exception as e:
+            send_error_report("duel_accept_decline_text", e)
+            bot.reply_to(message, "📑 Не удалось обработать вызов на дуэль.")
+            return
+
+    if parsed.cmd == "duel_cancel":
+        pending_inv = _duel_latest_outgoing_pending_invite(int(chat_id), int(uid))
+        if pending_inv:
+            try:
+                ok, msg = _duel_cancel_pending_invite(
+                    pending_inv,
+                    int(uid),
+                    via_message=message,
+                    edit_existing=False
+                )
+            except Exception as e:
+                send_error_report("duel_cancel_pending_text", e)
+                bot.reply_to(message, "📑 Не удалось отменить вызов на дуэль.")
+                return
+    
+            if not ok and msg:
+                bot.reply_to(message, msg)
+            return
+    
+        duel_row = _duel_active_by_user_in_chat(int(chat_id), int(uid))
+        if not duel_row:
+            bot.reply_to(message, "📑 В этом чате у вас нет активной дуэли.")
+            return
+    
+        try:
+            ok, msg = _duel_cancel_before_moves(
+                duel_row,
+                int(uid),
+                via_message=message,
+                edit_existing=False
+            )
+        except Exception as e:
+            send_error_report("duel_cancel_text", e)
+            bot.reply_to(message, "📑 Не удалось отменить дуэль.")
+            return
+    
+        if not ok and msg:
+            bot.reply_to(message, msg)
+        return
+    
+
+    if parsed.cmd in ("duel_fire", "duel_aim", "duel_break_aim", "duel_surrender"):
+        duel_row = _duel_active_by_user_in_chat(int(chat_id), int(uid))
+        if not duel_row:
+            bot.reply_to(message, "📑 В этом чате у вас нет активной дуэли.")
+            return
+
+        action_map = {
+            "duel_fire": "fire",
+            "duel_aim": "aim",
+            "duel_break_aim": "break",
+            "duel_surrender": "surrender",
+        }
+
+        try:
+            ok, err = _duel_perform_action(
+                duel_row,
+                int(uid),
+                action_map[parsed.cmd],
+                via_message=message,
+                edit_existing=False
+            )
+        except Exception as e:
+            send_error_report("duel_action_text", e)
+            bot.reply_to(message, "📑 Не удалось выполнить действие дуэли.")
+            return
+
+        if not ok and err:
+            bot.reply_to(message, err)
+        return
+
+    with_stake = (parsed.cmd == "duel_call_stake")
+    target_id, target_user_obj, stake_amount, err = _duel_parse_call_args(message, parsed, with_stake=with_stake)
+    if target_id is None:
+        bot.reply_to(message, err)
+        return
+
+    if int(target_id) == int(uid):
+        bot.reply_to(message, "📑 Не ищите своёй сменти раньше времени.")
+        return
+
+    if target_user_obj is not None and bool(getattr(target_user_obj, "is_bot", False)):
+        bot.reply_to(message, "📑 Как бы Вам не хотелось показать своё преимущество перед искуственным соперником, бот не может участвовать в дуэли.")
+        return
+
+    my_bot_id = 0
+    try:
+        me = bot.get_me()
+        my_bot_id = int(getattr(me, "id", 0) or 0)
+    except Exception:
+        my_bot_id = 0
+    if my_bot_id and int(target_id) == int(my_bot_id):
+        bot.reply_to(message, "📑 Как бы Вам не хотелось показать своё преимущество перед искуственным соперником, бот не может участвовать в дуэли.")
+        return
+
+    if not is_lab_active(int(target_id)):
+        bot.reply_to(message, "📑 Этот пользователь ещё не создал свою лабораторию.")
+        return
+
+    if _duel_user_has_active_duel_in_chat(int(chat_id), int(uid)) or _duel_user_has_outgoing_pending_invite_in_chat(int(chat_id), int(uid)):
+        bot.reply_to(message, "📑 Вы уже участвуете в дуэли или ожидаете ответа на свой вызов в этом чате.")
+        return
+
+    if _duel_user_has_active_duel_in_chat(int(chat_id), int(target_id)):
+        bot.reply_to(message, "📑 Этот пользователь уже участвует в другой дуэли в этом чате.")
+        return
+
+    if stake_amount > 0 and not _duel_take_materials(int(uid), int(stake_amount)):
+        bot.reply_to(message, "📑 У вас недостаточно био-материалов для дуэли со ставкой.")
+        return
+
+    try:
+        invite_id = _duel_create_invite(int(chat_id), int(uid), int(target_id), int(stake_amount))
+        txt = _duel_invite_text(int(chat_id), int(uid), int(target_id), int(stake_amount))
+        sent = bot.reply_to(
+            message,
+            txt,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=kb_duel_invite(int(invite_id), int(target_id), int(uid))
+        )
+        _duel_mark_invite_message(int(invite_id), int(sent.chat.id), int(sent.message_id))
+    except Exception as e:
+        if int(stake_amount or 0) > 0:
+            _duel_refund_materials(int(uid), int(stake_amount))
+        try:
+            db_exec("DELETE FROM duel_invites WHERE invite_id=?", (int(invite_id),), commit=True)
+        except Exception:
+            pass
+        send_error_report("duel_create_invite", e)
+        bot.reply_to(message, "📑 Не удалось отправить вызов на дуэль.")
+        return
+
+@bot.callback_query_handler(func=lambda cq: (cq.data or "").startswith(f"{CB_DUEL_ACCEPT}:"))
+def cb_duel_accept(cq):
+    try:
+        parts = (cq.data or "").split(":")
+        if len(parts) != 3:
+            bot.answer_callback_query(cq.id)
+            return
+
+        invite_id = int(parts[1])
+        target_id = int(parts[2])
+
+        if int(cq.from_user.id) != int(target_id):
+            bot.answer_callback_query(cq.id, "Вы не можете нажимать чужие кнопки!")
+            return
+
+        ok, msg = _duel_accept_invite(int(invite_id), int(target_id), edit_invite_message=True)
+        bot.answer_callback_query(cq.id, msg, show_alert=not ok)
+    except Exception as e:
+        send_error_report("cb_duel_accept", e)
+        try:
+            bot.answer_callback_query(cq.id)
+        except Exception:
+            pass
+
+@bot.callback_query_handler(func=lambda cq: (cq.data or "").startswith(f"{CB_DUEL_DECLINE}:"))
+def cb_duel_decline(cq):
+    try:
+        parts = (cq.data or "").split(":")
+        if len(parts) != 3:
+            bot.answer_callback_query(cq.id)
+            return
+
+        invite_id = int(parts[1])
+        target_id = int(parts[2])
+
+        if int(cq.from_user.id) != int(target_id):
+            bot.answer_callback_query(cq.id, "Вы не можете нажимать чужие кнопки!")
+            return
+
+        ok, msg = _duel_decline_invite(int(invite_id), int(target_id), edit_invite_message=True)
+        bot.answer_callback_query(cq.id, msg, show_alert=not ok)
+    except Exception as e:
+        send_error_report("cb_duel_decline", e)
+        try:
+            bot.answer_callback_query(cq.id)
+        except Exception:
+            pass
+
+@bot.callback_query_handler(func=lambda cq: (cq.data or "").startswith(f"{CB_DUEL_FIRE}:"))
+def cb_duel_fire(cq):
+    try:
+        parts = (cq.data or "").split(":")
+        if len(parts) != 3:
+            bot.answer_callback_query(cq.id)
+            return
+
+        duel_id = int(parts[1])
+        actor_id = int(parts[2])
+
+        if int(cq.from_user.id) != int(actor_id):
+            bot.answer_callback_query(cq.id, "Вы не можете нажимать чужие кнопки!")
+            return
+
+        duel_row = _duel_by_id(int(duel_id))
+        ok, msg = _duel_perform_action(duel_row, int(actor_id), "fire", edit_existing=True)
+        bot.answer_callback_query(cq.id, msg if (not ok and msg) else "", show_alert=not ok)
+    except Exception as e:
+        send_error_report("cb_duel_fire", e)
+        try:
+            bot.answer_callback_query(cq.id)
+        except Exception:
+            pass
+
+@bot.callback_query_handler(func=lambda cq: (cq.data or "").startswith(f"{CB_DUEL_AIM}:"))
+def cb_duel_aim(cq):
+    try:
+        parts = (cq.data or "").split(":")
+        if len(parts) != 3:
+            bot.answer_callback_query(cq.id)
+            return
+
+        duel_id = int(parts[1])
+        actor_id = int(parts[2])
+
+        if int(cq.from_user.id) != int(actor_id):
+            bot.answer_callback_query(cq.id, "Вы не можете нажимать чужие кнопки!")
+            return
+
+        duel_row = _duel_by_id(int(duel_id))
+        ok, msg = _duel_perform_action(duel_row, int(actor_id), "aim", edit_existing=True)
+        bot.answer_callback_query(cq.id, msg if (not ok and msg) else "", show_alert=not ok)
+    except Exception as e:
+        send_error_report("cb_duel_aim", e)
+        try:
+            bot.answer_callback_query(cq.id)
+        except Exception:
+            pass
+
+@bot.callback_query_handler(func=lambda cq: (cq.data or "").startswith(f"{CB_DUEL_BREAK_AIM}:"))
+def cb_duel_break_aim(cq):
+    try:
+        parts = (cq.data or "").split(":")
+        if len(parts) != 3:
+            bot.answer_callback_query(cq.id)
+            return
+
+        duel_id = int(parts[1])
+        actor_id = int(parts[2])
+
+        if int(cq.from_user.id) != int(actor_id):
+            bot.answer_callback_query(cq.id, "Вы не можете нажимать чужие кнопки!")
+            return
+
+        duel_row = _duel_by_id(int(duel_id))
+        ok, msg = _duel_perform_action(duel_row, int(actor_id), "break", edit_existing=True)
+        bot.answer_callback_query(cq.id, msg if (not ok and msg) else "", show_alert=not ok)
+    except Exception as e:
+        send_error_report("cb_duel_break_aim", e)
+        try:
+            bot.answer_callback_query(cq.id)
+        except Exception:
+            pass
+
+@bot.callback_query_handler(func=lambda cq: (cq.data or "").startswith(f"{CB_DUEL_SURRENDER}:"))
+def cb_duel_surrender(cq):
+    try:
+        parts = (cq.data or "").split(":")
+        if len(parts) != 3:
+            bot.answer_callback_query(cq.id)
+            return
+
+        duel_id = int(parts[1])
+        actor_id = int(parts[2])
+
+        if int(cq.from_user.id) != int(actor_id):
+            bot.answer_callback_query(cq.id, "Вы не можете нажимать чужие кнопки!")
+            return
+
+        duel_row = _duel_by_id(int(duel_id))
+        ok, msg = _duel_perform_action(duel_row, int(actor_id), "surrender", edit_existing=True)
+        bot.answer_callback_query(cq.id, msg if (not ok and msg) else "", show_alert=not ok)
+    except Exception as e:
+        send_error_report("cb_duel_surrender", e)
+        try:
+            bot.answer_callback_query(cq.id)
+        except Exception:
+            pass
+
+@bot.callback_query_handler(func=lambda cq: (cq.data or "").startswith(f"{CB_DUEL_INV_CANCEL}:"))
+def cb_duel_inv_cancel(cq):
+    try:
+        parts = (cq.data or "").split(":")
+        if len(parts) != 3:
+            bot.answer_callback_query(cq.id)
+            return
+
+        invite_id = int(parts[1])
+        actor_id = int(parts[2])
+
+        if int(cq.from_user.id) != int(actor_id):
+            bot.answer_callback_query(cq.id, "Вы не можете нажимать чужие кнопки!")
+            return
+
+        invite_row = _duel_invite_by_id(int(invite_id))
+        ok, msg = _duel_cancel_pending_invite(invite_row, int(actor_id), edit_existing=True)
+        bot.answer_callback_query(cq.id, msg if (not ok and msg) else "Вызов отменён.", show_alert=not ok)
+    except Exception as e:
+        send_error_report("cb_duel_inv_cancel", e)
+        try:
+            bot.answer_callback_query(cq.id)
+        except Exception:
+            pass
+
+@bot.callback_query_handler(func=lambda cq: (cq.data or "").startswith(f"{CB_DUEL_CANCEL}:"))
+def cb_duel_cancel(cq):
+    try:
+        parts = (cq.data or "").split(":")
+        if len(parts) != 3:
+            bot.answer_callback_query(cq.id)
+            return
+
+        duel_id = int(parts[1])
+        actor_id = int(parts[2])
+
+        if int(cq.from_user.id) != int(actor_id):
+            bot.answer_callback_query(cq.id, "Вы не можете нажимать чужие кнопки!")
+            return
+
+        duel_row = _duel_by_id(int(duel_id))
+        ok, msg = _duel_cancel_before_moves(duel_row, int(actor_id), edit_existing=True)
+        bot.answer_callback_query(cq.id, msg if (not ok and msg) else "Дуэль отменена.", show_alert=not ok)
+    except Exception as e:
+        send_error_report("cb_duel_cancel", e)
+        try:
+            bot.answer_callback_query(cq.id)
+        except Exception:
+            pass
+
+@bot.callback_query_handler(func=lambda cq: (cq.data or "").startswith(f"{CB_DUEL_REMATCH}:"))
+def cb_duel_rematch(cq):
+    try:
+        parts = (cq.data or "").split(":")
+        if len(parts) != 3:
+            bot.answer_callback_query(cq.id)
+            return
+
+        duel_id = int(parts[1])
+        allowed_id = int(parts[2])
+
+        duel_row = _duel_by_id(int(duel_id))
+        if not duel_row:
+            bot.answer_callback_query(cq.id, "Дуэль не найдена.")
+            return
+
+        actor_id = int(cq.from_user.id)
+
+        if int(allowed_id) > 0 and actor_id != int(allowed_id):
+            bot.answer_callback_query(cq.id, "Нажать эту кнопку может только проигравший игрок.")
+            return
+
+        ok, msg = _duel_start_rematch_from_finished(duel_row, int(actor_id))
+        bot.answer_callback_query(cq.id, msg if (not ok and msg) else "Реванш начался.", show_alert=not ok)
+    except Exception as e:
+        send_error_report("cb_duel_rematch", e)
+        try:
+            bot.answer_callback_query(cq.id)
+        except Exception:
+            pass
+
 # COMANDS HANDLERS
 def handle_owner_command(message, parsed: Parsed):
     if not parsed.has_prefix_char or parsed.cmd != "owner":
@@ -13338,36 +16252,7 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
     now = now_ts()
 
     def _notify_target(tid: int, text: str):
-            """Отправка уведомлений о заражении/IDS. Возвращает Message (если удалось отправить)."""
-            try:
-                notify_chat_id, notify_off = get_notify_prefs(int(tid))
-                if int(notify_off) == 1 and int(notify_chat_id) == 0:
-                    return None
-    
-                dest = int(notify_chat_id) if int(notify_chat_id) != 0 else int(tid)
-                try:
-                    return bot.send_message(dest, text, parse_mode="HTML", disable_web_page_preview=True)
-                except Exception:
-                    if int(notify_chat_id) != 0:
-                        try:
-                            set_notify_prefs(int(tid), 0, 0)
-                            try:
-                                bot.send_message(int(tid),
-                                    "⚠️ Не удалось отправить уведомление в привязанный чат. Привязка сброшена на личные сообщения.",
-                                    disable_web_page_preview=True)
-                            except Exception:
-                                pass
-                        except Exception:
-                            pass
-    
-                    if int(dest) != int(tid):
-                        try:
-                            return bot.send_message(int(tid), text, parse_mode="HTML", disable_web_page_preview=True)
-                        except Exception:
-                            return None
-                return None
-            except Exception:
-                return None
+        return send_user_notification(int(tid), text)
 
     # организатор
     att_un = getattr(actor, "username", "") or ""
@@ -13432,6 +16317,14 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
     mat_word = _ru_form(int(pat_next_price), "био-материал", "био-материала", "био-материалов")
     pat_price_mat_line = f"{_fmt_k(int(pat_next_price))} {mat_word}"
     attacker_qual = int(lab_row["qual"] if lab_row else 1) or 1
+    from_pathogens_summary = bool(edit_ctx.get("pathogens_summary")) if isinstance(edit_ctx, dict) else False
+
+    def _pathogens_extra_line() -> str:
+        if not from_pathogens_summary:
+            return ""
+        rem_row = db_one("SELECT COALESCE(ready_pathogens,0) AS rp FROM labs WHERE user_id=?", (attacker_id,))
+        rem = int(rem_row["rp"] if rem_row else 0)
+        return f"\n🧪 Осталось патогенов: {rem} из {int(total_pathogens)}"
 
     def _emit_no_pathogens(inf_ctx: Optional[dict] = None):
         npi = int(_rget(lab_row, "npi", 0) or 0)
@@ -13491,9 +16384,9 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
             _ikb_premium_counter("🧪", "× 5", callback_data=cb_pat_5),
         )
         kb.row(
-            _ikb_premium_counter("⚗️", "× 1", callback_data=cb_acc_1),
-            _ikb_premium_counter("⚗️", "× 2", callback_data=cb_acc_2),
-            _ikb_premium_counter("⚗️", "× 5", callback_data=cb_acc_5),
+            _ikb_premium_counter("🧫", "× 1", callback_data=cb_acc_1),
+            _ikb_premium_counter("🧫", "× 2", callback_data=cb_acc_2),
+            _ikb_premium_counter("🧫", "× 5", callback_data=cb_acc_5),
         )
 
         _emit(
@@ -13857,6 +16750,7 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
                 f"🤒 Заражение на {_format_days(inf_days)}\n"
                 f"☣️ +{_fmt_k(int(gained))} {exp_word}"
             )
+            txt += _pathogens_extra_line()
             if first_time:
                 txt += (
                     "\n\n👨‍🔬 Объект ещё не подвергался заражению вашим патогеном, поэтому каждый день, пока он заражён, "
@@ -13919,6 +16813,11 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
     chat_id = int(message.chat.id) if message.chat.type in ("group", "supergroup") else 0
     if mode == "c" and chat_id == 0:
         return
+
+    def _single_random_retry_kb():
+        if mode in ("r", "p", "m", "e"):
+            return kb_infect_retry_mass(attacker_id, mode, chat_filter)
+        return None
 
     cnt = _apply_limit(req.get("count", 1))
     if cnt <= 0:
@@ -14284,46 +17183,38 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
                 (attacker_id,)
             )
             rem = int(rem_row["rp"] if rem_row else 0)
-        
-            rm = kb_infect_retry_mass(attacker_id, mode, chat_filter)
-            if (not last_dummy) and (last_tid is not None):
-                rm = kb_infect_retry_user(attacker_id, int(last_tid))
 
             _emit(
                 f"💢 Попытка заразить «{single_target_tag}» провалилась...\n"
                 f"{h(last_evt_text)}\n"
                 f"🧪 Осталось патогенов: {rem} | +1 = {pat_price_mat_line}",
-                reply_markup=rm
+                reply_markup=_single_random_retry_kb()
             )
             return
 
         if last_success:
-            exp_word = _ru_form(int(gained), "био-опыт", "био-опыта", "био-опыта")
+            exp_word = _ru_form(int(last_gained), "био-опыт", "био-опыта", "био-опыта")
             txt = (
                 f"🦠 {attacker_tag} подверг заражению {_pat_for_text((pathogen_name or '').strip())} {single_target_tag}\n"
                 f"☠️ Горячка на {_format_hm_from_seconds(fever_add)}\n"
                 f"🤒 Заражение на {_format_days(inf_days)}\n"
-                f"☣️ +{_fmt_k(int(gained))} {exp_word}"
+                f"☣️ +{_fmt_k(int(last_gained))} {exp_word}"
             )
             if last_first_time or last_dummy:
                 txt += (
                     "\n\n👨‍🔬 Объект ещё не подвергался заражению вашим патогеном, поэтому каждый день, пока он заражён, "
                     f"вы будете получать по {_fmt_bio_res_after_po(int(last_gained))}"
                 )
-            _emit(txt)
+            _emit(txt, reply_markup=_single_random_retry_kb())
             return
-    
+
         rem_row = db_one("SELECT COALESCE(ready_pathogens,0) AS rp FROM labs WHERE user_id=?", (attacker_id,))
         rem = int(rem_row["rp"] if rem_row else 0)
         _emit(
             f"🥽 Иммунитет объекта «{single_target_tag}» оказался стойким к вашему патогену.\n"
             "Антитела смогли справиться с заражением.\n"
             f"🧪 Осталось патогенов: {rem} | +1 = {pat_price_txt}",
-            reply_markup=(
-                kb_infect_retry_user_upg(attacker_id, int(last_tid))
-                if ((not last_dummy) and (last_tid is not None))
-                else kb_infect_retry_mass_upg(attacker_id, mode, chat_filter)
-            )
+            reply_markup=_single_random_retry_kb()
         )
         
         if message.chat.type in ("group", "supergroup") and last_tid and last_tid > 0 and _chat_has_user(message.chat.id, int(last_tid)):
@@ -14360,6 +17251,8 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
     if succ > 0:
         bio_word = _ru_form(total_gained, "био-опыт", "био-опыта", "био-опыта")
         txt += f"\n☣️‍ +{_fmt_k(total_gained)} {bio_word}"
+
+    txt += _pathogens_extra_line()
 
     _emit(txt, reply_markup=kb_infect_retry_mass(attacker_id, mode, chat_filter))
 
@@ -14460,34 +17353,7 @@ def handle_sabotage_command(message, parsed: Parsed, edit_ctx: Optional[dict] = 
     organizer_tag = tg_mention(attacker_id, a_disp, username=a_un)
 
     def _notify(tid: int, text: str):
-        try:
-            notify_chat_id, notify_off = get_notify_prefs(int(tid))
-            if int(notify_off) == 1 and int(notify_chat_id) == 0:
-                return None
-
-            dest = int(notify_chat_id) if int(notify_chat_id) != 0 else int(tid)
-            try:
-                return bot.send_message(dest, text, parse_mode="HTML", disable_web_page_preview=True)
-            except Exception:
-                if int(notify_chat_id) != 0:
-                    try:
-                        set_notify_prefs(int(tid), 0, 0)
-                        try:
-                            bot.send_message(int(tid),
-                                "⚠️ Не удалось отправить уведомление в привязанный чат. Привязка сброшена на личные сообщения.",
-                                disable_web_page_preview=True)
-                        except Exception:
-                            pass
-                    except Exception:
-                        pass
-                if int(dest) != int(tid):
-                    try:
-                        return bot.send_message(int(tid), text, parse_mode="HTML", disable_web_page_preview=True)
-                    except Exception:
-                        return None
-            return None
-        except Exception:
-            return None
+        return send_user_notification(int(tid), text)
 
     db_exec(
         "INSERT INTO sabotage_cooldowns(attacker_id,target_id,until_ts) VALUES (?,?,?) "
@@ -14653,7 +17519,8 @@ def handle_lab_commands(message, parsed: Parsed):
 
     if parsed.cmd not in (
         "lab_delete", "restore_lab", "lab_delete_confirm_phrase",
-        "labname_clear", "pathogenname_clear"
+        "labname_clear", "pathogenname_clear",
+        "chatname_set", "chatname_show", "chatname_clear"
     ):
         ensure_lab_exists(uid)
 
@@ -14683,6 +17550,83 @@ def handle_lab_commands(message, parsed: Parsed):
     if parsed.cmd == "restore_lab":
         ok, text = _restore_deleted_lab(int(uid), support_mode=False)
         bot.reply_to(message, text, parse_mode="HTML", disable_web_page_preview=True)
+        return
+
+    if parsed.cmd in ("chatname_set", "chatname_show", "chatname_clear"):
+        chat_id = int(message.chat.id)
+        me_row = get_user_row(int(uid))
+        me_un = (
+            (me_row["username"] or "").strip()
+            if me_row else
+            ((getattr(message.from_user, "username", None) or "").strip())
+        )
+
+        if parsed.cmd == "chatname_set":
+            new_name = _normalize_chat_user_name(parsed.args or "")
+            if not new_name:
+                return
+            if len(new_name) > _CHAT_USER_NAME_MAX_LEN:
+                bot.reply_to(message, f"📑 Ник превышает максимальные {_CHAT_USER_NAME_MAX_LEN} символов.")
+                return
+            if _chat_user_name_is_invalid(new_name):
+                bot.reply_to(message, "📑 Найдены недопустимые символы. Повторите попытку.")
+                return
+
+            set_chat_user_name(chat_id, int(uid), new_name)
+            bot.reply_to(
+                message,
+                f"✅ Ник {standard_user_tag(int(uid))} изменён на «{tg_mention(int(uid), new_name, username=me_un)}»",
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
+            return
+
+        if parsed.cmd == "chatname_clear":
+            clear_chat_user_name(chat_id, int(uid))
+            bot.reply_to(
+                message,
+                f"❎ Ник {standard_user_tag(int(uid))} удалён.",
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
+            return
+
+        if not (parsed.args or "").strip():
+            target_id = int(uid)
+            target_user_obj = message.from_user
+        else:
+            target_id, target_user_obj = resolve_target_from_reply_or_args(message, parsed)
+            if target_id is None:
+                bot.reply_to(message, "📑 Укажите пользователя через @username, user_id, ссылку или reply.")
+                return
+
+        if target_user_obj is not None:
+            capture_user_context(message, target_user_obj)
+
+        row = get_user_row(int(target_id))
+        un = (row["username"] or "").strip() if row else ""
+        current_chat_name = get_chat_user_name(chat_id, int(target_id))
+
+        if current_chat_name:
+            shown_name = current_chat_name
+        elif row:
+            shown_name = standard_display_name(
+                row["first_name"] or "",
+                row["last_name"] or "",
+                row["username"] or "",
+                int(target_id)
+            )
+        else:
+            disp, _, _ = _best_known_display_by_uid(int(target_id))
+            shown_name = disp
+
+        shown_tag = tg_mention(int(target_id), shown_name, username=un)
+        bot.reply_to(
+            message,
+            f"📋 Ник {standard_user_tag(int(target_id))}: «{shown_tag}»",
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
         return
 
     if parsed.cmd in ("labname_clear", "pathogenname_clear"):
@@ -14789,6 +17733,26 @@ def handle_lab_commands(message, parsed: Parsed):
 
         set_pathogen_name(uid, new_name)
         bot.reply_to(message, f"✅ Имя патогена успешно изменено на {h(new_name)}!")
+        return
+
+    if parsed.cmd == "pathogens_info":
+        bot.reply_to(
+            message,
+            render_pathogens_info(int(uid)),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=kb_pathogens(int(uid))
+        )
+        return
+
+    if parsed.cmd == "pathogen_info":
+        bot.reply_to(
+            message,
+            render_pathogen_brief(int(uid)),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=kb_pathogen_info(int(uid))
+        )
         return
 
     if parsed.cmd in ("lab", "mylab"):
@@ -16065,17 +19029,16 @@ def observe_seen_users(message):
                     is_active=1
                 )
                 u = getattr(message, "from_user", None)
-                if u and not bool(getattr(u, "is_bot", False)):
+                if u:
                     remember_chat_member(int(message.chat.id), u)
 
                 rm = getattr(message, "reply_to_message", None)
                 if rm and getattr(rm, "from_user", None):
                     ru = rm.from_user
-                    if not bool(getattr(ru, "is_bot", False)):
-                        remember_chat_member(int(message.chat.id), ru)
+                    remember_chat_member(int(message.chat.id), ru)
 
                 for nu in (getattr(message, "new_chat_members", None) or []):
-                    if nu and not bool(getattr(nu, "is_bot", False)):
+                    if nu:
                         remember_chat_member(int(message.chat.id), nu)
     except Exception:
         pass
@@ -16085,6 +19048,7 @@ def observe_seen_users(message):
 # MAIN ROUTER
 @bot.message_handler(content_types=["text"])
 def text_router(message):
+    set_chat_name_context(int(getattr(getattr(message, "chat", None), "id", 0) or 0))
     try:
         if (getattr(message.chat, "type", "") or "").lower() == "channel":
             return
@@ -16103,6 +19067,9 @@ def text_router(message):
 
         upsert_user(message.from_user)
         _merge_placeholder_to_real_user(message.from_user)
+        if message.chat.type == "private":
+            set_pm_opened(int(uid), 1)
+            set_notify_prefs(int(uid), 0, 0)
         if getattr(message, "via_bot", None) is not None:
             return
         if message.chat.type in ("group", "supergroup"):
@@ -16290,6 +19257,15 @@ def text_router(message):
             handle_autoanswer_toggle(message, parsed.cmd)
             return
 
+        # дуэли
+        if parsed.cmd in (
+            "duel_call", "duel_call_stake", "duel_accept", "duel_decline", "duel_cancel",
+            "duel_fire", "duel_aim", "duel_break_aim", "duel_surrender",
+            "duel_bets_list", "duel_bet", "duel_stats"
+        ):
+            handle_duel_commands(message, parsed)
+            return
+
         # заразить
         if parsed.cmd == "infect":
             handle_infect_command(message, parsed)
@@ -16411,13 +19387,17 @@ def text_router(message):
         if parsed.cmd in (
             "lab", "mylab", "labname", "pathogenname",
             "labname_clear", "pathogenname_clear",
-            "lab_delete", "restore_lab", "lab_delete_confirm_phrase"
+            "chatname_set", "chatname_show", "chatname_clear",
+            "lab_delete", "restore_lab", "lab_delete_confirm_phrase",
+            "pathogens_info", "pathogen_info"
         ):
             handle_lab_commands(message, parsed)
             return
 
     except Exception as e:
         send_error_report("text_router", e)
+    finally:
+        clear_chat_name_context()
 
 if __name__ == "__main__":
     init_db()
