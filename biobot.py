@@ -1685,6 +1685,9 @@ def _is_transient_telegram_network_error(exc: Exception) -> bool:
         or "connect timeout" in s
         or "remotedisconnected" in s
         or "remote end closed connection without response" in s
+        or "too many requests" in s
+        or "retry after" in s
+        or "error code: 429" in s
     )
 
 def _try_send_result_to_pm_from_message(message, text, *args, **kwargs):
@@ -1741,6 +1744,9 @@ def _bot_reply_to_premium(message, text, *args, **kwargs):
             pm_msg = _try_send_result_to_pm_from_message(message, text, *args, **kwargs)
             if pm_msg is not None:
                 return pm_msg
+            return None
+
+        if _is_transient_telegram_network_error(e):
             return None
 
         raise
@@ -10503,7 +10509,7 @@ def _promo_parse_create_message(message_text: str):
                     parsed = True
                     break
         if not parsed:
-            return None, "📑 Неверный формат периода промокода."
+            return None, f"📑 Неверный формат периода промокода.\n{_TIMER_ABS_FORMATS_HELP}"
     else:
         return None, "📑 Укажите параметр <code>постоянный</code> или <code>временный</code>."
 
@@ -16627,7 +16633,12 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
     now = now_ts()
 
     def _notify_target(tid: int, text: str):
-        return send_user_notification(int(tid), text)
+        tid = int(tid)
+
+        if not is_lab_active(tid):
+            return None
+
+        return send_user_notification(tid, text)
 
     # организатор
     att_un = getattr(actor, "username", "") or ""
