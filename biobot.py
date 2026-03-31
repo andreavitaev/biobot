@@ -1571,6 +1571,13 @@ def clear_chat_user_name(chat_id: int, user_id: int):
         commit=True
     )
 
+def clear_all_chat_user_names_for_user(user_id: int):
+    db_exec(
+        "DELETE FROM chat_user_names WHERE user_id=?",
+        (int(user_id),),
+        commit=True
+    )
+
 def _chat_user_name_is_invalid(name: str) -> bool:
     nm = _normalize_chat_user_name(name)
     if not nm:
@@ -2780,6 +2787,10 @@ def init_db():
     db_exec("""
     CREATE TABLE IF NOT EXISTS user_name_restrictions (
         user_id            INTEGER PRIMARY KEY,
+        user_locked        INTEGER NOT NULL DEFAULT 0,
+        user_by            INTEGER NOT NULL DEFAULT 0,
+        user_at            INTEGER NOT NULL DEFAULT 0,
+        user_reason        TEXT NOT NULL DEFAULT '',
         lab_locked         INTEGER NOT NULL DEFAULT 0,
         lab_by             INTEGER NOT NULL DEFAULT 0,
         lab_at             INTEGER NOT NULL DEFAULT 0,
@@ -2787,9 +2798,28 @@ def init_db():
         pat_locked         INTEGER NOT NULL DEFAULT 0,
         pat_by             INTEGER NOT NULL DEFAULT 0,
         pat_at             INTEGER NOT NULL DEFAULT 0,
-        pat_reason         TEXT NOT NULL DEFAULT ''
+        pat_reason         TEXT NOT NULL DEFAULT '',
+        corp_locked        INTEGER NOT NULL DEFAULT 0,
+        corp_by            INTEGER NOT NULL DEFAULT 0,
+        corp_at            INTEGER NOT NULL DEFAULT 0,
+        corp_reason        TEXT NOT NULL DEFAULT ''
     );
     """, commit=True)
+
+    for sql in (
+        "ALTER TABLE user_name_restrictions ADD COLUMN user_locked INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE user_name_restrictions ADD COLUMN user_by INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE user_name_restrictions ADD COLUMN user_at INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE user_name_restrictions ADD COLUMN user_reason TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE user_name_restrictions ADD COLUMN corp_locked INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE user_name_restrictions ADD COLUMN corp_by INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE user_name_restrictions ADD COLUMN corp_at INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE user_name_restrictions ADD COLUMN corp_reason TEXT NOT NULL DEFAULT ''",
+    ):
+        try:
+            db_exec(sql, commit=True)
+        except Exception:
+            pass
 
     db_exec("""
     CREATE TABLE IF NOT EXISTS chat_user_names (
@@ -3835,6 +3865,69 @@ def corp_name_display(name: str) -> str:
     if nm.lower().startswith("им."):
         return h(nm)
     return f"«{h(nm)}»"
+
+def _default_corp_name_for_owner(owner_id: int, exclude_corp_id: int = 0) -> str:
+    owner_id = int(owner_id)
+    exclude_corp_id = int(exclude_corp_id or 0)
+
+    u = get_user_row(owner_id)
+    un = (u["username"] or "") if u else ""
+    disp = standard_display_name(
+        (u["first_name"] or "") if u else "",
+        (u["last_name"] or "") if u else "",
+        un,
+        owner_id
+    )
+    base = f"им. {disp}".strip() if disp else f"им. {owner_id}"
+    if len(base) > 40:
+        base = base[:40].rstrip() or f"им. {owner_id}"
+
+    ex = corp_by_name(base)
+    if not ex or int(ex["corp_id"] or 0) == exclude_corp_id:
+        return base
+
+    suffix = f" {owner_id}"
+    trimmed = base[:max(1, 40 - len(suffix))].rstrip()
+    cand = f"{trimmed}{suffix}".strip()
+    ex = corp_by_name(cand)
+    if not ex or int(ex["corp_id"] or 0) == exclude_corp_id:
+        return cand
+
+    return (f"им. {owner_id}")[:40]
+
+def _reset_owned_corp_name_to_default(owner_id: int):
+    owner_id = int(owner_id)
+    cid, _ = get_user_corp_resolved(owner_id)
+    if cid <= 0:
+        return
+
+    corp = corp_by_id(int(cid))
+    if not corp:
+        return
+
+    if int(corp["owner_id"] or 0) != owner_id:
+        return
+
+    new_name = _default_corp_name_for_owner(owner_id, exclude_corp_id=int(cid))
+
+    with DB_LOCK:
+        c = conn.cursor()
+        try:
+            c.execute("BEGIN")
+            c.execute("UPDATE corps SET name=? WHERE corp_id=?", (new_name, int(cid)))
+            c.execute(
+                "UPDATE labs SET corp_name=? WHERE user_id IN (SELECT user_id FROM corp_members WHERE corp_id=?)",
+                (new_name, int(cid))
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            try:
+                c.close()
+            except Exception:
+                pass
 
 def corp_clickable_name(corp_row) -> str:
     nm = corp_name_display((corp_row["name"] or "").strip())
@@ -5589,7 +5682,11 @@ def remove_support_agent(target_id: int):
 
 def get_name_restriction_row(user_id: int):
     return db_one(
-        "SELECT user_id, lab_locked, lab_by, lab_at, lab_reason, pat_locked, pat_by, pat_at, pat_reason "
+        "SELECT user_id, "
+        "user_locked, user_by, user_at, user_reason, "
+        "lab_locked, lab_by, lab_at, lab_reason, "
+        "pat_locked, pat_by, pat_at, pat_reason, "
+        "corp_locked, corp_by, corp_at, corp_reason "
         "FROM user_name_restrictions WHERE user_id=? LIMIT 1",
         (int(user_id),)
     )
@@ -5602,35 +5699,61 @@ def set_name_restriction(user_id: int, kind: str, locked: int, imposed_by: int, 
 
     row = get_name_restriction_row(uid)
     cur = dict(row) if row else {
+        "user_locked": 0, "user_by": 0, "user_at": 0, "user_reason": "",
         "lab_locked": 0, "lab_by": 0, "lab_at": 0, "lab_reason": "",
         "pat_locked": 0, "pat_by": 0, "pat_at": 0, "pat_reason": "",
+        "corp_locked": 0, "corp_by": 0, "corp_at": 0, "corp_reason": "",
     }
 
-    if kind == "lab":
+    if kind == "user":
+        cur["user_locked"] = int(locked)
+        cur["user_by"] = agent if int(locked) == 1 else 0
+        cur["user_at"] = now if int(locked) == 1 else 0
+        cur["user_reason"] = reason if int(locked) == 1 else ""
+    elif kind == "lab":
         cur["lab_locked"] = int(locked)
         cur["lab_by"] = agent if int(locked) == 1 else 0
         cur["lab_at"] = now if int(locked) == 1 else 0
         cur["lab_reason"] = reason if int(locked) == 1 else ""
-    else:
+    elif kind == "pat":
         cur["pat_locked"] = int(locked)
         cur["pat_by"] = agent if int(locked) == 1 else 0
         cur["pat_at"] = now if int(locked) == 1 else 0
         cur["pat_reason"] = reason if int(locked) == 1 else ""
+    else:
+        cur["corp_locked"] = int(locked)
+        cur["corp_by"] = agent if int(locked) == 1 else 0
+        cur["corp_at"] = now if int(locked) == 1 else 0
+        cur["corp_reason"] = reason if int(locked) == 1 else ""
 
-    if int(cur["lab_locked"]) == 0 and int(cur["pat_locked"]) == 0:
+    if (
+        int(cur["user_locked"]) == 0
+        and int(cur["lab_locked"]) == 0
+        and int(cur["pat_locked"]) == 0
+        and int(cur["corp_locked"]) == 0
+    ):
         db_exec("DELETE FROM user_name_restrictions WHERE user_id=?", (uid,), commit=True)
         return
 
     db_exec(
-        "INSERT INTO user_name_restrictions(user_id, lab_locked, lab_by, lab_at, lab_reason, pat_locked, pat_by, pat_at, pat_reason) "
-        "VALUES (?,?,?,?,?,?,?,?,?) "
+        "INSERT INTO user_name_restrictions("
+        "user_id, "
+        "user_locked, user_by, user_at, user_reason, "
+        "lab_locked, lab_by, lab_at, lab_reason, "
+        "pat_locked, pat_by, pat_at, pat_reason, "
+        "corp_locked, corp_by, corp_at, corp_reason"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
         "ON CONFLICT(user_id) DO UPDATE SET "
+        "user_locked=excluded.user_locked, user_by=excluded.user_by, user_at=excluded.user_at, user_reason=excluded.user_reason, "
         "lab_locked=excluded.lab_locked, lab_by=excluded.lab_by, lab_at=excluded.lab_at, lab_reason=excluded.lab_reason, "
-        "pat_locked=excluded.pat_locked, pat_by=excluded.pat_by, pat_at=excluded.pat_at, pat_reason=excluded.pat_reason",
+        "pat_locked=excluded.pat_locked, pat_by=excluded.pat_by, pat_at=excluded.pat_at, pat_reason=excluded.pat_reason, "
+        "corp_locked=excluded.corp_locked, corp_by=excluded.corp_by, corp_at=excluded.corp_at, corp_reason=excluded.corp_reason",
         (
             uid,
+            int(cur["user_locked"]), int(cur["user_by"]), int(cur["user_at"]), str(cur["user_reason"]),
             int(cur["lab_locked"]), int(cur["lab_by"]), int(cur["lab_at"]), str(cur["lab_reason"]),
             int(cur["pat_locked"]), int(cur["pat_by"]), int(cur["pat_at"]), str(cur["pat_reason"]),
+            int(cur["corp_locked"]), int(cur["corp_by"]), int(cur["corp_at"]), str(cur["corp_reason"]),
         ),
         commit=True
     )
@@ -5639,7 +5762,8 @@ def _blacklist_collect_rows() -> list[dict]:
     out: Dict[int, dict] = {}
 
     bans = db_all(
-        "SELECT user_id, banned_by, banned_at, reason, username, first_name, last_name FROM bot_bans ORDER BY banned_at DESC, user_id DESC"
+        "SELECT user_id, banned_by, banned_at, reason, username, first_name, last_name "
+        "FROM bot_bans ORDER BY banned_at DESC, user_id DESC"
     ) or []
     for r in bans:
         uid = int(r["user_id"])
@@ -5661,11 +5785,16 @@ def _blacklist_collect_rows() -> list[dict]:
         item["latest_ts"] = max(int(item["latest_ts"]), int(r["banned_at"] or 0))
 
     locks = db_all(
-        "SELECT user_id, lab_locked, lab_by, lab_at, lab_reason, pat_locked, pat_by, pat_at, pat_reason "
+        "SELECT user_id, "
+        "user_locked, user_by, user_at, user_reason, "
+        "lab_locked, lab_by, lab_at, lab_reason, "
+        "pat_locked, pat_by, pat_at, pat_reason, "
+        "corp_locked, corp_by, corp_at, corp_reason "
         "FROM user_name_restrictions "
-        "WHERE lab_locked=1 OR pat_locked=1 "
-        "ORDER BY MAX(lab_at, pat_at) DESC, user_id DESC"
+        "WHERE user_locked=1 OR lab_locked=1 OR pat_locked=1 OR corp_locked=1 "
+        "ORDER BY user_id DESC"
     ) or []
+
     for r in locks:
         uid = int(r["user_id"])
         u = get_user_row(uid)
@@ -5679,6 +5808,14 @@ def _blacklist_collect_rows() -> list[dict]:
             "first_name": ((u["first_name"] or "").strip() if u else ""),
             "last_name": ((u["last_name"] or "").strip() if u else ""),
         })
+
+        if int(r["user_locked"] or 0) == 1:
+            item["statuses"].append("имени пользователя")
+            if (r["user_reason"] or "").strip():
+                item["reasons"].append((r["user_reason"] or "").strip())
+            if int(r["user_by"] or 0) > 0:
+                item["agents"].append(int(r["user_by"]))
+            item["latest_ts"] = max(int(item["latest_ts"]), int(r["user_at"] or 0))
 
         if int(r["lab_locked"] or 0) == 1:
             item["statuses"].append("имени лабы")
@@ -5695,6 +5832,14 @@ def _blacklist_collect_rows() -> list[dict]:
             if int(r["pat_by"] or 0) > 0:
                 item["agents"].append(int(r["pat_by"]))
             item["latest_ts"] = max(int(item["latest_ts"]), int(r["pat_at"] or 0))
+
+        if int(r["corp_locked"] or 0) == 1:
+            item["statuses"].append("названия корпорации")
+            if (r["corp_reason"] or "").strip():
+                item["reasons"].append((r["corp_reason"] or "").strip())
+            if int(r["corp_by"] or 0) > 0:
+                item["agents"].append(int(r["corp_by"]))
+            item["latest_ts"] = max(int(item["latest_ts"]), int(r["corp_at"] or 0))
 
     rows = list(out.values())
     rows.sort(key=lambda x: (int(x["latest_ts"]), int(x["user_id"])), reverse=True)
@@ -5753,6 +5898,7 @@ def render_blacklist_text(page: int) -> tuple[str, Optional[InlineKeyboardMarkup
     lines.append("📑 ЧЁРНЫЙ СПИСОК:")
     lines.append("")
     lines.append("<blockquote expandable>")
+
     for idx, row in enumerate(part, start + 1):
         who = _user_display_from_any(
             int(row["user_id"]),
@@ -5761,7 +5907,8 @@ def render_blacklist_text(page: int) -> tuple[str, Optional[InlineKeyboardMarkup
             last_name=str(row.get("last_name", "") or "")
         )
         statuses = " / ".join(dict.fromkeys([str(x) for x in row["statuses"] if str(x).strip()]))
-        reasons = " | ".join(dict.fromkeys([str(x) for x in row["reasons"] if str(x).strip()])) or "—"
+
+        reasons = " | ".join(dict.fromkeys([str(x) for x in row["reasons"] if str(x).strip()]))
 
         agents_unique = []
         seen = set()
@@ -5774,8 +5921,10 @@ def render_blacklist_text(page: int) -> tuple[str, Optional[InlineKeyboardMarkup
 
         lines.append(f"{idx}. {who} | {_fmt_ts(int(row['latest_ts'] or 0))}")
         lines.append(f"Ограничения: {h(statuses)}")
-        lines.append(f"Причина: {h(reasons)}")
+        if reasons:
+            lines.append(f"🗒️ Причина: {h(reasons)}")
         lines.append(f"Агент: {agent_text}")
+
         if idx < start + len(part):
             lines.append("")
 
@@ -6094,11 +6243,14 @@ def build_agents_panel_text(user_id: int) -> str:
         lines.append("/edit_k — изменить k")
         lines.append("/edit_b — изменить β")
         lines.append("/cof_inf_stats — информация по переменным заражения")
-    lines.append("/bot_ban — заблокировать пользователя")
+        lines.append("")
+    lines.append("/bot_ban + {причина с новой строки} — заблокировать пользователя")
     lines.append("/bot_unban — разблокировать пользователя")
     lines.append("/remake_lab — восстановить лабораторию")
-    lines.append("<code>/+lab_name</code> | <code>/-lab_name</code> — разрешает/запрещает имена лаборатории для пользователя")
-    lines.append("<code>/+pat_name</code> | <code>/-pat_name</code> — разрешает/запрещает имена патогена для пользователя")
+    lines.append("<code>/+lab_name</code> | <code>/-lab_name</code> + {причина с новой строки} — разрешает/запрещает имена лаборатории для пользователя")
+    lines.append("<code>/+pat_name</code> | <code>/-pat_name</code> + {причина с новой строки} — разрешает/запрещает имена патогена для пользователя")
+    lines.append("<code>/+user_name</code> | <code>/-user_name</code> + {причина с новой строки} — разрешает/запрещает смену имени для пользователя")
+    lines.append("<code>/+corp_name</code> | <code>/-corp_name</code> + {причина с новой строки} — разрешает/запрещает имена корпорации для пользователя")
     lines.append("/blacklist — список пользователей с ограничениями")
     lines.append("")
     if uid == int(CREATOR_ID):
@@ -6137,22 +6289,26 @@ def render_bot_ban_text(user_id: int) -> str:
     reason = (row["reason"] or "").strip()
     text = "⛔ Доступ к боту ограничен."
     if reason:
-        text += f"\nПричина: {h(reason)}"
+        text += f"\n\n🗒️ Причина: {h(reason)}"
     return text
 
 def _resolve_admin_target_and_reason(message, parsed: "Parsed"):
+    first_line, _body = _timer_first_line_and_body(message.text or "")
+    fl = first_line.strip()
+    if fl.startswith("/") or fl.startswith("."):
+        fl = fl[1:].strip()
+
+    reason = _timer_parse_reason_from_message(message.text or "")
+
     if message.reply_to_message and getattr(message.reply_to_message, "from_user", None):
         u = message.reply_to_message.from_user
-        return int(u.id), u, (parsed.args or "").strip()
+        return int(u.id), u, reason
 
-    args = (parsed.args or "").strip()
-    if not args:
-        return None, None, ""
+    parts = fl.split()
+    if len(parts) < 2:
+        return None, None, reason
 
-    parts = args.split(" ", 1)
-    token = parts[0].strip()
-    reason = parts[1].strip() if len(parts) > 1 else ""
-
+    token = parts[1].strip()
     target_id = resolve_target_id(token)
 
     if target_id is None:
@@ -6577,8 +6733,9 @@ def corp_notice_manager_ids(corp_id: int) -> list[int]:
             out.append(int(uid))
     return out
 
-def render_settings_text(user_id: int) -> str:
+def render_settings_text(user_id: int, current_chat_id: int = 0) -> str:
     uid = int(user_id)
+    current_chat_id = int(current_chat_id or 0)
 
     lab_row = db_one(
         "SELECT COALESCE(hide_balance,0) AS hb, COALESCE(hide_lab,0) AS hl, COALESCE(lab_active,0) AS la "
@@ -6607,8 +6764,22 @@ def render_settings_text(user_id: int) -> str:
     deleted_row = get_deleted_lab_row(uid)
     cid, _cname, role = _user_corp_role_soft(uid)
 
+    title = "⚙️ Параметры"
+    if current_chat_id < 0:
+        row = get_user_row(uid)
+        if row:
+            shown_name = get_chat_user_name(int(current_chat_id), int(uid)) or standard_display_name(
+                row["first_name"] or "",
+                row["last_name"] or "",
+                row["username"] or "",
+                int(uid)
+            )
+        else:
+            shown_name = get_chat_user_name(int(current_chat_id), int(uid)) or str(int(uid))
+        title = f"⚙️ Параметры «{h(shown_name)}»"
+
     lines = []
-    lines.append("⚙️ Параметры")
+    lines.append(title)
     lines.append("")
     lines.append("ПРИВАТНЫЕ НАСТРОЙКИ:")
     lines.append(f"💰 Баланс: {bal_txt}")
@@ -6695,7 +6866,7 @@ def handle_settings_command(message):
 
     bot.reply_to(
         message,
-        render_settings_text(uid),
+        render_settings_text(uid, int(message.chat.id)),
         parse_mode="HTML",
         disable_web_page_preview=True,
         reply_markup=kb_settings(uid, int(message.chat.id), str(message.chat.type or "private"))
@@ -6730,8 +6901,13 @@ def _report_parse_cb(data: str):
     except Exception:
         return None, None
 
-def kb_report_menu(uid: int) -> InlineKeyboardMarkup:
+def kb_report_menu(uid: int, *, appeal_only: bool = False) -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup(row_width=2)
+
+    if appeal_only:
+        kb.add(_ikb("Апелляция", callback_data=_report_cb(int(uid), "APPEAL"), style="primary"))
+        return kb
+
     kb.add(_ikb("Восстановление лаборатории", callback_data=_report_cb(int(uid), "RESTORE"), style="primary"))
     kb.row(
         _ikb("Ошибка бота", callback_data=_report_cb(int(uid), "BUG"), style="primary"),
@@ -6826,6 +7002,12 @@ def _handle_report_content_message(message) -> bool:
     desc = ""
 
     cat_u = str(cat).upper()
+
+    if is_bot_banned(int(uid)) and cat_u != "APPEAL":
+        report_clear_state(int(uid))
+        bot.reply_to(message, "Для заблокированных пользователей доступна только апелляция.")
+        return True
+
     if cat_u == "USER":
         lines = raw.splitlines()
         if not lines or not lines[0].strip().startswith("@"):
@@ -6897,10 +7079,12 @@ def handle_report_command(message):
     upsert_user(message.from_user)
     report_clear_state(uid)
 
+    appeal_only = is_bot_banned(int(uid))
+
     bot.reply_to(
         message,
         "Выберите категорию запроса:",
-        reply_markup=kb_report_menu(uid)
+        reply_markup=kb_report_menu(uid, appeal_only=appeal_only)
     )
 
 def remember_chat_member(chat_id: int, tg_user):
@@ -7372,7 +7556,7 @@ def leading_sign_after_bot_prefix(text: str) -> str:
 
     if s.startswith("++"):
         return "+"
-    if s[0] in "+-":
+    if s[0] in "+-~":
         return s[0]
     return ""
 
@@ -7383,11 +7567,11 @@ SIGNED_COMMANDS_ALLOWED = {
     "notify_on", "notify_off",
     "mrp_add", "mrp_delete",
     "autoanswer_on", "autoanswer_off",
-    "corp_open", "corp_close",
+    "corp_open", "corp_close", "corp_rename",
     "corp_deputy", "corp_deputy_remove",
     "labname_clear", "pathogenname_clear",
     "chatname_set", "chatname_clear",
-    "name_lock_lab", "name_lock_pat",
+    "name_lock_user", "name_lock_lab", "name_lock_pat", "name_lock_corp",
     "upgrade_preview", "upgrade_buy",
 }
 
@@ -7501,7 +7685,7 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
     if t.startswith("++"):
         sign = "++"
         t = t[2:].lstrip()
-    elif t.startswith(("+", "-", "!")):
+    elif t.startswith(("+", "-", "!", "~")):
         sign = t[0]
         t = t[1:].lstrip()
 
@@ -7564,6 +7748,32 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
             has_prefix_char=False,
             prefix_char=None,
             cmd="name_lock_pat",
+            args=rest
+        )
+
+    if sign in ("+", "-") and (low == "user_name" or low.startswith("user_name ")):
+        rest = ""
+        parts = t.split(" ", 1)
+        if len(parts) > 1:
+            rest = parts[1].strip()
+        return Parsed(
+            raw=raw_multiline,
+            has_prefix_char=False,
+            prefix_char=None,
+            cmd="name_lock_user",
+            args=rest
+        )
+
+    if sign in ("+", "-") and (low == "corp_name" or low.startswith("corp_name ")):
+        rest = ""
+        parts = t.split(" ", 1)
+        if len(parts) > 1:
+            rest = parts[1].strip()
+        return Parsed(
+            raw=raw_multiline,
+            has_prefix_char=False,
+            prefix_char=None,
+            cmd="name_lock_corp",
             args=rest
         )
 
@@ -7822,6 +8032,20 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
         if len(parts) >= 3:
             rest = parts[2].strip()
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="corp_create", args=rest)
+
+    if sign == "~" and (
+        low == "корп название"
+        or low == "корпорация название"
+        or low == "к название"
+        or low.startswith("корп название ")
+        or low.startswith("корпорация название ")
+        or low.startswith("к название ")
+    ):
+        rest = ""
+        parts = t.split(" ", 2)
+        if len(parts) >= 3:
+            rest = parts[2].strip()
+        return Parsed(raw=raw_multiline, has_prefix_char=False, prefix_char=None, cmd="corp_rename", args=rest)
 
     if low in ("удалить корпорацию", "удалить корп", "удалить корпу", "удалить к"):
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="corp_delete", args="")
@@ -8671,8 +8895,20 @@ def handle_admin_name_restriction_command(message, parsed: Parsed):
 
     reason = _timer_parse_reason_from_message(message.text or "")
 
+    if parsed.cmd == "name_lock_user":
+        locked = 1 if fl.startswith("-") or fl.lower().startswith("-user_name") else 0
+        set_name_restriction(int(target_id), "user", locked, int(uid), reason)
+        if locked == 1:
+            clear_all_chat_user_names_for_user(int(target_id))
+        bot.reply_to(
+            message,
+            f"✅ Пользователю <code>{int(target_id)}</code> {'запрещено' if locked == 1 else 'разрешено'} менять имя пользователя в чатах.",
+            parse_mode="HTML"
+        )
+        return
+
     if parsed.cmd == "name_lock_lab":
-        locked = 1 if fl.startswith("-") or fl.lower().startswith("-lab_name") or fl.lower().startswith("/-lab_name") or fl.lower().startswith(".-lab_name") else 0
+        locked = 1 if fl.startswith("-") or fl.lower().startswith("-lab_name") else 0
         set_name_restriction(int(target_id), "lab", locked, int(uid), reason)
         bot.reply_to(
             message,
@@ -8681,11 +8917,23 @@ def handle_admin_name_restriction_command(message, parsed: Parsed):
         )
         return
 
-    locked = 1 if fl.startswith("-") or fl.lower().startswith("-pat_name") or fl.lower().startswith("/-pat_name") or fl.lower().startswith(".-pat_name") else 0
-    set_name_restriction(int(target_id), "pat", locked, int(uid), reason)
+    if parsed.cmd == "name_lock_pat":
+        locked = 1 if fl.startswith("-") or fl.lower().startswith("-pat_name") else 0
+        set_name_restriction(int(target_id), "pat", locked, int(uid), reason)
+        bot.reply_to(
+            message,
+            f"✅ Пользователю <code>{int(target_id)}</code> {'запрещено' if locked == 1 else 'разрешено'} менять имя патогена.",
+            parse_mode="HTML"
+        )
+        return
+
+    locked = 1 if fl.startswith("-") or fl.lower().startswith("-corp_name") else 0
+    set_name_restriction(int(target_id), "corp", locked, int(uid), reason)
+    if locked == 1:
+        _reset_owned_corp_name_to_default(int(target_id))
     bot.reply_to(
         message,
-        f"✅ Пользователю <code>{int(target_id)}</code> {'запрещено' if locked == 1 else 'разрешено'} менять имя патогена.",
+        f"✅ Пользователю <code>{int(target_id)}</code> {'запрещено' if locked == 1 else 'разрешено'} менять название корпорации.",
         parse_mode="HTML"
     )
 
@@ -14080,6 +14328,10 @@ def cb_report_ui(cq):
             bot.answer_callback_query(cq.id)
             return
 
+        if is_bot_banned(int(uid)) and act != "APPEAL":
+            bot.answer_callback_query(cq.id, "Для заблокированных пользователей доступна только апелляция.", show_alert=True)
+            return
+
         if act == "RESTORE" and not get_deleted_lab_row(int(uid)):
             bot.answer_callback_query(cq.id, "У вас нет сохранённой лаборатории для восстановления.", show_alert=True)
             return
@@ -14572,8 +14824,8 @@ CB_DUEL_REMATCH = "DUEL_REMATCH"
 
 DUEL_INVITE_TIMEOUT_SEC = 5 * 60
 DUEL_TURN_TIMEOUT_SEC = 5 * 60
-DUEL_BASE_HIT_PCT = 20
-DUEL_MAX_TURNS = 15
+DUEL_BASE_HIT_PCT = 25
+DUEL_MAX_TURNS = 25
 
 def _duel_stake_text(amount: int) -> str:
     n = int(amount or 0)
@@ -15654,7 +15906,13 @@ def _duel_send_bet_result_notice(chat_id: int, bettor_id: int, candidate_id: int
         pass
 
 def _duel_rating_pct_value(wins: int, draws: int, losses: int) -> float:
-    return ((int(wins) + int(draws)) / max(1, int(losses))) * 100.0
+    wins = int(wins or 0)
+    draws = int(draws or 0)
+    losses = int(losses or 0)
+    total = wins + draws + losses
+    if total <= 0:
+        return 0.0
+    return ((wins + draws) / total) * 100.0
 
 def _duel_streak_label(streak: int) -> str:
     s = int(streak or 0)
@@ -16095,10 +16353,6 @@ def handle_duel_commands(message, parsed: Parsed):
     uid = int(message.from_user.id)
     chat_id = int(message.chat.id)
 
-    if not is_lab_active(int(uid)):
-        bot.reply_to(message, "📑 Сначала создайте свою лабораторию.")
-        return
-
     if parsed.cmd == "duel_stats":
         text = render_duel_stats_text(
             int(chat_id),
@@ -16286,10 +16540,6 @@ def handle_duel_commands(message, parsed: Parsed):
         my_bot_id = 0
     if my_bot_id and int(target_id) == int(my_bot_id):
         bot.reply_to(message, "📑 Как бы Вам не хотелось показать своё преимущество перед искуственным соперником, бот не может участвовать в дуэли.")
-        return
-
-    if not is_lab_active(int(target_id)):
-        bot.reply_to(message, "📑 Этот пользователь ещё не создал свою лабораторию.")
         return
 
     if _duel_user_has_active_duel_in_chat(int(chat_id), int(uid)) or _duel_user_has_outgoing_pending_invite_in_chat(int(chat_id), int(uid)):
@@ -17949,6 +18199,10 @@ def handle_lab_commands(message, parsed: Parsed):
 
         if parsed.cmd == "chatname_set":
             new_name = _normalize_chat_user_name(parsed.args or "")
+            lock_row = get_name_restriction_row(int(uid))
+            if lock_row and int(lock_row["user_locked"] or 0) == 1:
+                bot.reply_to(message, "📑 Возможность менять имя пользователя в чатах ограничена. Обратитесь к агенту тех.поддержки.")
+                return
             if not new_name:
                 return
             if len(new_name) > _CHAT_USER_NAME_MAX_LEN:
@@ -18223,12 +18477,83 @@ def handle_corp_commands(message, parsed: Parsed):
 
     my_cid, my_cname = get_user_corp_resolved(uid)
 
+    if parsed.cmd == "corp_rename":
+        if my_cid <= 0:
+            bot.reply_to(message, "📑 Вы не состоите в Корпорации.")
+            return
+
+        corp = corp_by_id(my_cid)
+        if not corp:
+            bot.reply_to(message, "📑 Корпорация не найдена.")
+            return
+
+        if int(corp["owner_id"] or 0) != int(uid):
+            bot.reply_to(message, "📑 Менять название Корпорации может только её владелец.")
+            return
+
+        lock_row = get_name_restriction_row(int(uid))
+        if lock_row and int(lock_row["corp_locked"] or 0) == 1:
+            bot.reply_to(message, "📑 Возможность менять название Корпорации ограничена. Обратитесь к агенту тех.поддержки.")
+            return
+
+        new_name = re.sub(r"\s+", " ", (parsed.args or "").strip())
+        if not new_name:
+            bot.reply_to(message, "📑 Укажите новое название Корпорации.")
+            return
+
+        if len(new_name) > 40:
+            bot.reply_to(message, "📑 Название Корпорации превышает максимальные 40 символов.")
+            return
+
+        ex = corp_by_name(new_name)
+        if ex and int(ex["corp_id"] or 0) != int(my_cid):
+            bot.reply_to(message, "📑 Корпорация с таким названием уже существует.")
+            return
+
+        try:
+            with DB_LOCK:
+                c = conn.cursor()
+                try:
+                    c.execute("BEGIN")
+                    c.execute("UPDATE corps SET name=? WHERE corp_id=?", (new_name, int(my_cid)))
+                    c.execute(
+                        "UPDATE labs SET corp_name=? WHERE user_id IN (SELECT user_id FROM corp_members WHERE corp_id=?)",
+                        (new_name, int(my_cid))
+                    )
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+                finally:
+                    try:
+                        c.close()
+                    except Exception:
+                        pass
+        except Exception as e:
+            send_error_report("corp_rename", e)
+            bot.reply_to(message, "📑 Не удалось изменить название Корпорации.")
+            return
+
+        bot.reply_to(
+            message,
+            f"✅ Название Корпорации изменено на {corp_name_display(new_name)}.",
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
+        return
+
     if parsed.cmd == "corp_create":
         if my_cid > 0:
             bot.reply_to(message, "📑 Вы уже состоите в Корпорации.")
             return
 
-        name = (parsed.args or "").strip()
+        raw_name = (parsed.args or "").strip()
+        lock_row = get_name_restriction_row(int(uid))
+        if lock_row and int(lock_row["corp_locked"] or 0) == 1 and raw_name:
+            bot.reply_to(message, "📑 Возможность менять название Корпорации ограничена. Обратитесь к агенту тех.поддержки.")
+            return
+
+        name = raw_name
         if not name:
             u = get_user_row(uid)
             un = (u["username"] or "") if u else ""
@@ -19389,8 +19714,10 @@ def on_report_media(message):
     try:
         uid = int(message.from_user.id)
         if is_bot_banned(uid):
-            bot.reply_to(message, render_bot_ban_text(uid), disable_web_page_preview=True)
-            return
+            stage, cat = report_get_state(int(uid))
+            if not (stage == "await_content" and str(cat or "").upper() == "APPEAL"):
+                bot.reply_to(message, render_bot_ban_text(uid), disable_web_page_preview=True)
+                return
 
         upsert_user(message.from_user)
         _handle_report_content_message(message)
@@ -19447,8 +19774,32 @@ def text_router(message):
         uid = int(message.from_user.id)
 
         if is_bot_banned(uid):
-            if message.chat.type == "private":
-                bot.reply_to(message, render_bot_ban_text(uid), disable_web_page_preview=True)
+            if message.chat.type != "private":
+                return
+
+            stage, cat = report_get_state(int(uid))
+
+            if stage == "await_content" and str(cat or "").upper() == "APPEAL":
+                upsert_user(message.from_user)
+                _merge_placeholder_to_real_user(message.from_user)
+                set_pm_opened(int(uid), 1)
+                set_notify_prefs(int(uid), 0, 0)
+                ensure_creator_is_support()
+                if _handle_report_content_message(message):
+                    return
+                return
+
+            parsed_banned = parse_message_as_command(message.text or "")
+            if parsed_banned and parsed_banned.cmd == "report":
+                upsert_user(message.from_user)
+                _merge_placeholder_to_real_user(message.from_user)
+                set_pm_opened(int(uid), 1)
+                set_notify_prefs(int(uid), 0, 0)
+                ensure_creator_is_support()
+                handle_report_command(message)
+                return
+
+            bot.reply_to(message, render_bot_ban_text(uid), disable_web_page_preview=True)
             return
 
         upsert_user(message.from_user)
@@ -19562,7 +19913,7 @@ def text_router(message):
             handle_admin_service_commands(message, parsed)
             return
 
-        if parsed.cmd in ("name_lock_lab", "name_lock_pat"):
+        if parsed.cmd in ("name_lock_user", "name_lock_lab", "name_lock_pat", "name_lock_corp"):
             handle_admin_name_restriction_command(message, parsed)
             return
 
@@ -19760,7 +20111,7 @@ def text_router(message):
 
         # корпорации
         if parsed.cmd in (
-            "corp_create", "corp_delete", "corp_open", "corp_close",
+            "corp_create", "corp_delete", "corp_open", "corp_close", "corp_rename",
             "corp_reg", "corp_info", "corp_my", "corp_join", "corp_invite",
             "corp_req_accept", "corp_req_reject", "corp_req_list",
             "corp_deputy", "corp_deputy_remove", "corp_kick", "corp_leave", "corp_transfer_owner",
