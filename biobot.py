@@ -1144,6 +1144,7 @@ PREMIUM_EMOJI_IDS: Dict[str, str] = {
     "🩻": "5451915461295876382",
     "🌡️": "5470049770997292425",    
     "💥": "5197414236413786044",
+    "🎯": "5447213996820168272",
     "🦠": "5451936901772616837",
     "☠️": "5370842086658546991",
     "🧿": "5348470396582665977",
@@ -1153,7 +1154,7 @@ PREMIUM_EMOJI_IDS: Dict[str, str] = {
     "🧪": "5411512278740640309",
     "🧫": "5280706833537865059",
     "📟": "5195361551283942795",
-    "🛰️": "5447213996820168272",
+    "🛰️": "5444979432710242887",
     "🤖": "5355051922862653659",
     "🧮": "5190741648237161191",
     "⏱️": "5258258882022612173",
@@ -1170,6 +1171,7 @@ PREMIUM_EMOJI_IDS: Dict[str, str] = {
     "❎": "5445283164207479914",
     "⭕": "5260416304224936047",
     "❌": "5260342697075416641",
+    "❗": "5220197908342648622",
     "⚠️": "5447381715293074599",
     "🔒": "5258458340303866282",
     "🔓": "5256212970056224341",
@@ -1680,6 +1682,10 @@ def _is_send_text_forbidden_error(exc: Exception) -> bool:
         or "have no rights to send a message" in s
         or "chat_write_forbidden" in s
     )
+
+def _is_chat_not_found_error(exc: Exception) -> bool:
+    s = str(exc or "").lower()
+    return "chat not found" in s
 
 def _is_transient_telegram_network_error(exc: Exception) -> bool:
     s = str(exc or "").lower()
@@ -2209,10 +2215,17 @@ def table_exists(name: str) -> bool:
         return False
 
 # демоны
+DB_CKPT_PASSIVE_EVERY_SEC = 60
+DB_CKPT_TRUNCATE_EVERY_SEC = 600
+DB_CKPT_NEXT_PASSIVE_TS = int(now_ts() + DB_CKPT_PASSIVE_EVERY_SEC)
+DB_CKPT_NEXT_TRUNCATE_TS = int(now_ts() + DB_CKPT_TRUNCATE_EVERY_SEC)
+
 def _checkpoint_daemon():
+    global DB_CKPT_NEXT_PASSIVE_TS, DB_CKPT_NEXT_TRUNCATE_TS
+
     tick = 0
     while True:
-        time.sleep(60)  # раз в минуту
+        time.sleep(DB_CKPT_PASSIVE_EVERY_SEC)
         tick += 1
 
         with DB_LOCK:
@@ -2221,11 +2234,14 @@ def _checkpoint_daemon():
             except Exception:
                 pass
 
-            if tick % 10 == 0:  # раз в 10 минут
+            DB_CKPT_NEXT_PASSIVE_TS = int(now_ts() + DB_CKPT_PASSIVE_EVERY_SEC)
+
+            if tick % 10 == 0:
                 try:
                     conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
                 except Exception:
                     pass
+                DB_CKPT_NEXT_TRUNCATE_TS = int(now_ts() + DB_CKPT_TRUNCATE_EVERY_SEC)
 
 threading.Thread(target=_checkpoint_daemon, daemon=True).start()
 
@@ -2484,6 +2500,7 @@ def _housekeeping_daemon():
             purge_deleted_db(now)
             _run_due_timers(now)
             run_chat_autodelete_once()
+            _run_db_file_msg_once(int(now))
 
         except Exception as e:
             send_error_report("_tz3_housekeeping_daemon", e)
@@ -2751,6 +2768,27 @@ def init_db():
     """, commit=True)
 
     db_exec("""
+    CREATE TABLE IF NOT EXISTS balance_chain_state (
+        user_id            INTEGER PRIMARY KEY,
+        chain_kind         TEXT NOT NULL DEFAULT '',
+        button_text        TEXT NOT NULL DEFAULT '',
+        payload_json       TEXT NOT NULL DEFAULT '',
+        source_chat_id     INTEGER NOT NULL DEFAULT 0,
+        source_message_id  INTEGER NOT NULL DEFAULT 0,
+        updated_at         INTEGER NOT NULL DEFAULT 0
+    );
+    """, commit=True)
+
+    db_exec("""
+    CREATE TABLE IF NOT EXISTS quick_infect_prefs (
+        user_id       INTEGER PRIMARY KEY,
+        mode          TEXT NOT NULL DEFAULT 'r',
+        chat_filter   TEXT NOT NULL DEFAULT 'n',
+        updated_at    INTEGER NOT NULL DEFAULT 0
+    );
+    """, commit=True)
+
+    db_exec("""
     CREATE TABLE IF NOT EXISTS user_timers (
         timer_id       INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id        INTEGER NOT NULL,
@@ -2762,6 +2800,15 @@ def init_db():
         cycle_total    INTEGER NOT NULL DEFAULT 0,
         cycle_left     INTEGER NOT NULL DEFAULT 0,
         command_text   TEXT NOT NULL DEFAULT ''
+    );
+    """, commit=True)
+
+    db_exec("""
+    CREATE TABLE IF NOT EXISTS db_file_msg_schedule (
+        user_id       INTEGER PRIMARY KEY,
+        repeat_spec   TEXT NOT NULL DEFAULT '',
+        next_run_ts   INTEGER NOT NULL DEFAULT 0,
+        updated_at    INTEGER NOT NULL DEFAULT 0
     );
     """, commit=True)
 
@@ -3382,6 +3429,113 @@ def kb_lab_delete_confirm(uid: int) -> InlineKeyboardMarkup:
     )
     return kb
 
+def _deleted_lab_restore_offer_mode(user_id: int) -> str:
+    row = get_deleted_lab_row(int(user_id))
+    if not row:
+        return ""
+
+    meta = _load_deleted_meta(row)
+    if int(meta.get("suppress_restore_offer", 0) or 0) == 1:
+        return ""
+
+    now = now_ts()
+    deleted_at = int(row["deleted_at"] or 0)
+    purge_at = int(row["purge_at"] or 0)
+    self_until = int(deleted_at + 3 * 86400)
+
+    if now <= self_until:
+        return "SELF"
+    if now <= purge_at:
+        return "SUPPORT"
+    return ""
+
+def _set_deleted_lab_restore_offer_suppressed(user_id: int, suppressed: bool = True):
+    row = get_deleted_lab_row(int(user_id))
+    if not row:
+        return
+
+    meta = _load_deleted_meta(row)
+    meta["suppress_restore_offer"] = 1 if suppressed else 0
+    meta["suppress_restore_offer_at"] = int(now_ts()) if suppressed else 0
+    _save_deleted_meta(int(user_id), meta)
+
+def build_inactive_lab_text(user_id: int, *, after_delete: bool = False) -> str:
+    base = build_lab_deleted_text() if after_delete else "📑 У вас нет активной Лаборатории."
+    mode = _deleted_lab_restore_offer_mode(int(user_id))
+
+    if mode == "SELF":
+        return (
+            f"{base}\n\n"
+            "Вы можете создать новую лабораторию или восстановить ранее удалённую."
+        )
+
+    if mode == "SUPPORT":
+        return (
+            f"{base}\n\n"
+            "Срок самовосстановления истёк.\n"
+            "Вы можете создать новую лабораторию или запросить восстановление через техподдержку."
+        )
+
+    return base
+
+def kb_inactive_lab_actions(uid: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=2)
+    mode = _deleted_lab_restore_offer_mode(int(uid))
+
+    if mode == "SELF":
+        kb.row(
+            _ikb("Создать лабу", callback_data=f"{CB_LAB_CREATE}:{int(uid)}", style="success"),
+            _ikb("Восстановить лабу", callback_data=f"{CB_LAB_RESTORE}:{int(uid)}", style="primary")
+        )
+        return kb
+
+    if mode == "SUPPORT":
+        kb.row(
+            _ikb("Создать лабу", callback_data=f"{CB_LAB_CREATE}:{int(uid)}", style="success"),
+            _ikb("Запросить восстановление", callback_data=f"{CB_LAB_RESTORE_REQ}:{int(uid)}", style="primary")
+        )
+        return kb
+
+    kb.add(_ikb("Создать лабу", callback_data=f"{CB_LAB_CREATE}:{int(uid)}", style="success"))
+    return kb
+
+def _lab_state_edit_current(cq, text: str, rm=None):
+    if getattr(cq, "inline_message_id", None):
+        limited_edit_message_text(
+            text=text,
+            inline_id=cq.inline_message_id,
+            parse_mode="HTML",
+            reply_markup=rm,
+            disable_web_page_preview=True
+        )
+    elif getattr(cq, "message", None):
+        limited_edit_message_text(
+            text=text,
+            chat_id=int(cq.message.chat.id),
+            msg_id=int(cq.message.message_id),
+            parse_mode="HTML",
+            reply_markup=rm,
+            disable_web_page_preview=True
+        )
+
+def _start_restore_report_flow_for_user(user_id: int) -> tuple[bool, str]:
+    uid = int(user_id)
+    report_clear_state(uid)
+    report_set_state(uid, "RESTORE", "await_content")
+    prompt = _report_prompt(uid, "RESTORE")
+
+    try:
+        bot.send_message(
+            uid,
+            prompt,
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
+        return True, "📑 Запрос переведён в личные сообщения бота."
+    except Exception:
+        report_clear_state(uid)
+        return False, "📑 Не удалось открыть личные сообщения. Сначала откройте личный чат с ботом."
+
 def _row_to_dict(row):
     return dict(row) if row else None
 
@@ -3475,6 +3629,8 @@ def _build_deleted_lab_snapshot(user_id: int) -> tuple[dict, dict]:
         "granted_bio_mater": int(grant_mater),
         "grant_applied": 0,
         "grant_applied_at": 0,
+        "suppress_restore_offer": 0,
+        "suppress_restore_offer_at": 0,
     }
     return snapshot, meta
 
@@ -4087,6 +4243,171 @@ def _parse_corp_transfer_args(message, parsed: "Parsed"):
     tok = (tail.split()[0] if tail else "")
     return amount, target_id, target_user_obj, tok
 
+def _corp_transfer_shortage_error(cmd: str) -> str:
+    if str(cmd or "").strip() == "corp_send_res":
+        return "📝 У вас нет столько био-ресурсов."
+    return "📝 У вас нет столько био-материалов."
+
+def _corp_transfer_mode_code(cmd: str) -> str:
+    return "R" if str(cmd or "").strip() == "corp_send_res" else "M"
+
+def _corp_transfer_cmd_from_mode(mode: str) -> str:
+    m = str(mode or "").strip().upper()
+    if m == "R":
+        return "corp_send_res"
+    if m == "M":
+        return "corp_send_mat"
+    return ""
+
+def _corp_transfer_plan(sender_id: int, cmd: str, amount: int) -> dict:
+    amount = max(1, int(amount or 0))
+    cmd = str(cmd or "").strip()
+
+    row = db_one(
+        "SELECT COALESCE(all_bio_res,0) AS ar, COALESCE(all_bio_mater,0) AS am "
+        "FROM labs WHERE user_id=?",
+        (int(sender_id),)
+    )
+    have_r = int(row["ar"] or 0) if row else 0
+    have_m = int(row["am"] or 0) if row else 0
+
+    plan = {
+        "ok": False,
+        "pure": False,
+        "mixed": False,
+        "substitute_only": False,
+        "cmd": cmd,
+        "amount": amount,
+        "have_r": have_r,
+        "have_m": have_m,
+        "res_amount": 0,
+        "mat_amount": 0,
+        "requested_currency": "res" if cmd == "corp_send_res" else "mat",
+        "actual_currency": "",
+    }
+
+    if cmd == "corp_send_res":
+        if have_r >= amount:
+            plan["ok"] = True
+            plan["pure"] = True
+            plan["res_amount"] = int(amount)
+            plan["actual_currency"] = "res"
+            return plan
+
+        if have_m >= amount and have_r <= 0:
+            plan["ok"] = True
+            plan["substitute_only"] = True
+            plan["mat_amount"] = int(amount)
+            plan["actual_currency"] = "mat"
+            return plan
+
+        if (have_r + have_m) >= amount:
+            plan["ok"] = True
+            plan["mixed"] = True
+            plan["res_amount"] = int(max(0, have_r))
+            plan["mat_amount"] = int(amount - plan["res_amount"])
+            plan["actual_currency"] = "mixed"
+            return plan
+
+        return plan
+
+    if cmd == "corp_send_mat":
+        if have_m >= amount:
+            plan["ok"] = True
+            plan["pure"] = True
+            plan["mat_amount"] = int(amount)
+            plan["actual_currency"] = "mat"
+            return plan
+
+        if have_r >= amount and have_m <= 0:
+            plan["ok"] = True
+            plan["substitute_only"] = True
+            plan["res_amount"] = int(amount)
+            plan["actual_currency"] = "res"
+            return plan
+
+        if (have_r + have_m) >= amount:
+            plan["ok"] = True
+            plan["mixed"] = True
+            plan["mat_amount"] = int(max(0, have_m))
+            plan["res_amount"] = int(amount - plan["mat_amount"])
+            plan["actual_currency"] = "mixed"
+            return plan
+
+        return plan
+
+    return plan
+
+def _corp_transfer_mix_text(cmd: str, target_id: int, res_amount: int, mat_amount: int) -> str:
+    shortage = _corp_transfer_shortage_error(cmd)
+    target_tag = _corp_actor_tag(int(target_id))
+
+    res_amount = int(res_amount or 0)
+    mat_amount = int(mat_amount or 0)
+
+    if res_amount <= 0 and mat_amount > 0:
+        return (
+            f"{shortage}\n"
+            f"Однако для перевода игроку {target_tag} можно полностью заменить сумму на био-материалы:\n"
+            f"💊 {_fmt_k(mat_amount)}\n"
+            "Подтвердить перевод?"
+        )
+
+    if mat_amount <= 0 and res_amount > 0:
+        return (
+            f"{shortage}\n"
+            f"Однако для перевода игроку {target_tag} можно полностью заменить сумму на био-ресурсы:\n"
+            f"🧬 {_fmt_k(res_amount)}\n"
+            "Подтвердить перевод?"
+        )
+
+    return (
+        f"{shortage}\n"
+        f"Однако для перевода игроку {target_tag} можно использовать смешанную сумму:\n"
+        f"🧬 {_fmt_k(res_amount)} + 💊 {_fmt_k(mat_amount)}\n"
+        "Подтвердить перевод?"
+    )
+
+def _corp_transfer_success_text(target_id: int, res_amount: int, mat_amount: int) -> str:
+    target_tag = _corp_actor_tag(int(target_id))
+    res_amount = int(res_amount or 0)
+    mat_amount = int(mat_amount or 0)
+
+    if res_amount > 0 and mat_amount > 0:
+        return (
+            f"✅Успех. Игроку {target_tag} передано "
+            f"🧬 {_fmt_k(res_amount)} + 💊 {_fmt_k(mat_amount)}."
+        )
+
+    if res_amount > 0:
+        word = _ru_form(int(res_amount), "био-ресурс", "био-ресурса", "био-ресурсов")
+        return f"✅Успех. Игроку {target_tag} передано 🧬 {_fmt_k(int(res_amount))} {word}."
+
+    word = _ru_form(int(mat_amount), "био-материал", "био-материала", "био-материалов")
+    return f"✅Успех. Игроку {target_tag} передано 💊 {_fmt_k(int(mat_amount))} {word}."
+
+def _corp_transfer_mix_cb(action: str, uid: int, cmd: str, target_id: int, res_amount: int, mat_amount: int) -> str:
+    return (
+        f"{CB_CORP_TX}:{str(action or '').strip().upper()}:{int(uid)}:"
+        f"{_corp_transfer_mode_code(cmd)}:{int(target_id)}:{int(res_amount)}:{int(mat_amount)}"
+    )
+
+def kb_corp_transfer_mix_offer(uid: int, cmd: str, target_id: int, res_amount: int, mat_amount: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.row(
+        InlineKeyboardButton(
+            "Согласиться",
+            callback_data=_corp_transfer_mix_cb("A", int(uid), cmd, int(target_id), int(res_amount), int(mat_amount)),
+            style="success"
+        ),
+        InlineKeyboardButton(
+            "Прервать перевод",
+            callback_data=_corp_transfer_mix_cb("C", int(uid), cmd, int(target_id), int(res_amount), int(mat_amount)),
+            style="danger"
+        )
+    )
+    return kb
+
 def _corp_transfer_apply(sender_id: int, target_id: int, *, res_amount: int = 0, mat_amount: int = 0) -> tuple[bool, str]:
     res_amount = int(res_amount or 0)
     mat_amount = int(mat_amount or 0)
@@ -4113,8 +4434,10 @@ def _corp_transfer_apply(sender_id: int, target_id: int, *, res_amount: int = 0,
     t_ar = int(t["ar"] or 0)
     t_am = int(t["am"] or 0)
 
-    if s_ar < res_amount or s_am < mat_amount:
-        return False, "📝 У вас нет столько био-ресурсов или био-материалов."
+    if s_ar < res_amount:
+        return False, "📝 У вас нет столько био-ресурсов."
+    if s_am < mat_amount:
+        return False, "📝 У вас нет столько био-материалов."
 
     new_s_ar = s_ar - res_amount
     new_s_am = s_am - mat_amount
@@ -4182,16 +4505,33 @@ def _extract_single_corp_name_from_text(text: str) -> str:
 def resolve_corp_for_join(message, parsed: "Parsed"):
     name = (parsed.args or "").strip()
     if name:
-        return corp_by_name(name)
+        corp = corp_by_name(name)
+        if corp:
+            return corp
 
-    if message.reply_to_message and getattr(message.reply_to_message, "from_user", None):
-        ru = message.reply_to_message.from_user
-        if not bool(getattr(ru, "is_bot", False)):
-            rcid, _ = get_user_corp(int(ru.id))
+        target_id, target_user_obj = resolve_target_from_reply_or_args(message, parsed)
+        if target_id is not None:
+            if target_user_obj is not None:
+                capture_user_context(message, target_user_obj)
+
+            rcid, _ = get_user_corp_resolved(int(target_id))
             if rcid > 0:
                 corp = corp_by_id(int(rcid))
                 if corp:
                     return corp
+
+        return None
+
+    target_id, target_user_obj = resolve_target_from_reply_or_args(message, parsed)
+    if target_id is not None:
+        if target_user_obj is not None:
+            capture_user_context(message, target_user_obj)
+
+        rcid, _ = get_user_corp_resolved(int(target_id))
+        if rcid > 0:
+            corp = corp_by_id(int(rcid))
+            if corp:
+                return corp
 
     if message.reply_to_message:
         txt = (getattr(message.reply_to_message, "text", "") or getattr(message.reply_to_message, "caption", "") or "")
@@ -4718,10 +5058,25 @@ def kb_corp_info(corp_id: int, viewer_id: int, is_member: bool) -> InlineKeyboar
         role = corp_role(int(corp_id), int(viewer_id))
         corp = corp_by_id(int(corp_id))
         if corp and role in ("owner", "deputy"):
-            if corp_is_open_value(corp) == 1:
-                kb.add(InlineKeyboardButton("Закрыть корпу", callback_data=f"{CORPUI_TAG}:C:{int(corp_id)}:{int(viewer_id)}"))
+            req_row = db_one(
+                "SELECT COUNT(*) AS c FROM corp_requests WHERE corp_id=? AND status='pending'",
+                (int(corp_id),)
+            )
+            req_count = int(req_row["c"] or 0) if req_row else 0
+
+            type_btn = (
+                InlineKeyboardButton("Закрыть корпу", callback_data=f"{CORPUI_TAG}:C:{int(corp_id)}:{int(viewer_id)}", style="danger")
+                if corp_is_open_value(corp) == 1 else
+                InlineKeyboardButton("Открыть корпу", callback_data=f"{CORPUI_TAG}:O:{int(corp_id)}:{int(viewer_id)}", style="success")
+            )
+
+            if req_count > 0:
+                kb.row(
+                    InlineKeyboardButton("Заявки", callback_data=f"{CORPUI_TAG}:R:{int(corp_id)}:{int(viewer_id)}", style="primary"),
+                    type_btn
+                )
             else:
-                kb.add(InlineKeyboardButton("Открыть корпу", callback_data=f"{CORPUI_TAG}:O:{int(corp_id)}:{int(viewer_id)}"))
+                kb.add(type_btn)
     else:
         kb.add(InlineKeyboardButton("Вступить", callback_data=f"{CB_CORP_JOIN}:{int(corp_id)}:{int(viewer_id)}", style="primary"))
 
@@ -5386,21 +5741,32 @@ def resolve_rp_target(message, actor_id: int, args_text: str):
         if is_channel_sender_message(message.reply_to_message):
             return None, None
 
+        u = getattr(message.reply_to_message, "from_user", None)
+        if (
+            u
+            and not bool(getattr(u, "is_bot", False))
+            and int(getattr(u, "id", 0) or 0) != int(actor_id)
+        ):
+            capture_user_context(message, u)
+            return int(u.id), u
+
         tid = _pick_reply_target_id(message, exclude_user_ids={int(actor_id)})
         if tid is not None:
             return int(tid), None
 
-        if getattr(message.reply_to_message, "from_user", None):
-            u = message.reply_to_message.from_user
-            if not bool(getattr(u, "is_bot", False)) and int(getattr(u, "id", 0) or 0) != int(actor_id):
-                capture_user_context(message, u)
-                return int(u.id), u
+        if (
+            u
+            and not bool(getattr(u, "is_bot", False))
+            and int(getattr(u, "id", 0) or 0) == int(actor_id)
+        ):
+            capture_user_context(message, u)
+            return int(u.id), u
 
-    token = (args_text or "").strip().split()[0] if (args_text or "").strip() else ""
-    if not token:
+    full = (args_text or "").strip()
+    if not full:
         return None, None
 
-    tid = _resolve_or_create_infect_target(token)
+    tid = _resolve_single_target_from_text(full, _resolve_or_create_infect_target)
     if tid is not None:
         return int(tid), None
 
@@ -6236,14 +6602,8 @@ def build_agents_panel_text(user_id: int) -> str:
 
     lines.append("")
     lines.append("💬 Следующие доступные Вам команды:")
-    if uid == int(CREATOR_ID):
-        lines.append("/owner — назначить агента")
-        lines.append("/owner_remove — снять права с агента")
-        lines.append("/users — список всех пользователей")
-        lines.append("/edit_k — изменить k")
-        lines.append("/edit_b — изменить β")
-        lines.append("/cof_inf_stats — информация по переменным заражения")
-        lines.append("")
+    lines.append("<blockquote expandable>")
+    lines.append("📒 Раздел агента")
     lines.append("/bot_ban + {причина с новой строки} — заблокировать пользователя")
     lines.append("/bot_unban — разблокировать пользователя")
     lines.append("/remake_lab — восстановить лабораторию")
@@ -6252,13 +6612,30 @@ def build_agents_panel_text(user_id: int) -> str:
     lines.append("<code>/+user_name</code> | <code>/-user_name</code> + {причина с новой строки} — разрешает/запрещает смену имени для пользователя")
     lines.append("<code>/+corp_name</code> | <code>/-corp_name</code> + {причина с новой строки} — разрешает/запрещает имена корпорации для пользователя")
     lines.append("/blacklist — список пользователей с ограничениями")
-    lines.append("")
+    if uid == int(CREATOR_ID):
+        lines.append("")
+        lines.append("📒 Раздел владельца / Редактирования бота")
+        lines.append("/owner — назначить агента")
+        lines.append("/owner_remove — снять права с агента")
+        lines.append("/users — список всех пользователей")
+        lines.append("/its + {ссылка} + {<code>бот</code>|<code>юзер</code>} — ручное редактирование списка")
+        lines.append("/edit_k — изменить k")
+        lines.append("/edit_b — изменить β")
+        lines.append("/cof_inf_stats — информация по переменным заражения")
+        lines.append("")
+        lines.append("💾 Data Base")
+        lines.append("/db_fife_stat — параметры базы данных")
+        lines.append("/db_fife_msg + {период} — автосэйв таймер")
+        lines.append("/db_fife — файл базы данных")
+        lines.append("/db_fife_upd — обновить базу данных")
+        lines.append("")
     if uid == int(CREATOR_ID):
         lines.append("🎁 Раздел промокоды:")
         lines.append("/promocode_generate — генерация случайного временного промокода")
         lines.append("/promocode_create — создание промокода")
         lines.append("/promocode_all — список всех промокодов")
         lines.append("/promocode_delete — удалить промокод")
+    lines.append("</blockquote>")
 
     return "\n".join(lines)
 
@@ -6300,19 +6677,33 @@ def _resolve_admin_target_and_reason(message, parsed: "Parsed"):
 
     reason = _timer_parse_reason_from_message(message.text or "")
 
-    if message.reply_to_message and getattr(message.reply_to_message, "from_user", None):
-        u = message.reply_to_message.from_user
-        return int(u.id), u, reason
+    if message.reply_to_message:
+        actor_id = int(getattr(getattr(message, "from_user", None), "id", 0) or 0)
+        u = getattr(message.reply_to_message, "from_user", None)
 
-    parts = fl.split()
+        if (
+            u
+            and not bool(getattr(u, "is_bot", False))
+            and int(getattr(u, "id", 0) or 0) != actor_id
+        ):
+            return int(u.id), u, reason
+
+        tid = _pick_reply_target_id(message, exclude_user_ids=None)
+        if tid is not None:
+            return int(tid), None, reason
+
+        if u and not bool(getattr(u, "is_bot", False)):
+            return int(u.id), u, reason
+
+    parts = fl.split(None, 1)
     if len(parts) < 2:
         return None, None, reason
 
-    token = parts[1].strip()
-    target_id = resolve_target_id(token)
+    target_expr = parts[1].strip()
+    target_id = resolve_target_id(target_expr)
 
     if target_id is None:
-        s = token.strip()
+        s = target_expr.strip()
 
         if parsed.cmd == "bot_unban":
             if s.isdigit():
@@ -6474,6 +6865,263 @@ def handle_admin_service_commands(message, parsed: "Parsed"):
             disable_web_page_preview=True
         )
         return
+
+def _fmt_file_size(num: int) -> str:
+    n = int(num or 0)
+    units = ["B", "KB", "MB", "GB", "TB"]
+    i = 0
+    x = float(n)
+    while x >= 1024.0 and i < len(units) - 1:
+        x /= 1024.0
+        i += 1
+    s = f"{x:.2f}".rstrip("0").rstrip(".")
+    return f"{s} {units[i]}"
+
+def _path_size(path: str) -> int:
+    try:
+        return int(os.path.getsize(path))
+    except Exception:
+        return 0
+
+def _db_limit_bytes_for_path(path: str) -> int:
+    c = None
+    try:
+        c = sqlite3.connect(path, check_same_thread=False)
+        row1 = c.execute("PRAGMA page_size;").fetchone()
+        row2 = c.execute("PRAGMA wal_autocheckpoint;").fetchone()
+        page_size = int(row1[0] or 0) if row1 else 0
+        wal_pages = int(row2[0] or 0) if row2 else 0
+        return int(page_size * wal_pages)
+    except Exception:
+        return 0
+    finally:
+        try:
+            if c is not None:
+                c.close()
+        except Exception:
+            pass
+
+def _db_schedule_row(user_id: int):
+    return db_one(
+        "SELECT user_id, repeat_spec, next_run_ts, updated_at "
+        "FROM db_file_msg_schedule WHERE user_id=? LIMIT 1",
+        (int(user_id),)
+    )
+
+def _db_schedule_set(user_id: int, spec: dict):
+    next_run_ts = int(_timer_apply_period(datetime.fromtimestamp(now_ts()), spec).timestamp())
+    db_exec(
+        "INSERT INTO db_file_msg_schedule(user_id, repeat_spec, next_run_ts, updated_at) VALUES (?,?,?,?) "
+        "ON CONFLICT(user_id) DO UPDATE SET repeat_spec=excluded.repeat_spec, next_run_ts=excluded.next_run_ts, updated_at=excluded.updated_at",
+        (int(user_id), json.dumps(spec or {}, ensure_ascii=False), int(next_run_ts), int(now_ts())),
+        commit=True
+    )
+
+def _db_schedule_reschedule(user_id: int, spec: dict, base_ts: int):
+    dt = datetime.fromtimestamp(int(base_ts))
+    nxt = _timer_apply_period(dt, spec)
+    nowv = int(now_ts())
+    while int(nxt.timestamp()) <= nowv:
+        nxt = _timer_apply_period(nxt, spec)
+
+    db_exec(
+        "UPDATE db_file_msg_schedule SET next_run_ts=?, updated_at=? WHERE user_id=?",
+        (int(nxt.timestamp()), int(nowv), int(user_id)),
+        commit=True
+    )
+
+def _db_snapshot_copy(src_path: str, prefix: str) -> str:
+    if not os.path.exists(src_path):
+        return ""
+
+    tmp_path = os.path.join(DATA_DIR, f"{prefix}_{int(now_ts())}.db")
+    try:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+    except Exception:
+        pass
+
+    ok = _sqlite_backup_file(src_path, tmp_path)
+    return tmp_path if ok and os.path.exists(tmp_path) else ""
+
+def _send_db_files_to_chat(chat_id: int) -> tuple[bool, str]:
+    main_copy = ""
+    deleted_copy = ""
+
+    try:
+        with DB_LOCK:
+            try:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+            except Exception:
+                pass
+
+        main_copy = _db_snapshot_copy(DB_PATH, "bio_war_snapshot")
+        deleted_copy = _db_snapshot_copy(DELETED_DB_PATH, "deleted_labs_snapshot")
+
+        if not main_copy and not deleted_copy:
+            return False, "📑 Не удалось подготовить файлы баз данных."
+
+        if main_copy:
+            with open(main_copy, "rb") as f:
+                bio = io.BytesIO(f.read())
+                bio.name = "bio_war.db"
+                bot.send_document(int(chat_id), bio, caption="Основная база данных")
+
+        if deleted_copy:
+            with open(deleted_copy, "rb") as f:
+                bio = io.BytesIO(f.read())
+                bio.name = "deleted_labs.db"
+                bot.send_document(int(chat_id), bio, caption="База удалённых лабораторий")
+
+        return True, "✅ Файлы баз данных отправлены."
+    finally:
+        for p in (main_copy, deleted_copy):
+            try:
+                if p and os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
+
+def render_db_file_stat_text(owner_id: int) -> str:
+    nowv = int(now_ts())
+
+    main_db = _path_size(DB_PATH)
+    main_wal = _path_size(DB_PATH + "-wal")
+    main_shm = _path_size(DB_PATH + "-shm")
+    main_lim = _db_limit_bytes_for_path(DB_PATH)
+
+    del_db = _path_size(DELETED_DB_PATH)
+
+    sch = _db_schedule_row(int(owner_id))
+    next_send_ts = int(sch["next_run_ts"] or 0) if sch else 0
+
+    passive_left = max(0, int(DB_CKPT_NEXT_PASSIVE_TS or 0) - nowv)
+    truncate_left = max(0, int(DB_CKPT_NEXT_TRUNCATE_TS or 0) - nowv)
+    send_left = max(0, next_send_ts - nowv) if next_send_ts > 0 else 0
+
+    lines = []
+    lines.append("🧾 Статистика файлов баз данных")
+    lines.append("<blockquote expandable>")
+    lines.append(f"🗃️ bio_war.db: {_fmt_file_size(main_db)}")
+    lines.append(f"🧱 bio_war.db-wal: {_fmt_file_size(main_wal)} / лимит {_fmt_file_size(main_lim)}")
+    lines.append(f"📦 bio_war.db-shm: {_fmt_file_size(main_shm)}")
+    lines.append(f"🗃️ deleted_labs.db: {_fmt_file_size(del_db)}")
+    lines.append("</blockquote>")
+    lines.append(f"⏱️ До следующего PASSIVE-чекпоинта: {_format_hms(passive_left)}")
+    lines.append(f"⏱️ До следующего TRUNCATE-чекпоинта: {_format_hms(truncate_left)}")
+
+    if next_send_ts > 0:
+        lines.append("")
+        lines.append(f"⏱️ До следующего автосэйва: {_format_hms(send_left)}")
+
+    return "\n".join(lines)
+
+def _run_db_file_msg_once(now_value: int):
+    rows = db_all(
+        "SELECT user_id, repeat_spec, next_run_ts, updated_at "
+        "FROM db_file_msg_schedule WHERE next_run_ts>0 AND next_run_ts<=?",
+        (int(now_value),)
+    ) or []
+
+    for row in rows:
+        uid = int(row["user_id"])
+        spec = {}
+        try:
+            spec = json.loads((row["repeat_spec"] or "") or "{}")
+        except Exception:
+            spec = {}
+
+        try:
+            _send_db_files_to_chat(int(uid))
+        except Exception as e:
+            send_error_report("_run_db_file_msg_once", e)
+
+        if spec:
+            _db_schedule_reschedule(int(uid), spec, int(row["next_run_ts"] or now_value))
+
+def _parse_its_args(args: str) -> tuple[Optional[int], str]:
+    s = (args or "").strip()
+    if not s:
+        return None, ""
+
+    parts = s.split()
+    if len(parts) < 2:
+        return None, ""
+
+    token = parts[0].strip()
+    mode = parts[1].strip().lower()
+
+    tid = _resolve_or_create_infect_target(token)
+    if tid is None:
+        return None, ""
+
+    if mode in ("бот", "bot"):
+        return int(tid), "bot"
+    if mode in ("юзер", "юзер.", "user", "пользователь"):
+        return int(tid), "user"
+
+    return int(tid), ""
+
+def handle_owner_db_commands(message, parsed: "Parsed"):
+    uid = int(message.from_user.id)
+    upsert_user(message.from_user)
+
+    if message.chat.type != "private":
+        bot.reply_to(message, "📑 Эта команда работает только в личных сообщениях бота.")
+        return
+
+    if not can_manage_support(uid):
+        bot.reply_to(message, "📑 Эта команда доступна только владельцу бота.")
+        return
+
+    if parsed.cmd == "db_fife":
+        ok, msg = _send_db_files_to_chat(int(message.chat.id))
+        bot.reply_to(message, msg)
+        return
+
+    if parsed.cmd == "db_fife_stat":
+        bot.reply_to(
+            message,
+            render_db_file_stat_text(int(uid)),
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
+        return
+
+    if parsed.cmd == "db_fife_msg":
+        spec, err = _timer_parse_period_spec((parsed.args or "").strip())
+        if not spec:
+            bot.reply_to(message, err)
+            return
+
+        _db_schedule_set(int(uid), spec)
+        bot.reply_to(
+            message,
+            f"✅ Автосэйв включен.\n⌛ {_timer_spec_to_text(spec)}",
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
+        return
+
+    target_id, mode = _parse_its_args(parsed.args or "")
+    if target_id is None or not mode:
+        bot.reply_to(message, "📑 Используйте формат: /its [ссылка/uid/@username] [<code>бот</code>|<code>юзер</code>]", parse_mode="HTML")
+        return
+
+    db_exec(
+        "INSERT INTO users(user_id, username, first_name, last_name, last_seen, is_placeholder, is_bot) "
+        "VALUES (?,?,?,?,?,?,?) "
+        "ON CONFLICT(user_id) DO UPDATE SET is_bot=excluded.is_bot",
+        (int(target_id), None, None, None, int(now_ts()), 0, 1 if mode == "bot" else 0),
+        commit=True
+    )
+
+    bot.reply_to(
+        message,
+        f"✅ Статус пользователя <code>{int(target_id)}</code> принудительно установлен как "
+        f"<b>{'бот' if mode == 'bot' else 'юзер'}</b>.",
+        parse_mode="HTML"
+    )
 
 def get_lab(user_id: int) -> sqlite3.Row:
     ensure_lab_exists(user_id)
@@ -6889,6 +7537,7 @@ def report_get_state(user_id: int) -> tuple[str, str]:
 def report_clear_state(user_id: int):
     db_exec("DELETE FROM report_state WHERE user_id=?", (int(user_id),), commit=True)
 
+# report
 def _report_cb(uid: int, act: str) -> str:
     return f"{REPORTUI_TAG}:{int(uid)}:{str(act).upper()}"
 
@@ -7087,6 +7736,106 @@ def handle_report_command(message):
         reply_markup=kb_report_menu(uid, appeal_only=appeal_only)
     )
 
+# balans chains
+def _balance_chain_row(user_id: int):
+    return db_one(
+        "SELECT user_id, chain_kind, button_text, payload_json, source_chat_id, source_message_id, updated_at "
+        "FROM balance_chain_state WHERE user_id=? LIMIT 1",
+        (int(user_id),)
+    )
+
+def get_balance_chain_state(user_id: int) -> Optional[dict]:
+    row = _balance_chain_row(int(user_id))
+    if not row:
+        return None
+
+    try:
+        payload = json.loads((row["payload_json"] or "") or "{}")
+        if not isinstance(payload, dict):
+            payload = {}
+    except Exception:
+        payload = {}
+
+    return {
+        "user_id": int(row["user_id"]),
+        "chain_kind": str(row["chain_kind"] or "").strip(),
+        "button_text": str(row["button_text"] or "").strip(),
+        "payload": payload,
+        "source_chat_id": int(row["source_chat_id"] or 0),
+        "source_message_id": int(row["source_message_id"] or 0),
+        "updated_at": int(row["updated_at"] or 0),
+    }
+
+def clear_balance_chain_state(user_id: int):
+    db_exec(
+        "DELETE FROM balance_chain_state WHERE user_id=?",
+        (int(user_id),),
+        commit=True
+    )
+
+def set_balance_chain_state(
+    user_id: int,
+    chain_kind: str,
+    button_text: str,
+    payload: Optional[dict] = None,
+    *,
+    source_chat_id: int = 0,
+    source_message_id: int = 0
+):
+    data = payload if isinstance(payload, dict) else {}
+    db_exec(
+        "INSERT INTO balance_chain_state("
+        "user_id, chain_kind, button_text, payload_json, source_chat_id, source_message_id, updated_at"
+        ") VALUES (?,?,?,?,?,?,?) "
+        "ON CONFLICT(user_id) DO UPDATE SET "
+        "chain_kind=excluded.chain_kind, "
+        "button_text=excluded.button_text, "
+        "payload_json=excluded.payload_json, "
+        "source_chat_id=excluded.source_chat_id, "
+        "source_message_id=excluded.source_message_id, "
+        "updated_at=excluded.updated_at",
+        (
+            int(user_id),
+            str(chain_kind or "").strip(),
+            str(button_text or "").strip(),
+            json.dumps(data, ensure_ascii=False),
+            int(source_chat_id or 0),
+            int(source_message_id or 0),
+            int(now_ts()),
+        ),
+        commit=True
+    )
+
+def set_balance_chain_state_from_message(
+    message,
+    chain_kind: str,
+    button_text: str,
+    payload: Optional[dict] = None
+):
+    uid = int(getattr(getattr(message, "from_user", None), "id", 0) or 0)
+    if uid <= 0:
+        return
+
+    set_balance_chain_state(
+        int(uid),
+        str(chain_kind or "").strip(),
+        str(button_text or "").strip(),
+        payload if isinstance(payload, dict) else {},
+        source_chat_id=int(getattr(getattr(message, "chat", None), "id", 0) or 0),
+        source_message_id=int(getattr(message, "message_id", 0) or 0),
+    )
+
+def get_balance_chain_button_text(user_id: int) -> str:
+    state = get_balance_chain_state(int(user_id))
+    if not state:
+        return ""
+    return str(state.get("button_text") or "").strip()
+
+def has_balance_chain_state(user_id: int) -> bool:
+    state = get_balance_chain_state(int(user_id))
+    return bool(state and str(state.get("chain_kind") or "").strip())
+
+# chat member
 def remember_chat_member(chat_id: int, tg_user):
     upsert_user(tg_user)
 
@@ -7343,29 +8092,6 @@ def _pick_reply_target_id(message, *, exclude_user_ids=None) -> Optional[int]:
         return int(ids[0])
     return int(random.choice(ids))
 
-def _reply_message_text_and_entities(rm):
-    raw = (getattr(rm, "text", None) or getattr(rm, "caption", None) or "")
-    ents = []
-    try:
-        ents.extend(list(getattr(rm, "entities", None) or []))
-    except Exception:
-        pass
-    try:
-        ents.extend(list(getattr(rm, "caption_entities", None) or []))
-    except Exception:
-        pass
-    return raw, ents
-
-def _entity_slice_text(raw: str, ent) -> str:
-    try:
-        off = int(getattr(ent, "offset", 0) or 0)
-        ln = int(getattr(ent, "length", 0) or 0)
-        if ln <= 0:
-            return ""
-        return str(raw or "")[off:off + ln]
-    except Exception:
-        return ""
-
 def _resolve_target_from_reply_message_content(message, *, exclude_user_id: int = 0) -> Optional[int]:
     rm = getattr(message, "reply_to_message", None)
     if not rm:
@@ -7412,21 +8138,37 @@ def resolve_target_from_reply_or_args(message, parsed: Optional["Parsed"]):
     Возвращает (target_id, target_user_obj_or_None).
 
     При reply:
-      1) если в replied-сообщении есть ссылки/упоминания пользователей —
+      1) если reply на не-бота и команду использует НЕ автор replied-сообщения —
+         всегда берём автора replied-сообщения;
+      2) иначе, если в replied-сообщении есть ссылки/упоминания пользователей —
          берём цель из них, исключая самого вызывающего команду;
          если после исключения остаётся несколько целей — берём случайную.
-      2) если целей в тексте нет — fallback на автора replied-сообщения.
+      3) если целей в тексте нет — fallback на автора replied-сообщения,
+         но только если это не бот и не сам вызывающий.
     При args — поддерживает один целевой uid, @username или ссылку даже внутри текста args.
     """
     actor_id = int(getattr(getattr(message, "from_user", None), "id", 0) or 0)
 
     if message.reply_to_message:
+        u = getattr(message.reply_to_message, "from_user", None)
+
+        if (
+            u
+            and not bool(getattr(u, "is_bot", False))
+            and int(getattr(u, "id", 0) or 0) != actor_id
+        ):
+            capture_user_context(message, u)
+            return int(u.id), u
+
         tid = _pick_reply_target_id(message, exclude_user_ids={actor_id})
         if tid is not None:
             return int(tid), None
 
-        u = getattr(message.reply_to_message, "from_user", None)
-        if u and int(getattr(u, "id", 0) or 0) != actor_id:
+        if (
+            u
+            and not bool(getattr(u, "is_bot", False))
+            and int(getattr(u, "id", 0) or 0) == actor_id
+        ):
             capture_user_context(message, u)
             return int(u.id), u
 
@@ -7583,6 +8325,9 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
     first_line_raw, _, _body_raw = raw_multiline.partition("\n")
     first_line = first_line_raw.strip()
 
+    if normalize(first_line_raw).lower() == "!-игра вирусы":
+        return Parsed(raw=raw_multiline, has_prefix_char=False, prefix_char=None, cmd="lab_delete_now", args="")
+
     if first_line.startswith("/") or first_line.startswith("."):
         pch = first_line[0]
         body = first_line[1:].strip()
@@ -7601,7 +8346,9 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
         c = parts[0].lower()
         a = parts[1].strip() if len(parts) > 1 else ""
 
-        if c in ("owner", "агент", "owner_remove", "agents", "blacklist", "users", "bot_ban", "bot_unban", "remake_lab"):
+        if c in ("owner", "агент", "owner_remove", "agents", 
+                 "blacklist", "users", "bot_ban", "bot_unban", "remake_lab", 
+                 "db_fife", "db_fife_stat", "db_fife_msg", "its"):
             cmd_map = {
                 "owner": "owner",
                 "агент": "owner",
@@ -7612,6 +8359,10 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
                 "bot_ban": "bot_ban",
                 "bot_unban": "bot_unban",
                 "remake_lab": "remake_lab",
+                "db_fife": "db_fife",
+                "db_fife_stat": "db_fife_stat",
+                "db_fife_msg": "db_fife_msg",
+                "its": "its",
             }
             return Parsed(raw=raw_multiline, has_prefix_char=True, prefix_char=pch, cmd=cmd_map[c], args=a)
 
@@ -7639,7 +8390,8 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
         a = parts[1].strip() if len(parts) > 1 else ""
         if c in ("owner", "агент"):
             return Parsed(raw=raw, has_prefix_char=True, prefix_char=prefix_char, cmd="owner", args=a)
-        if c in ("bot_ban", "bot_unban", "remake_lab"):
+        if c in ("bot_ban", "bot_unban", "remake_lab",
+                 "db_fife", "db_fife_stat", "db_fife_msg", "its"):
             return Parsed(raw=raw, has_prefix_char=True, prefix_char=prefix_char, cmd=c, args=a)
         return None
 
@@ -7787,8 +8539,18 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
     if low in ("рпстат", "рпстата", "рп стата", "рп стат"):
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="rp_stats", args="")
 
-    if low in ("патогены", "паты", "заряды", "патроны"):
-        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="pathogens_info", args="")
+    if (
+        low in ("патогены", "паты", "заряды", "патроны")
+        or low.startswith("патогены ")
+        or low.startswith("паты ")
+        or low.startswith("заряды ")
+        or low.startswith("патроны ")
+    ):
+        rest = ""
+        parts = t.split(" ", 1)
+        if len(parts) > 1:
+            rest = parts[1].strip()
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="pathogens_info", args=rest)
 
     if low in ("патоген инфо", "пат инфо", "пи"):
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="pathogen_info", args="")
@@ -8883,17 +9645,9 @@ def handle_admin_name_restriction_command(message, parsed: Parsed):
     if fl.startswith("/") or fl.startswith("."):
         fl = fl[1:].strip()
 
-    parts = fl.split()
-    if len(parts) < 2:
-        return
-
-    token = parts[1].strip()
-    target_id = resolve_target_id(token)
-
+    target_id, _target_user_obj, reason = _resolve_admin_target_and_reason(message, parsed)
     if target_id is None:
         return
-
-    reason = _timer_parse_reason_from_message(message.text or "")
 
     if parsed.cmd == "name_lock_user":
         locked = 1 if fl.startswith("-") or fl.lower().startswith("-user_name") else 0
@@ -10365,7 +11119,13 @@ def _make_fake_timer_message(user_id: int, chat_id: int, text: str):
 
     u = get_user_row(int(user_id))
 
-    placeholder = _REAL_BOT_SEND_MESSAGE(int(chat_id), "⏳")
+    placeholder = None
+    try:
+        placeholder = _REAL_BOT_SEND_MESSAGE(int(chat_id), "⏳")
+    except Exception as e:
+        if _is_chat_not_found_error(e):
+            return None, None
+        raise
 
     fu = _FakeUser()
     fu.id = int(user_id)
@@ -10382,7 +11142,7 @@ def _make_fake_timer_message(user_id: int, chat_id: int, text: str):
     fm.from_user = fu
     fm.chat = fc
     fm.text = str(text or "")
-    fm.message_id = int(placeholder.message_id)
+    fm.message_id = int(placeholder.message_id) if placeholder is not None else 0
     fm.reply_to_message = None
     fm.via_bot = None
     fm.content_type = "text"
@@ -10397,7 +11157,12 @@ def _execute_timer_command_text(user_id: int, chat_id: int, command_text: str):
 
     parsed = parse_message_as_command(cmd_text)
     if not parsed:
-        _REAL_BOT_SEND_MESSAGE(int(chat_id), "📑 Таймер сработал, но текст команды не распознан.")
+        try:
+            _REAL_BOT_SEND_MESSAGE(int(chat_id), "📑 Таймер сработал, но текст команды не распознан.")
+        except Exception as e:
+            if _is_chat_not_found_error(e):
+                raise RuntimeError("__TIMER_DEAD_CHAT__")
+            raise
         return
 
     if parsed.cmd in (
@@ -10408,13 +11173,20 @@ def _execute_timer_command_text(user_id: int, chat_id: int, command_text: str):
         "report", "settings", "blacklist",
         "name_lock_lab", "name_lock_pat"
     ):
-        _REAL_BOT_SEND_MESSAGE(int(chat_id), "📑 Эта команда не может быть выполнена таймером.")
+        try:
+            _REAL_BOT_SEND_MESSAGE(int(chat_id), "📑 Эта команда не может быть выполнена таймером.")
+        except Exception as e:
+            if _is_chat_not_found_error(e):
+                raise RuntimeError("__TIMER_DEAD_CHAT__")
+            raise
         return
 
     fake_msg = None
     placeholder = None
     try:
         fake_msg, placeholder = _make_fake_timer_message(int(user_id), int(chat_id), cmd_text)
+        if fake_msg is None:
+            raise RuntimeError("__TIMER_DEAD_CHAT__")
         text_router(fake_msg)
     finally:
         if placeholder is not None:
@@ -10467,6 +11239,9 @@ def _run_due_timers(now_value: int):
         try:
             _execute_timer_command_text(user_id, chat_id, row["command_text"] or "")
         except Exception as e:
+            if "__TIMER_DEAD_CHAT__" in str(e):
+                db_exec("DELETE FROM user_timers WHERE timer_id=?", (timer_id,), commit=True)
+                continue
             if _is_transient_telegram_network_error(e):
                 transient_failed = True
             else:
@@ -10589,6 +11364,9 @@ CB_USE_VACCINE = "vac:use"
 CB_USE_VACCINE_X = "vac:usex"
 CB_LAB_DELETE_OK = "labdel:ok"
 CB_LAB_DELETE_CANCEL = "labdel:cancel"
+CB_LAB_CREATE = "lab:create"
+CB_LAB_RESTORE = "lab:restore"
+CB_LAB_RESTORE_REQ = "lab:restore:req"
 LAB_DELETE_PHRASE = "Да, я полностью уверен"
 CB_AO_MENU = "ao:menu"
 CB_AO_TOGGLE = "ao:toggle"
@@ -10597,6 +11375,7 @@ CB_CORP_REQ_APPROVE = "corp:req:ok"
 CB_CORP_REQ_REJECT = "corp:req:no"
 CB_CORP_INV_ACCEPT = "corp:inv:ok"
 CB_CORP_INV_REJECT = "corp:inv:no"
+CB_CORP_TX = "corpmix"
 CB_RP_ACCEPT = "rp:ok"
 CB_RP_DECLINE = "rp:no"
 #            callback_data
@@ -10615,6 +11394,13 @@ EMPACKUI_TAG = "EP"
 RPUI_TAG = "RP"
 PROMOUI_TAG = "PR"
 PROMO_PAGE_SIZE = 15
+#           balance-chain kinds
+BALCHAIN_INFECT = "infect"
+BALCHAIN_UPGRADE = "upgrade"
+BALCHAIN_CORP_TRANSFER = "corp_transfer"
+BALCHAIN_VACCINE = "vaccine"
+BALCHAIN_DUEL_STAKE = "duel_stake"
+BALCHAIN_DUEL_BET = "duel_bet"
 
 # хендлеры и хэлперы
 #           report
@@ -11375,16 +12161,29 @@ def _parse_infect_request(message, parsed: "Parsed", attacker_id: int) -> dict:
     if message.reply_to_message and is_channel_sender_message(message.reply_to_message):
         return {"kind": "NONE"}
 
-    if message.reply_to_message and message.reply_to_message.from_user:
-        ru = message.reply_to_message.from_user
-        if bool(getattr(ru, "is_bot", False)):
-            tid = _resolve_target_from_bot_reply(message, attacker_id)
-            if tid is not None:
-                cnt = 1
-                if toks and toks[0].isdigit():
-                    cnt = int(toks[0])
-                return {"kind": "U", "target": tid, "count": cnt}
-        else:
+    if message.reply_to_message:
+        ru = getattr(message.reply_to_message, "from_user", None)
+
+        if (
+            ru
+            and not bool(getattr(ru, "is_bot", False))
+            and int(getattr(ru, "id", 0) or 0) != int(attacker_id)
+        ):
+            capture_user_context(message, ru)
+            tid = int(ru.id)
+            cnt = 1
+            if toks and toks[0].isdigit():
+                cnt = int(toks[0])
+            return {"kind": "U", "target": tid, "count": cnt}
+
+        tid = _pick_reply_target_id(message, exclude_user_ids={int(attacker_id)})
+        if tid is not None:
+            cnt = 1
+            if toks and toks[0].isdigit():
+                cnt = int(toks[0])
+            return {"kind": "U", "target": int(tid), "count": cnt}
+
+        if ru and not bool(getattr(ru, "is_bot", False)):
             capture_user_context(message, ru)
             tid = int(ru.id)
             cnt = 1
@@ -11721,6 +12520,145 @@ def kb_upgrade(uid: int, code: str, steps: int, src: str = "C", ictype: Optional
         )
     return kb
 
+def _upgrade_skill_points_count(uid: int) -> int:
+    row = db_one(
+        "SELECT COALESCE(skill_points,0) AS sp FROM labs WHERE user_id=?",
+        (int(uid),)
+    )
+    return int(row["sp"] or 0) if row else 0
+
+def _upgrade_chain_cb(action: str, uid: int, code: str, steps: int, src: str = "C", ictype: Optional[str] = None, ictx: Optional[list[str]] = None) -> str:
+    if src == "I" and ictype:
+        ctx = ictx or []
+        return _upg_cb_i(action, int(uid), str(code), int(steps), str(ictype), *ctx)
+    return _upg_cb(action, int(uid), str(code), int(steps), str(src or "C"))
+
+def _upgrade_shortage_text(uid: int) -> str:
+    row = db_one(
+        "SELECT COALESCE(all_bio_res,0) AS r, COALESCE(all_bio_mater,0) AS m, COALESCE(skill_points,0) AS sp "
+        "FROM labs WHERE user_id=?",
+        (int(uid),)
+    )
+    have_r = int(row["r"] or 0) if row else 0
+    have_m = int(row["m"] or 0) if row else 0
+    sp = int(row["sp"] or 0) if row else 0
+
+    if sp > 0:
+        pts_word = _ru_form(sp, "очко навыка", "очка навыка", "очков навыка")
+        return (
+            "📝 У вас нет столько био-ресурсов или био-материалов.\n"
+            f"Однако, на вашем счету имеется 🔹 {_fmt_k(sp)} {pts_word}. Хотите использовать?"
+        )
+
+    if have_r <= 0 and have_m <= 0:
+        return "📝 У вас нет столько био-ресурсов или био-материалов, или очков навыков."
+
+    return "📝 У вас нет столько био-ресурсов или био-материалов."
+
+def kb_upgrade_shortage(
+    uid: int,
+    code: str,
+    steps: int,
+    src: str = "C",
+    ictype: Optional[str] = None,
+    ictx: Optional[list[str]] = None,
+    *,
+    include_balance: bool = True
+) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=2)
+
+    sp = _upgrade_skill_points_count(int(uid))
+    row_btns = []
+
+    if sp > 0:
+        row_btns.append(
+            _ikb_premium_lead(
+                "🔹",
+                "Использовать 1",
+                callback_data=_upgrade_chain_cb("SP", uid, code, steps, src, ictype, ictx),
+                style="primary"
+            )
+        )
+
+    if include_balance:
+        row_btns.append(
+            InlineKeyboardButton("Баланс", callback_data=_balui_data(int(uid), "B"), style="primary")
+        )
+
+    if row_btns:
+        kb.row(*row_btns)
+
+    return kb
+
+def _upgrade_balance_payload(code: str, steps: int, src: str = "C", ictype: Optional[str] = None, ictx: Optional[list[str]] = None) -> dict:
+    return {
+        "code": str(code or "").strip().upper(),
+        "steps": int(max(1, steps or 1)),
+        "src": str(src or "C"),
+        "ictype": str(ictype or ""),
+        "ictx": list(ictx or []),
+    }
+
+def _upgrade_payload_parts(payload: dict) -> tuple[str, int, str, Optional[str], list[str]]:
+    p = payload if isinstance(payload, dict) else {}
+    code = str(p.get("code") or "").strip().upper()
+    steps = max(1, int(p.get("steps") or 1))
+    src = str(p.get("src") or "C").strip() or "C"
+    ictype = str(p.get("ictype") or "").strip() or None
+    ictx = list(p.get("ictx") or [])
+    return code, steps, src, ictype, ictx
+
+def _append_upgrade_return_buttons(rm: Optional[InlineKeyboardMarkup], uid: int, src: str, ictype: Optional[str] = None, ictx: Optional[list[str]] = None) -> Optional[InlineKeyboardMarkup]:
+    if rm is None:
+        return None
+
+    if src == "D":
+        rm.row(InlineKeyboardButton("Вернуться к досье", callback_data=_labui_data(uid, "D"), style="primary"))
+    elif src == "PB":
+        rm.row(InlineKeyboardButton("Вернуться к сводке", callback_data=_pathogens_ui_data(uid, "INFO", 0), style="primary"))
+
+    return rm
+
+def _kb_balance_upgrade_actions(uid: int, state: dict, *, from_synth: bool = False) -> Optional[InlineKeyboardMarkup]:
+    payload = (state or {}).get("payload") or {}
+    code, steps, src, ictype, ictx = _upgrade_payload_parts(payload)
+    if code not in SKILLS:
+        return None
+
+    kb = InlineKeyboardMarkup(row_width=2)
+
+    sp = _upgrade_skill_points_count(int(uid))
+    can_repeat, repeat_text = _balance_chain_can_resume(int(uid), state)
+
+    row_btns = []
+    if sp > 0:
+        row_btns.append(
+            _ikb_premium_lead(
+                "🔹",
+                "Использовать 1",
+                callback_data=_upgrade_chain_cb("SP", uid, code, steps, src, ictype, ictx),
+                style="primary"
+            )
+        )
+
+    if can_repeat and repeat_text:
+        row_btns.append(
+            _balance_chain_upgrade_button(
+                code,
+                steps,
+                callback_data=_balui_data(int(uid), "R", "U"),
+                style="primary"
+            )
+        )
+
+    if row_btns:
+        kb.row(*row_btns)
+
+    if synth_left_seconds(uid) <= 0:
+        kb.add(_ikb_premium_counter("⚗️", "Синтез", callback_data=_balui_data(uid, "S")))
+
+    return kb if getattr(kb, "keyboard", None) else None
+
 def _build_upgrade_preview(uid: int, code: str, steps: int) -> str:
     ensure_lab_exists(int(uid))
     lab = get_lab(int(uid))
@@ -11785,9 +12723,9 @@ def _execute_upgrade(uid: int, code: str, steps: int):
         bv, _ = _craft_params(VACCINE_CRAFT_SEC, VACCINE_MIN_SEC, cur)
         av, _ = _craft_params(VACCINE_CRAFT_SEC, VACCINE_MIN_SEC, final_lvl)
         if bp != ap:
-            extra_lines += f"🧪: {_format_hms(bp)} → {_format_hms(ap)}\n"
+            extra_lines += f"🧪 Время произв.: {_format_hms(bp)} → {_format_hms(ap)}\n"
         if bv != av:
-            extra_lines += f"💉: {_format_hms(bv)} → {_format_hms(av)}\n"
+            extra_lines += f"💉 Время произв.: {_format_hms(bv)} → {_format_hms(av)}\n"
 
     if code == "SYN":
         bsyn = _synth_bonus_value(cur)
@@ -11834,7 +12772,7 @@ def _execute_upgrade_by_skill_point(uid: int, code: str):
     row = db_one("SELECT COALESCE(skill_points,0) AS sp FROM labs WHERE user_id=?", (int(uid),))
     sp = int(row["sp"] or 0) if row else 0
     if sp <= 0:
-        return False, "📑 У вас нет очков навыка.", None
+        return False, "📝 У вас нет очков навыка.", None
 
     skill = SKILLS[code]
     col = skill["col"]
@@ -11916,14 +12854,28 @@ def handle_upgrade_command(message, parsed: Parsed, edit_ctx: Optional[dict] = N
 
     ok, txt, _final = _execute_upgrade(uid, code, steps)
     if ok:
+        st = get_balance_chain_state(int(uid))
+        if st and str(st.get("chain_kind") or "") == BALCHAIN_UPGRADE:
+            clear_balance_chain_state(int(uid))
         _emit(txt, reply_markup=kb_upgrade(uid, code, steps, "C"))
     else:
-        _emit(txt, reply_markup=None)
+        set_balance_chain_state_from_message(
+            message,
+            BALCHAIN_UPGRADE,
+            _balance_chain_upgrade_button_text(code, steps),
+            _upgrade_balance_payload(code, steps, "C")
+        )
+
+        fail_text = _upgrade_shortage_text(int(uid))
+        rm = kb_upgrade_shortage(int(uid), code, int(steps), "C", include_balance=True) if _upgrade_skill_points_count(int(uid)) > 0 else kb_open_balance(int(uid))
+        _emit(fail_text, reply_markup=rm)
 
 CALC_UPGRADE_MODE_ALIASES = {"улучшение", "улучшения", "улучш", "у", 
                              "прокачка", "прокачки", "прокач", "пк"}
 CALC_CHANCE_MODE_ALIASES = {"шанс", "шанса", "шансы", "шансов", "ш", 
                             "проценты", "процента", "процентов", "процент", "проц", "пц"}
+CALC_BUFF_MODE_ALIASES = {"усиление", "усиления", "усилений", "кс", "кус"
+}
 
 CALC_CHANCE_METRIC_ALIASES = {
     "заражения": "INFECT", "заражение": "INFECT", "зар": "INFECT",
@@ -11960,21 +12912,37 @@ STRICT_NO_EXTRA_ARGS_CMDS = {
     "duel_bets_list", "duel_stats",
 }
 
-CALC_BUFF_MODE_ALIASES = {
-    "усиления", "усилений", "кс", "кус"
-}
+CALC_MAIN_PUBLIC_VARS = [
+    "улучшения",
+    "усиления",
+    "шансов",
+]
 
 CALC_UPGRADE_PUBLIC_VARS = [
-    "заразность", "летальность", "тяжесть", "ускорение",
-    "патоген", "вакцина", "реагирование", "обнаружение", "предотвращение"
+    "заразность",
+    "летальность",
+    "тяжесть",
+    "иммунитет",
+    "реагирование",
+    "обнаружение",
+    "предотвращение",
+    "синтез",
+    "ускорение",
+    "патоген",
+    "вакцина",
 ]
 
 CALC_CHANCE_PUBLIC_VARS = [
-    "заражения", "обнаружения", "диверсии", "тяжести"
+    "заражения", 
+    "обнаружения", 
+    "диверсии", 
+    "тяжести",
 ]
 
 CALC_BUFF_PUBLIC_VARS = [
-    "синтез", "ускорение", "горячка"
+    "синтез", 
+    "ускорение", 
+    "летальность",
 ]
 
 def _calc_inline_hint_keyboard(prefix: str):
@@ -11993,6 +12961,19 @@ def _calc_inline_error_text(mode_label: str, hint_text: str) -> str:
         f"{hint_text}"
     )
 
+def _calc_quote_block(lines: list[str]) -> str:
+    body = "\n".join([h(x) for x in (lines or []) if str(x).strip()])
+    return f"<blockquote>{body}</blockquote>" if body else ""
+
+def _calc_main_hint_text() -> str:
+    vars_txt = "\n".join([f"<code>{h(x)}</code>" for x in CALC_MAIN_PUBLIC_VARS])
+    return (
+        "📋 Доступные переменные для калькулятора:\n"
+        "<blockquote expandable>"
+        f"{vars_txt}\n"
+        "</blockquote>"
+    )
+
 def _calc_upgrade_hint_text() -> str:
     vars_txt = "\n".join([f"<code>{h(x)}</code>" for x in CALC_UPGRADE_PUBLIC_VARS])
     return (
@@ -12001,6 +12982,12 @@ def _calc_upgrade_hint_text() -> str:
         f"{vars_txt}\n"
         "</blockquote>"
     )
+
+def _calc_upgrade_levels_hint_text() -> str:
+    return _calc_quote_block([
+        "1. Укажите начальный и конечный уровни навыка.",
+        "2. Соблюдайте условие: конечный уровень > начального уровня.",
+    ])
 
 def _calc_chance_hint_text() -> str:
     vars_txt = "\n".join([f"<code>{h(x)}</code>" for x in CALC_CHANCE_PUBLIC_VARS])
@@ -12011,14 +12998,43 @@ def _calc_chance_hint_text() -> str:
         "</blockquote>"
     )
 
+def _calc_chance_metric_prompt_text(metric_key: str) -> str:
+    metric_key = str(metric_key or "").strip().upper()
+    if metric_key == "INFECT":
+        return _calc_quote_block([
+            "Укажите 1.уровень заразности 2.уровень иммунитета."
+        ])
+    if metric_key == "IDS":
+        return _calc_quote_block([
+            "Укажите 1.уровень IDS атакующего 2.уровень IDS защищающегося."
+        ])
+    if metric_key == "SAB":
+        return _calc_quote_block([
+            "Укажите 1.уровень группы быстрого реагирования атакующего 2.уровень IDS защищающегося."
+        ])
+    if metric_key == "HEA":
+        return _calc_quote_block([
+            "Укажите 1.уровень тяжести 2.уровень квалификации учёных."
+        ])
+    return ""
+
 def _calc_buff_hint_text() -> str:
-    vars_txt = "\n".join([f"<code>{h(x)}</code>" for x in CALC_BUFF_PUBLIC_VARS]) 
+    vars_txt = "\n".join([f"<code>{h(x)}</code>" for x in CALC_BUFF_PUBLIC_VARS])
     return (
         "📋 Доступные переменные для подсчёта усилений:\n"
         "<blockquote expandable>"
         f"{vars_txt}\n"
-        "\n</blockquote>"
+        "</blockquote>"
     )
+
+def _calc_buff_levels_hint_text() -> str:
+    return _calc_quote_block([
+        "1. Укажите начальный и конечный уровни навыка.",
+        "2. Соблюдайте условие: конечный уровень > начального уровня.",
+    ])
+
+def _calc_join_prefix(parts: list[str]) -> str:
+    return " ".join([str(x).strip() for x in (parts or []) if str(x).strip()]).strip()
 
 def _fmt_pct_text(v: float) -> str:
     x = float(v)
@@ -12075,7 +13091,7 @@ def _calc_chance_payload(metric_token: str, lvl1: int, lvl2: int):
         success = float(_calc_sabotage_success_pct(l1, l2))
         fail = 100.0 - success
         label = "диверсии"
-        levels_txt = f"🕵️ {l1} ур → 📟 {l2} ур"
+        levels_txt = f"👮 {l1} ур → 📟 {l2} ур"
     else:
         success, fail = _calc_heaviness_success_fail_pct(l1, l2)
         label = "тяжести"
@@ -12189,71 +13205,147 @@ def _inline_calc_req_from_query(query: str):
     if not toks:
         return None
 
+    def _hint(kind: str, title: str, desc: str, text: str, prefix_parts: list[str]):
+        return {
+            "kind": kind,
+            "ready": False,
+            "title": title,
+            "desc": desc,
+            "text": text,
+            "reply_markup": _calc_inline_hint_keyboard(_calc_join_prefix(prefix_parts)),
+        }
+
     explicit = False
     mode = "UPG"
-    prefix_for_button = ""
+    prefix_parts: list[str] = []
+    rest_raw = list(toks_raw)
+    rest = list(toks)
 
-    if toks[0] in CALC_UPGRADE_MODE_ALIASES:
+    if toks[0] in ("к", "калькулятор"):
+        explicit = True
+        prefix_parts = [toks_raw[0]]
+        rest_raw = toks_raw[1:]
+        rest = toks[1:]
+
+        if not rest:
+            return _hint(
+                "MAIN",
+                "Калькулятор",
+                "Выберите режим расчёта",
+                _calc_inline_error_text("калькулятор", _calc_main_hint_text()),
+                prefix_parts
+            )
+
+        if rest[0] in CALC_UPGRADE_MODE_ALIASES or rest[0] in ("ку", "кпк"):
+            mode = "UPG"
+            prefix_parts.append(rest_raw[0])
+            rest_raw = rest_raw[1:]
+            rest = rest[1:]
+        elif rest[0] in CALC_CHANCE_MODE_ALIASES or rest[0] in ("кш", "кпц"):
+            mode = "CHANCE"
+            prefix_parts.append(rest_raw[0])
+            rest_raw = rest_raw[1:]
+            rest = rest[1:]
+        elif rest[0] in CALC_BUFF_MODE_ALIASES or rest[0] in ("кс", "кус"):
+            mode = "BUFF"
+            prefix_parts.append(rest_raw[0])
+            rest_raw = rest_raw[1:]
+            rest = rest[1:]
+        else:
+            return _hint(
+                "MAIN",
+                "Калькулятор",
+                "Выберите режим расчёта",
+                _calc_inline_error_text("калькулятор", _calc_main_hint_text()),
+                prefix_parts
+            )
+
+    elif toks[0] in CALC_UPGRADE_MODE_ALIASES or toks[0] in ("ку", "кпк"):
         explicit = True
         mode = "UPG"
-        prefix_for_button = toks_raw[0]
-        toks_raw = toks_raw[1:]
-        toks = toks[1:]
-    elif toks[0] in CALC_CHANCE_MODE_ALIASES:
+        prefix_parts = [toks_raw[0]]
+        rest_raw = toks_raw[1:]
+        rest = toks[1:]
+    elif toks[0] in CALC_CHANCE_MODE_ALIASES or toks[0] in ("кш", "кпц"):
         explicit = True
         mode = "CHANCE"
-        prefix_for_button = toks_raw[0]
-        toks_raw = toks_raw[1:]
-        toks = toks[1:]
-    elif toks[0] in CALC_BUFF_MODE_ALIASES:
+        prefix_parts = [toks_raw[0]]
+        rest_raw = toks_raw[1:]
+        rest = toks[1:]
+    elif toks[0] in CALC_BUFF_MODE_ALIASES or toks[0] in ("кс", "кус"):
         explicit = True
         mode = "BUFF"
-        prefix_for_button = toks_raw[0]
-        toks_raw = toks_raw[1:]
-        toks = toks[1:]
-    elif toks[0] in ("ку", "кпк"):
-        explicit = True
-        mode = "UPG"
-        prefix_for_button = toks_raw[0]
-        toks_raw = toks_raw[1:]
-        toks = toks[1:]
-    elif toks[0] in ("кш", "кпц"):
-        explicit = True
-        mode = "CHANCE"
-        prefix_for_button = toks_raw[0]
-        toks_raw = toks_raw[1:]
-        toks = toks[1:]
-    elif toks[0] in ("кс", "кус"):
-        explicit = True
-        mode = "BUFF"
-        prefix_for_button = toks_raw[0]
-        toks_raw = toks_raw[1:]
-        toks = toks[1:]
+        prefix_parts = [toks_raw[0]]
+        rest_raw = toks_raw[1:]
+        rest = toks[1:]
 
     if mode == "BUFF":
-        hint_text = _calc_buff_hint_text()
-        err_text = _calc_inline_error_text("усиления", hint_text)
+        if not explicit:
+            return None
 
-        if len(toks) < 3:
-            return {
-                "kind": "BUFF",
-                "ready": False,
-                "title": "Калькулятор усилений",
-                "desc": "Введите переменную и уровни",
-                "text": err_text,
-                "reply_markup": _calc_inline_hint_keyboard(prefix_for_button),
-            }
+        if not rest:
+            return _hint(
+                "BUFF",
+                "Калькулятор усилений",
+                "Введите показатель и уровни",
+                _calc_inline_error_text("усиления", _calc_buff_hint_text()),
+                prefix_parts
+            )
 
-        payload = _calc_buff_payload(toks[0], toks[1], toks[2])
+        metric_key = CALC_BUFF_METRIC_ALIASES.get(rest[0])
+        if not metric_key:
+            return _hint(
+                "BUFF",
+                "Калькулятор усилений",
+                "Введите показатель и уровни",
+                _calc_inline_error_text("усиления", _calc_buff_hint_text()),
+                prefix_parts
+            )
+
+        ok_prefix = prefix_parts + [rest_raw[0]]
+
+        if len(rest) < 3:
+            if len(rest) >= 2 and rest[1].isdigit():
+                ok_prefix.append(rest_raw[1])
+            return _hint(
+                "BUFF",
+                "Калькулятор усилений",
+                "Введите показатель и уровни",
+                _calc_inline_error_text("усиления", _calc_buff_levels_hint_text()),
+                ok_prefix
+            )
+
+        if not rest[1].isdigit() or not rest[2].isdigit():
+            if len(rest) >= 2 and rest[1].isdigit():
+                ok_prefix.append(rest_raw[1])
+            return _hint(
+                "BUFF",
+                "Калькулятор усилений",
+                "Введите показатель и уровни",
+                _calc_inline_error_text("усиления", _calc_buff_levels_hint_text()),
+                ok_prefix
+            )
+
+        n1 = int(rest[1])
+        n2 = int(rest[2])
+        if n1 >= n2:
+            return _hint(
+                "BUFF",
+                "Калькулятор усилений",
+                "Введите показатель и уровни",
+                _calc_inline_error_text("усиления", _calc_buff_levels_hint_text()),
+                ok_prefix + [rest_raw[1], rest_raw[2]]
+            )
+
+        payload = _calc_buff_payload(rest[0], n1, n2)
         if not payload:
-            return {
-                "kind": "BUFF",
-                "ready": False,
-                "title": "Калькулятор усилений",
-                "desc": "Введите переменную и уровни",
-                "text": err_text,
-                "reply_markup": _calc_inline_hint_keyboard(prefix_for_button),
-            }
+            return _hint(
+                "BUFF",
+                "Калькулятор усилений",
+                "Введите показатель и уровни",
+                _calc_inline_error_text("усиления", _calc_buff_levels_hint_text()),
+                ok_prefix + [rest_raw[1], rest_raw[2]]
+            )
 
         return {
             "kind": "BUFF",
@@ -12266,14 +13358,15 @@ def _inline_calc_req_from_query(query: str):
 
     if mode == "UPG":
         if not explicit:
-            if len(toks) != 3:
+            if len(rest) != 3:
                 return None
 
-            code = _resolve_skill(toks[0])
-            if not code or not toks[1].isdigit() or not toks[2].isdigit():
+            code = _resolve_skill(rest[0])
+            if not code or not rest[1].isdigit() or not rest[2].isdigit():
                 return None
 
-            n1 = int(toks[1]); n2 = int(toks[2])
+            n1 = int(rest[1])
+            n2 = int(rest[2])
             if n1 >= n2:
                 return None
 
@@ -12291,40 +13384,59 @@ def _inline_calc_req_from_query(query: str):
                 "reply_markup": None,
             }
 
-        hint_text = _calc_upgrade_hint_text()
-        err_text = _calc_inline_error_text("улучшение", hint_text)
+        if not rest:
+            return _hint(
+                "UPG",
+                "Калькулятор улучшения",
+                "Введите название навыка и уровни",
+                _calc_inline_error_text("улучшения", _calc_upgrade_hint_text()),
+                prefix_parts
+            )
 
-        if len(toks) < 3:
-            return {
-                "kind": "UPG",
-                "ready": False,
-                "title": "Калькулятор улучшения",
-                "desc": "Введите название навыка, минимальный и максимальный уровни",
-                "text": err_text,
-                "reply_markup": _calc_inline_hint_keyboard(prefix_for_button),
-            }
+        code = _resolve_skill(rest[0])
+        if not code:
+            return _hint(
+                "UPG",
+                "Калькулятор улучшения",
+                "Введите название навыка и уровни",
+                _calc_inline_error_text("улучшения", _calc_upgrade_hint_text()),
+                prefix_parts
+            )
 
-        code = _resolve_skill(toks[0])
-        if not code or not toks[1].isdigit() or not toks[2].isdigit():
-            return {
-                "kind": "UPG",
-                "ready": False,
-                "title": "Калькулятор улучшения",
-                "desc": "Введите название навыка, минимальный и максимальный уровни",
-                "text": err_text,
-                "reply_markup": _calc_inline_hint_keyboard(prefix_for_button),
-            }
+        ok_prefix = prefix_parts + [rest_raw[0]]
 
-        n1 = int(toks[1]); n2 = int(toks[2])
+        if len(rest) < 3:
+            if len(rest) >= 2 and rest[1].isdigit():
+                ok_prefix.append(rest_raw[1])
+            return _hint(
+                "UPG",
+                "Калькулятор улучшения",
+                "Введите название навыка и уровни",
+                _calc_inline_error_text("улучшения", _calc_upgrade_levels_hint_text()),
+                ok_prefix
+            )
+
+        if not rest[1].isdigit() or not rest[2].isdigit():
+            if len(rest) >= 2 and rest[1].isdigit():
+                ok_prefix.append(rest_raw[1])
+            return _hint(
+                "UPG",
+                "Калькулятор улучшения",
+                "Введите название навыка и уровни",
+                _calc_inline_error_text("улучшения", _calc_upgrade_levels_hint_text()),
+                ok_prefix
+            )
+
+        n1 = int(rest[1])
+        n2 = int(rest[2])
         if n1 >= n2:
-            return {
-                "kind": "UPG",
-                "ready": False,
-                "title": "Калькулятор улучшения",
-                "desc": "Введите название навыка, минимальный и максимальный уровни",
-                "text": err_text,
-                "reply_markup": _calc_inline_hint_keyboard(prefix_for_button),
-            }
+            return _hint(
+                "UPG",
+                "Калькулятор улучшения",
+                "Введите название навыка и уровни",
+                _calc_inline_error_text("улучшения", _calc_upgrade_levels_hint_text()),
+                ok_prefix + [rest_raw[1], rest_raw[2]]
+            )
 
         cost = _calc_cost_range(SKILL_N1[code], n1, n2)
         skill = SKILLS[code]
@@ -12340,57 +13452,62 @@ def _inline_calc_req_from_query(query: str):
             "reply_markup": None,
         }
 
-    hint_text = _calc_chance_hint_text()
-    err_text = _calc_inline_error_text("шансы", hint_text)
+    if not explicit:
+        return None
 
-    if len(toks) < 1:
-        return {
-            "kind": "CHANCE",
-            "ready": False,
-            "title": "Калькулятор шансов",
-            "desc": "Введите интересующий параметр",
-            "text": err_text,
-            "reply_markup": _calc_inline_hint_keyboard(prefix_for_button),
-        }
+    if not rest:
+        return _hint(
+            "CHANCE",
+            "Калькулятор шансов",
+            "Введите интересующий параметр",
+            _calc_inline_error_text("шансы", _calc_chance_hint_text()),
+            prefix_parts
+        )
 
-    metric_key = CALC_CHANCE_METRIC_ALIASES.get(toks[0])
+    metric_key = CALC_CHANCE_METRIC_ALIASES.get(rest[0])
     if not metric_key:
-        return {
-            "kind": "CHANCE",
-            "ready": False,
-            "title": "Калькулятор шансов",
-            "desc": "Введите интересующий параметр",
-            "text": err_text,
-            "reply_markup": _calc_inline_hint_keyboard(prefix_for_button),
-        }
+        return _hint(
+            "CHANCE",
+            "Калькулятор шансов",
+            "Введите интересующий параметр",
+            _calc_inline_error_text("шансы", _calc_chance_hint_text()),
+            prefix_parts
+        )
 
-    metric_hint = {
-        "INFECT": "Введите уровень заразности и уровень иммунитета",
-        "IDS": "Введите два уровня системы обнаружения угроз (IDS)",
-        "SAB": "Введите уровень группы быстрого реагирования и уровень службы безопасности",
-        "HEA": "Введите уровень тяжести патогена и уровень квалификации учёных",
-    }[metric_key]
+    ok_prefix = prefix_parts + [rest_raw[0]]
+    metric_prompt = _calc_chance_metric_prompt_text(metric_key)
 
-    if len(toks) < 3 or not toks[1].isdigit() or not toks[2].isdigit():
-        return {
-            "kind": "CHANCE",
-            "ready": False,
-            "title": "Калькулятор шансов",
-            "desc": metric_hint,
-            "text": err_text,
-            "reply_markup": _calc_inline_hint_keyboard(prefix_for_button),
-        }
+    if len(rest) < 3:
+        if len(rest) >= 2 and rest[1].isdigit():
+            ok_prefix.append(rest_raw[1])
+        return _hint(
+            "CHANCE",
+            "Калькулятор шансов",
+            "Введите интересующий параметр",
+            _calc_inline_error_text("шансы", metric_prompt),
+            ok_prefix
+        )
 
-    payload = _calc_chance_payload(toks[0], int(toks[1]), int(toks[2]))
+    if not rest[1].isdigit() or not rest[2].isdigit():
+        if len(rest) >= 2 and rest[1].isdigit():
+            ok_prefix.append(rest_raw[1])
+        return _hint(
+            "CHANCE",
+            "Калькулятор шансов",
+            "Введите интересующий параметр",
+            _calc_inline_error_text("шансы", metric_prompt),
+            ok_prefix
+        )
+
+    payload = _calc_chance_payload(rest[0], int(rest[1]), int(rest[2]))
     if not payload:
-        return {
-            "kind": "CHANCE",
-            "ready": False,
-            "title": "Калькулятор шансов",
-            "desc": "Введите интересующий параметр",
-            "text": err_text,
-            "reply_markup": _calc_inline_hint_keyboard(prefix_for_button),
-        }
+        return _hint(
+            "CHANCE",
+            "Калькулятор шансов",
+            "Введите интересующий параметр",
+            _calc_inline_error_text("шансы", metric_prompt),
+            ok_prefix + [rest_raw[1], rest_raw[2]]
+        )
 
     return {
         "kind": "CHANCE",
@@ -12414,52 +13531,107 @@ def handle_calc_command(message, parsed: Parsed):
             disable_web_page_preview=True
         )
 
+    def _emit_err(hint_text: str):
+        _emit(_calc_inline_error_text("calc", hint_text))
+
     parts = (parsed.args or "").strip().split()
-    if not parts:
-        return
-
-    if parsed.cmd == "calc_buff":
-        if len(parts) < 3:
-            return
-
-        payload = _calc_buff_payload(parts[0], parts[1], parts[2])
-        if not payload:
-            return
-
-        _emit(payload["text"])
-        return
 
     mode = "UPG"
+    explicit = False
+
     if parsed.cmd == "calc_upg":
         mode = "UPG"
+        explicit = True
     elif parsed.cmd == "calc_chance":
         mode = "CHANCE"
+        explicit = True
+    elif parsed.cmd == "calc_buff":
+        mode = "BUFF"
+        explicit = True
     else:
+        if not parts:
+            _emit_err(_calc_main_hint_text())
+            return
+
         first = parts[0].lower()
         if first in CALC_UPGRADE_MODE_ALIASES:
             mode = "UPG"
+            explicit = True
             parts = parts[1:]
         elif first in CALC_CHANCE_MODE_ALIASES:
             mode = "CHANCE"
+            explicit = True
+            parts = parts[1:]
+        elif first in CALC_BUFF_MODE_ALIASES:
+            mode = "BUFF"
+            explicit = True
             parts = parts[1:]
         else:
             mode = "UPG"
+            explicit = False
 
-    if mode == "UPG":
-        if len(parts) < 3:
+    if mode == "BUFF":
+        if not parts:
+            _emit_err(_calc_buff_hint_text())
             return
 
-        code = _resolve_skill(parts[0])
-        if not code or code not in SKILLS:
+        metric_key = CALC_BUFF_METRIC_ALIASES.get(parts[0].lower())
+        if not metric_key:
+            _emit_err(_calc_buff_hint_text())
+            return
+
+        if len(parts) < 3:
+            _emit_err(_calc_buff_levels_hint_text())
             return
 
         try:
             n1 = int(parts[1])
             n2 = int(parts[2])
         except Exception:
+            _emit_err(_calc_buff_levels_hint_text())
             return
 
         if n1 >= n2:
+            _emit_err(_calc_buff_levels_hint_text())
+            return
+
+        payload = _calc_buff_payload(parts[0], n1, n2)
+        if not payload:
+            _emit_err(_calc_buff_levels_hint_text())
+            return
+
+        _emit(payload["text"])
+        return
+
+    if mode == "UPG":
+        if not parts:
+            if explicit:
+                _emit_err(_calc_upgrade_hint_text())
+            else:
+                _emit_err(_calc_main_hint_text())
+            return
+
+        code = _resolve_skill(parts[0])
+        if not code or code not in SKILLS:
+            if explicit:
+                _emit_err(_calc_upgrade_hint_text())
+            else:
+                _emit_err(_calc_upgrade_hint_text())
+            return
+
+        if len(parts) < 3:
+            _emit_err(_calc_upgrade_levels_hint_text())
+            return
+
+        try:
+            n1 = int(parts[1])
+            n2 = int(parts[2])
+        except Exception:
+            _emit_err(_calc_upgrade_levels_hint_text())
+            return
+
+        if n1 >= n2:
+            _emit_err(_calc_upgrade_levels_hint_text())
             return
 
         cost = _calc_cost_range(SKILL_N1[code], n1, n2)
@@ -12471,11 +13643,29 @@ def handle_calc_command(message, parsed: Parsed):
         )
         return
 
-    if len(parts) < 3:
+    if not parts:
+        _emit_err(_calc_chance_hint_text())
         return
 
-    payload = _calc_chance_payload(parts[0], parts[1], parts[2])
+    metric_key = CALC_CHANCE_METRIC_ALIASES.get(parts[0].lower())
+    if not metric_key:
+        _emit_err(_calc_chance_hint_text())
+        return
+
+    if len(parts) < 3:
+        _emit_err(_calc_chance_metric_prompt_text(metric_key))
+        return
+
+    try:
+        n1 = int(parts[1])
+        n2 = int(parts[2])
+    except Exception:
+        _emit_err(_calc_chance_metric_prompt_text(metric_key))
+        return
+
+    payload = _calc_chance_payload(parts[0], n1, n2)
     if not payload:
+        _emit_err(_calc_chance_metric_prompt_text(metric_key))
         return
 
     _emit(payload["text"])
@@ -12533,11 +13723,28 @@ def cb_upgrade(cq):
 
         if action == "SP":
             ok, txt, _ = _execute_upgrade_by_skill_point(uid, code)
-            rm = kb_upgrade(uid, code, 1, src, ictype=ictype, ictx=ictx) if ok else None
-            if ok and src == "D":
-                rm.row(InlineKeyboardButton("Вернуться к досье", callback_data=_labui_data(uid, "D"), style="primary"))
-            elif ok and src == "PB":
-                rm.row(InlineKeyboardButton("Вернуться к сводке", callback_data=_pathogens_ui_data(uid, "INFO", 0), style="primary"))
+
+            st = get_balance_chain_state(int(uid))
+            state_code = ""
+            state_steps = int(steps)
+            state_src = src
+            state_ictype = ictype
+            state_ictx = ictx or []
+
+            if st and str(st.get("chain_kind") or "") == BALCHAIN_UPGRADE:
+                payload = (st.get("payload") or {})
+                state_code, state_steps, state_src, state_ictype, state_ictx = _upgrade_payload_parts(payload)
+
+            if ok:
+                if state_code == code:
+                    rm = kb_upgrade_shortage(uid, code, state_steps, state_src, ictype=state_ictype, ictx=state_ictx, include_balance=True)
+                    rm = _append_upgrade_return_buttons(rm, uid, state_src, state_ictype, state_ictx)
+                else:
+                    rm = kb_upgrade(uid, code, 1, src, ictype=ictype, ictx=ictx)
+                    rm = _append_upgrade_return_buttons(rm, uid, src, ictype, ictx)
+            else:
+                rm = None
+
             _edit(txt, reply_markup=rm)
             bot.answer_callback_query(cq.id)
             return
@@ -12557,6 +13764,10 @@ def cb_upgrade(cq):
 
         rm = None
         if ok:
+            st = get_balance_chain_state(int(uid))
+            if st and str(st.get("chain_kind") or "") == BALCHAIN_UPGRADE:
+                clear_balance_chain_state(int(uid))
+
             rm = kb_upgrade(uid, code, steps, src, ictype=ictype, ictx=ictx)
 
             if src == "D":
@@ -12590,14 +13801,21 @@ def cb_upgrade(cq):
                 except Exception:
                     pass
         else:
-            if src == "D":
-                rm = InlineKeyboardMarkup()
-                rm.add(InlineKeyboardButton("Вернуться к досье", callback_data=_labui_data(uid, "D"), style="primary"))
-            elif src == "PB":
-                rm = InlineKeyboardMarkup()
-                rm.add(InlineKeyboardButton("Вернуться к сводке", callback_data=_pathogens_ui_data(uid, "INFO", 0), style="primary"))
-            else:
-                rm = None
+            source_chat_id = int(getattr(getattr(cq, "message", None), "chat", None).id) if getattr(cq, "message", None) and getattr(cq.message, "chat", None) else 0
+            source_message_id = int(getattr(getattr(cq, "message", None), "message_id", 0) or 0)
+
+            set_balance_chain_state(
+                int(uid),
+                BALCHAIN_UPGRADE,
+                _balance_chain_upgrade_button_text(code, steps),
+                _upgrade_balance_payload(code, steps, src, ictype, ictx),
+                source_chat_id=source_chat_id,
+                source_message_id=source_message_id
+            )
+
+            txt = _upgrade_shortage_text(int(uid))
+            rm = kb_upgrade_shortage(uid, code, steps, src, ictype=ictype, ictx=ictx, include_balance=True) if _upgrade_skill_points_count(int(uid)) > 0 else kb_open_balance(int(uid))
+            rm = _append_upgrade_return_buttons(rm, uid, src, ictype, ictx)
 
         _edit(txt, reply_markup=rm)
         bot.answer_callback_query(cq.id)
@@ -12695,17 +13913,24 @@ def render_balance(user_id: int) -> str:
         f"💬 Запасы можно пополнить командой \"<code>Синтез</code>\""
     )
 
-def _balui_data(uid: int, act: str) -> str:
-    return f"{BALUI_TAG}:{int(uid)}:{act}"
+def _balui_data(uid: int, act: str, extra: str = "") -> str:
+    base = f"{BALUI_TAG}:{int(uid)}:{act}"
+    extra = str(extra or "").strip()
+    if not extra:
+        return base
+    return f"{base}:{extra}"
 
 def _balui_parse(data: str):
     try:
         p = (data or "").split(":")
-        if len(p) != 3 or p[0] != BALUI_TAG:
-            return None, None
-        return int(p[1]), p[2]
+        if len(p) < 3 or p[0] != BALUI_TAG:
+            return None, None, ""
+        uid = int(p[1])
+        act = str(p[2] or "").strip()
+        extra = ":".join(p[3:]).strip() if len(p) > 3 else ""
+        return uid, act, extra
     except Exception:
-        return None, None
+        return None, None, ""
 
 def synth_left_seconds(uid: int) -> int:
     ensure_lab_exists(uid)
@@ -12715,15 +13940,593 @@ def synth_left_seconds(uid: int) -> int:
     return int(left) if left > 0 else 0
 
 def kb_balance_self(uid: int) -> Optional[InlineKeyboardMarkup]:
-    if synth_left_seconds(uid) > 0:
-        return None
     kb = InlineKeyboardMarkup()
-    kb.add(_ikb_premium_counter("⚗️", "Синтез", callback_data=_balui_data(uid, "S")))
+
+    state = get_balance_chain_state(int(uid))
+    can_resume = False
+    btn_text = ""
+    if state:
+        can_resume, btn_text = _balance_chain_can_resume(int(uid), state)
+
+    if can_resume and btn_text:
+        chain_kind = str((state or {}).get("chain_kind") or "").strip()
+        if chain_kind == BALCHAIN_UPGRADE:
+            payload = (state or {}).get("payload") or {}
+            code, steps, _src, _ictype, _ictx = _upgrade_payload_parts(payload)
+            kb.add(
+                _balance_chain_upgrade_button(
+                    code,
+                    steps,
+                    callback_data=_balui_data(int(uid), "R"),
+                    style="primary"
+                )
+            )
+        else:
+            kb.add(InlineKeyboardButton(btn_text, callback_data=_balui_data(int(uid), "R"), style="primary"))
+
+    if synth_left_seconds(uid) <= 0:
+        kb.add(_ikb_premium_counter("⚗️", "Синтез", callback_data=_balui_data(uid, "S")))
+
+    return kb if getattr(kb, "keyboard", None) else None
+
+def kb_balance_resume_only(uid: int) -> Optional[InlineKeyboardMarkup]:
+    btn_text = get_balance_chain_button_text(int(uid))
+    if not btn_text:
+        return None
+
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton(btn_text, callback_data=_balui_data(int(uid), "R"), style="primary"))
     return kb
+
+def kb_balance_after_synth(uid: int) -> Optional[InlineKeyboardMarkup]:
+    state = get_balance_chain_state(int(uid))
+    if state and str(state.get("chain_kind") or "") == BALCHAIN_UPGRADE:
+        return _kb_balance_upgrade_actions(int(uid), state, from_synth=True)
+
+    kb = InlineKeyboardMarkup()
+
+    btn_text = str((state or {}).get("button_text") or "").strip()
+    if btn_text:
+        kb.add(InlineKeyboardButton(btn_text, callback_data=_balui_data(int(uid), "R", "S"), style="primary"))
+
+    if synth_left_seconds(uid) <= 0:
+        kb.add(_ikb_premium_counter("⚗️", "Синтез", callback_data=_balui_data(uid, "S")))
+
+    return kb if getattr(kb, "keyboard", None) else None
+
+def kb_open_balance(uid: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("Баланс", callback_data=_balui_data(int(uid), "B"), style="primary"))
+    return kb
+
+def _balance_chain_upgrade_button_parts(code: str, steps: int) -> tuple[str, str]:
+    skill = SKILLS.get(str(code or "").strip().upper())
+    emo = str(skill["emoji"] if skill else "").strip()
+    steps = max(1, int(steps or 1))
+
+    if steps <= 1:
+        return emo, "Повторить улучшение"
+
+    return emo, f"Повторить × {steps}"
+
+def _balance_chain_upgrade_button_text(code: str, steps: int) -> str:
+    emo, label = _balance_chain_upgrade_button_parts(code, steps)
+    return f"{label} {emo}".strip()
+
+def _balance_chain_upgrade_button(
+    code: str,
+    steps: int,
+    *,
+    callback_data: str,
+    style: str = "primary"
+):
+    emo, label = _balance_chain_upgrade_button_parts(code, steps)
+    return _ikb_premium_lead(
+        emo,
+        label,
+        callback_data=callback_data,
+        style=style
+    )
+
+def _balance_chain_upgrade_skill_token(code: str) -> str:
+    skill = SKILLS.get(str(code or "").strip().upper())
+    if skill:
+        return str(skill.get("title_2") or "").strip()
+    return str(code or "").strip().lower()
+
+def _balance_chain_can_resume(uid: int, state: dict) -> tuple[bool, str]:
+    if not state:
+        return False, ""
+
+    kind = str(state.get("chain_kind") or "").strip()
+    payload = state.get("payload") or {}
+    if not isinstance(payload, dict):
+        payload = {}
+
+    ensure_lab_exists(int(uid))
+    row = db_one(
+        "SELECT COALESCE(all_bio_res,0) AS r, COALESCE(all_bio_mater,0) AS m, COALESCE(skill_points,0) AS sp "
+        "FROM labs WHERE user_id=?",
+        (int(uid),)
+    )
+    have_r = int(row["r"] or 0) if row else 0
+    have_m = int(row["m"] or 0) if row else 0
+
+    if kind == BALCHAIN_UPGRADE:
+        code = str(payload.get("code") or "").strip().upper()
+        steps = max(1, int(payload.get("steps") or 1))
+        if code not in SKILLS:
+            return False, ""
+
+        lab = get_lab(int(uid))
+        cur = int(_rget(lab, SKILLS[code]["col"], 1) or 1)
+        cost = _upgrade_cost(SKILL_N1[code], cur, steps)
+        if (have_r + have_m) >= int(cost):
+            return True, _balance_chain_upgrade_button_text(code, steps)
+        return False, ""
+
+    if kind == BALCHAIN_CORP_TRANSFER:
+        cmd = str(payload.get("cmd") or "").strip()
+        amount = max(1, int(payload.get("amount") or 0))
+        plan = _corp_transfer_plan(int(uid), cmd, int(amount))
+        if bool(plan.get("ok")):
+            return True, "Повторить перевод"
+        return False, ""
+
+    if kind == BALCHAIN_VACCINE:
+        fever_until, _fever_pat, vac_cnt = get_fever_and_vaccines(int(uid))
+        now = now_ts()
+        if fever_until <= now:
+            return False, ""
+
+        if int(vac_cnt) > 0:
+            return True, "Использовать вакцину"
+
+        need = int(get_vaccine_price(int(uid)))
+        if (have_r + have_m) >= need:
+            return True, "Повторить покупку"
+        return False, ""
+
+    if kind == BALCHAIN_DUEL_BET:
+        amount = max(1, int(payload.get("amount") or 0))
+        if have_m >= amount:
+            return True, "Повторить ставку"
+        return False, ""
+
+    if kind == BALCHAIN_DUEL_STAKE:
+        stake_amount = max(1, int(payload.get("stake_amount") or 0))
+        if have_m >= stake_amount:
+            return True, "Повторить вызов"
+        return False, ""
+
+    return False, ""
+
+def _balance_chain_fake_message(cq, uid: int, state: dict):
+    class _FakeChat:
+        pass
+
+    class _FakeMsg:
+        pass
+
+    fm = _FakeMsg()
+    fm.from_user = cq.from_user
+    fm.reply_to_message = None
+    fm.text = ""
+    fm.via_bot = None
+    fm.content_type = "text"
+    fm.date = now_ts()
+
+    fc = _FakeChat()
+    if getattr(cq, "message", None) and getattr(cq.message, "chat", None):
+        fc.id = int(cq.message.chat.id)
+        fc.type = (getattr(cq.message.chat, "type", None) or ("private" if int(fc.id) > 0 else "group"))
+        fm.message_id = int(getattr(cq.message, "message_id", 0) or 0)
+    else:
+        src_chat_id = int(state.get("source_chat_id") or 0)
+        if src_chat_id == 0:
+            src_chat_id = int(uid)
+        fc.id = int(src_chat_id)
+        fc.type = "private" if int(src_chat_id) > 0 else "group"
+        fm.message_id = int(state.get("source_message_id") or 0)
+
+    fm.chat = fc
+    return fm
+
+def _balance_chain_edit_ctx_from_cq(cq, state: dict) -> Optional[dict]:
+    if getattr(cq, "inline_message_id", None):
+        return {"inline_id": str(cq.inline_message_id)}
+
+    if getattr(cq, "message", None) and getattr(cq.message, "chat", None):
+        chat_id = int(getattr(cq.message.chat, "id", 0) or 0)
+        msg_id = int(getattr(cq.message, "message_id", 0) or 0)
+        if chat_id != 0 and msg_id != 0:
+            return {"chat_id": chat_id, "msg_id": msg_id}
+
+    src_chat_id = int(state.get("source_chat_id") or 0)
+    src_msg_id = int(state.get("source_message_id") or 0)
+    if src_chat_id != 0 and src_msg_id != 0:
+        return {"chat_id": src_chat_id, "msg_id": src_msg_id}
+
+    return None
+
+def _balance_chain_emit(message, text: str, reply_markup=None, edit_ctx: Optional[dict] = None):
+    if edit_ctx and isinstance(edit_ctx, dict):
+        inline_id = edit_ctx.get("inline_id")
+        chat_id = edit_ctx.get("chat_id")
+        msg_id = edit_ctx.get("msg_id")
+
+        if inline_id:
+            limited_edit_message_text(
+                text=text,
+                inline_id=inline_id,
+                parse_mode="HTML",
+                reply_markup=reply_markup,
+                disable_web_page_preview=True
+            )
+            return
+
+        if chat_id and msg_id:
+            limited_edit_message_text(
+                text=text,
+                chat_id=int(chat_id),
+                msg_id=int(msg_id),
+                parse_mode="HTML",
+                reply_markup=reply_markup,
+                disable_web_page_preview=True
+            )
+            return
+
+    bot.reply_to(
+        message,
+        text,
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+        reply_markup=reply_markup
+    )
+
+def _resume_vaccine_chain_from_balance(message, uid: int, edit_ctx: Optional[dict] = None):
+    fever_until, fever_pat, vac_cnt = get_fever_and_vaccines(int(uid))
+    now = now_ts()
+
+    if fever_until <= now:
+        clear_balance_chain_state(int(uid))
+        _balance_chain_emit(
+            message,
+            "📝 У вас нет горячки. Нет необходимости покупать или использовать вакцину.",
+            reply_markup=None,
+            edit_ctx=edit_ctx
+        )
+        return
+
+    if int(vac_cnt) > 0:
+        status, used = try_use_vaccine(int(uid), 1)
+        if status == "OK":
+            clear_balance_chain_state(int(uid))
+            _balance_chain_emit(
+                message,
+                "💉 Вакцина излечила вас от горячки.\n🧾 Потрачена 1 единица вакцины",
+                reply_markup=None,
+                edit_ctx=edit_ctx
+            )
+            return
+        if status == "FAIL":
+            _balance_chain_emit(
+                message,
+                VACCINE_FAIL_TEXT,
+                reply_markup=kb_vaccine_retry(int(uid)),
+                edit_ctx=edit_ctx
+            )
+            return
+        if status == "NO_VACCINE":
+            set_balance_chain_state_from_message(
+                message,
+                BALCHAIN_VACCINE,
+                "Повторить покупку",
+                {"action": "buy"}
+            )
+            _balance_chain_emit(
+                message,
+                "📝 У вас нет вакцины.",
+                reply_markup=kb_open_balance(int(uid)),
+                edit_ctx=edit_ctx
+            )
+            return
+
+        clear_balance_chain_state(int(uid))
+        _balance_chain_emit(
+            message,
+            "📝 У вас нет горячки. Нет необходимости использовать вакцину.",
+            reply_markup=None,
+            edit_ctx=edit_ctx
+        )
+        return
+
+    status, spent_res, spent_mat = try_buy_vaccine(int(uid))
+    if status == "NO_MONEY":
+        set_balance_chain_state_from_message(
+            message,
+            BALCHAIN_VACCINE,
+            "Повторить покупку",
+            {"action": "buy"}
+        )
+        _balance_chain_emit(
+            message,
+            "📝 У вас недостаточно средств.",
+            reply_markup=kb_open_balance(int(uid)),
+            edit_ctx=edit_ctx
+        )
+        return
+
+    if status == "NO_FEVER":
+        clear_balance_chain_state(int(uid))
+        _balance_chain_emit(
+            message,
+            "📝 У вас нет горячки. Нет необходимости покупать вакцину.",
+            reply_markup=None,
+            edit_ctx=edit_ctx
+        )
+        return
+
+    if status == "FAIL":
+        clear_balance_chain_state(int(uid))
+        _balance_chain_emit(
+            message,
+            VACCINE_FAIL_TEXT,
+            reply_markup=kb_vaccine_retry(int(uid)),
+            edit_ctx=edit_ctx
+        )
+        return
+
+    clear_balance_chain_state(int(uid))
+    _balance_chain_emit(
+        message,
+        "💉 Вакцина излечила вас от горячки.\n"
+        f"🧾 Потрачено {vaccine_spent_text(spent_res, spent_mat)}",
+        reply_markup=None,
+        edit_ctx=edit_ctx
+    )
+
+def _resume_balance_chain(cq, uid: int, *, force_attempt: bool = False):
+    state = get_balance_chain_state(int(uid))
+    if not state:
+        return False
+
+    can_resume, _btn_text = _balance_chain_can_resume(int(uid), state)
+    if not can_resume and not force_attempt:
+        return False
+
+    kind = str(state.get("chain_kind") or "").strip()
+    payload = state.get("payload") or {}
+    if not isinstance(payload, dict):
+        payload = {}
+
+    fake_msg = _balance_chain_fake_message(cq, int(uid), state)
+    edit_ctx = _balance_chain_edit_ctx_from_cq(cq, state)
+
+    if kind == BALCHAIN_UPGRADE:
+        code, steps, src, ictype, ictx = _upgrade_payload_parts(payload)
+        if code not in SKILLS:
+            return False
+
+        ok, txt, _final = _execute_upgrade(int(uid), code, int(steps))
+        if ok:
+            st = get_balance_chain_state(int(uid))
+            if st and str(st.get("chain_kind") or "") == BALCHAIN_UPGRADE:
+                clear_balance_chain_state(int(uid))
+
+            rm = kb_upgrade(int(uid), code, int(steps), src, ictype=ictype, ictx=ictx)
+            rm = _append_upgrade_return_buttons(rm, int(uid), src, ictype, ictx)
+            _balance_chain_emit(fake_msg, txt, reply_markup=rm, edit_ctx=edit_ctx)
+            return True
+
+        set_balance_chain_state(
+            int(uid),
+            BALCHAIN_UPGRADE,
+            _balance_chain_upgrade_button_text(code, steps),
+            _upgrade_balance_payload(code, steps, src, ictype, ictx),
+            source_chat_id=int(getattr(getattr(fake_msg, "chat", None), "id", 0) or 0),
+            source_message_id=int(getattr(fake_msg, "message_id", 0) or 0),
+        )
+
+        fail_text = _upgrade_shortage_text(int(uid))
+        rm = kb_upgrade_shortage(int(uid), code, int(steps), src, ictype=ictype, ictx=ictx, include_balance=True) if _upgrade_skill_points_count(int(uid)) > 0 else kb_open_balance(int(uid))
+        rm = _append_upgrade_return_buttons(rm, int(uid), src, ictype, ictx)
+        _balance_chain_emit(fake_msg, fail_text, reply_markup=rm, edit_ctx=edit_ctx)
+        return True
+
+    if kind == BALCHAIN_CORP_TRANSFER:
+        cmd = str(payload.get("cmd") or "").strip()
+        amount = max(1, int(payload.get("amount") or 0))
+        target_id = int(payload.get("target_id") or 0)
+        if cmd not in ("corp_send_res", "corp_send_mat") or target_id <= 0:
+            return False
+
+        plan = _corp_transfer_plan(int(uid), cmd, int(amount))
+        if not bool(plan.get("ok")):
+            set_balance_chain_state_from_message(
+                fake_msg,
+                BALCHAIN_CORP_TRANSFER,
+                "Повторить перевод",
+                {"cmd": cmd, "amount": int(amount), "target_id": int(target_id)}
+            )
+            _balance_chain_emit(
+                fake_msg,
+                _corp_transfer_shortage_error(cmd),
+                reply_markup=kb_open_balance(int(uid)),
+                edit_ctx=edit_ctx
+            )
+            return True
+
+        if bool(plan.get("mixed")) or bool(plan.get("substitute_only")):
+            set_balance_chain_state_from_message(
+                fake_msg,
+                BALCHAIN_CORP_TRANSFER,
+                "Повторить перевод",
+                {"cmd": cmd, "amount": int(amount), "target_id": int(target_id)}
+            )
+            _balance_chain_emit(
+                fake_msg,
+                _corp_transfer_mix_text(cmd, int(target_id), int(plan["res_amount"]), int(plan["mat_amount"])),
+                reply_markup=kb_corp_transfer_mix_offer(
+                    int(uid),
+                    cmd,
+                    int(target_id),
+                    int(plan["res_amount"]),
+                    int(plan["mat_amount"])
+                ),
+                edit_ctx=edit_ctx
+            )
+            return True
+
+        try:
+            ok, err = _corp_transfer_apply(
+                int(uid),
+                int(target_id),
+                res_amount=int(plan["res_amount"]),
+                mat_amount=int(plan["mat_amount"])
+            )
+        except Exception as e:
+            send_error_report("resume_corp_transfer", e)
+            _balance_chain_emit(fake_msg, "📑 Не удалось выполнить перевод.", reply_markup=None, edit_ctx=edit_ctx)
+            return True
+
+        if not ok:
+            if err in ("📝 У вас нет столько био-ресурсов.", "📝 У вас нет столько био-материалов."):
+                set_balance_chain_state_from_message(
+                    fake_msg,
+                    BALCHAIN_CORP_TRANSFER,
+                    "Повторить перевод",
+                    {"cmd": cmd, "amount": int(amount), "target_id": int(target_id)}
+                )
+                _balance_chain_emit(fake_msg, err, reply_markup=kb_open_balance(int(uid)), edit_ctx=edit_ctx)
+            else:
+                _balance_chain_emit(fake_msg, err, reply_markup=None, edit_ctx=edit_ctx)
+            return True
+
+        st = get_balance_chain_state(int(uid))
+        if st and str(st.get("chain_kind") or "") == BALCHAIN_CORP_TRANSFER:
+            clear_balance_chain_state(int(uid))
+
+        txt = _corp_transfer_success_text(
+            int(target_id),
+            int(plan["res_amount"]),
+            int(plan["mat_amount"])
+        )
+        _balance_chain_emit(fake_msg, txt, reply_markup=None, edit_ctx=edit_ctx)
+        return True
+
+    if kind == BALCHAIN_DUEL_BET:
+        amount = max(1, int(payload.get("amount") or 0))
+        target_id = int(payload.get("target_id") or 0)
+        if target_id <= 0:
+            return False
+
+        chat_id = int(getattr(getattr(fake_msg, "chat", None), "id", 0) or 0)
+
+        try:
+            ok, msg, duel_row = _duel_place_bet(int(chat_id), int(uid), int(target_id), int(amount))
+        except Exception as e:
+            send_error_report("resume_duel_bet_place", e)
+            _balance_chain_emit(fake_msg, "📑 Не удалось сделать ставку.", reply_markup=None, edit_ctx=edit_ctx)
+            return True
+
+        if not ok:
+            if msg == "📝 У вас нет столько био-материалов для ставки.":
+                set_balance_chain_state_from_message(
+                    fake_msg,
+                    BALCHAIN_DUEL_BET,
+                    "Повторить ставку",
+                    {"amount": int(amount), "target_id": int(target_id)}
+                )
+                _balance_chain_emit(fake_msg, msg, reply_markup=kb_open_balance(int(uid)), edit_ctx=edit_ctx)
+            else:
+                _balance_chain_emit(fake_msg, msg, reply_markup=None, edit_ctx=edit_ctx)
+            return True
+
+        with chat_name_context(int(chat_id)):
+            target_tag = public_user_tag(int(target_id))
+
+        st = get_balance_chain_state(int(uid))
+        if st and str(st.get("chain_kind") or "") == BALCHAIN_DUEL_BET:
+            clear_balance_chain_state(int(uid))
+
+        _balance_chain_emit(
+            fake_msg,
+            f"💰 Вы сделали ставку на дуэлянта <b>{target_tag}</b> в размере 💊 {_duel_stake_text(int(amount))}\n"
+            "Дождитесь окончания дуэли. Мы сообщим вам, если ваша ставка сыграет.",
+            reply_markup=None,
+            edit_ctx=edit_ctx
+        )
+        return True
+
+    if kind == BALCHAIN_DUEL_STAKE:
+        stake_amount = max(1, int(payload.get("stake_amount") or 0))
+        target_id = int(payload.get("target_id") or 0)
+        if target_id <= 0:
+            return False
+
+        chat_id = int(getattr(getattr(fake_msg, "chat", None), "id", 0) or 0)
+
+        if _duel_user_has_active_duel_in_chat(int(chat_id), int(uid)) or _duel_user_has_outgoing_pending_invite_in_chat(int(chat_id), int(uid)):
+            _balance_chain_emit(fake_msg, "📑 Вы уже участвуете в дуэли или ожидаете ответа на свой вызов в этом чате.", reply_markup=None, edit_ctx=edit_ctx)
+            return True
+
+        if _duel_user_has_active_duel_in_chat(int(chat_id), int(target_id)):
+            _balance_chain_emit(fake_msg, "📑 Этот пользователь уже участвует в другой дуэли в этом чате.", reply_markup=None, edit_ctx=edit_ctx)
+            return True
+
+        if stake_amount > 0 and not _duel_take_materials(int(uid), int(stake_amount)):
+            set_balance_chain_state_from_message(
+                fake_msg,
+                BALCHAIN_DUEL_STAKE,
+                "Повторить вызов",
+                {"stake_amount": int(stake_amount), "target_id": int(target_id)}
+            )
+            _balance_chain_emit(
+                fake_msg,
+                "📝 У вас недостаточно био-материалов для дуэли со ставкой.",
+                reply_markup=kb_open_balance(int(uid)),
+                edit_ctx=edit_ctx
+            )
+            return True
+
+        st = get_balance_chain_state(int(uid))
+        if st and str(st.get("chain_kind") or "") == BALCHAIN_DUEL_STAKE:
+            clear_balance_chain_state(int(uid))
+
+        invite_id = 0
+        try:
+            invite_id = _duel_create_invite(int(chat_id), int(uid), int(target_id), int(stake_amount))
+            txt = _duel_invite_text(int(chat_id), int(uid), int(target_id), int(stake_amount))
+            rm = kb_duel_invite(int(invite_id), int(target_id), int(uid))
+
+            _balance_chain_emit(fake_msg, txt, reply_markup=rm, edit_ctx=edit_ctx)
+
+            if edit_ctx and edit_ctx.get("chat_id") and edit_ctx.get("msg_id"):
+                _duel_mark_invite_message(int(invite_id), int(edit_ctx["chat_id"]), int(edit_ctx["msg_id"]))
+        except Exception as e:
+            if int(stake_amount or 0) > 0:
+                _duel_refund_materials(int(uid), int(stake_amount))
+            try:
+                if int(invite_id or 0) > 0:
+                    db_exec("DELETE FROM duel_invites WHERE invite_id=?", (int(invite_id),), commit=True)
+            except Exception:
+                pass
+            send_error_report("resume_duel_create_invite", e)
+            _balance_chain_emit(fake_msg, "📑 Не удалось отправить вызов на дуэль.", reply_markup=None, edit_ctx=edit_ctx)
+            return True
+
+        return True
+
+    if kind == BALCHAIN_VACCINE:
+        _resume_vaccine_chain_from_balance(fake_msg, int(uid), edit_ctx=edit_ctx)
+        return True
+
+    return False
 
 def kb_synth(uid: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("Баланс", callback_data=_balui_data(uid, "B")))
+    kb.add(InlineKeyboardButton("Баланс", callback_data=_balui_data(uid, "B", "S"), style="primary"))
     return kb
 
 def synth_attempt(uid: int) -> str:
@@ -12770,25 +14573,140 @@ def handle_synth_command(message):
     bot.reply_to(message, text, reply_markup=kb_synth(uid), disable_web_page_preview=True)
 
 #             краткая сводка
-def _pathogens_ui_data(uid: int, kind: str, count: int = 1) -> str:
-    return f"PATHUI:{int(uid)}:{kind}:{int(count)}"
+def _normalize_quick_infect_pref(mode: str, chat_filter: str = "n") -> tuple[str, str]:
+    m = str(mode or "r").strip().lower()
+    f = str(chat_filter or "n").strip().lower()
+
+    if m not in ("r", "p", "m", "e", "c"):
+        m = "r"
+
+    if m != "c":
+        f = "n"
+    elif f not in ("n", "p", "m", "e"):
+        f = "n"
+
+    return m, f
+
+def _quick_infect_pref_row(user_id: int):
+    return db_one(
+        "SELECT user_id, mode, chat_filter, updated_at "
+        "FROM quick_infect_prefs WHERE user_id=? LIMIT 1",
+        (int(user_id),)
+    )
+
+def get_quick_infect_pref(user_id: int) -> tuple[str, str]:
+    row = _quick_infect_pref_row(int(user_id))
+    if not row:
+        return "r", "n"
+    return _normalize_quick_infect_pref(row["mode"], row["chat_filter"])
+
+def set_quick_infect_pref(user_id: int, mode: str, chat_filter: str = "n"):
+    m, f = _normalize_quick_infect_pref(mode, chat_filter)
+    db_exec(
+        "INSERT INTO quick_infect_prefs(user_id, mode, chat_filter, updated_at) VALUES (?,?,?,?) "
+        "ON CONFLICT(user_id) DO UPDATE SET "
+        "mode=excluded.mode, chat_filter=excluded.chat_filter, updated_at=excluded.updated_at",
+        (int(user_id), str(m), str(f), int(now_ts())),
+        commit=True
+    )
+
+def _quick_infect_mode_text(mode: str, chat_filter: str = "n") -> str:
+    m, f = _normalize_quick_infect_pref(mode, chat_filter)
+
+    if m == "r":
+        return "Случайная цель"
+    if m == "p":
+        return "Случайная цель с большим био-опытом"
+    if m == "m":
+        return "Случайная цель с меньшим био-опытом"
+    if m == "e":
+        return "Случайная цель с равным био-опытом"
+
+    if f == "p":
+        return "Случайная цель из чата с большим био-опытом"
+    if f == "m":
+        return "Случайная цель из чата с меньшим био-опытом"
+    if f == "e":
+        return "Случайная цель из чата с равным био-опытом"
+    return "Случайная цель из чата"
+
+def _parse_quick_infect_pref_args(args: str) -> tuple[Optional[str], str, str]:
+    s = (args or "").strip()
+    if not s:
+        return None, "n", ""
+
+    toks = s.split()
+    key = toks[0].lower()
+    mode = INF_MODE_SYNONYMS.get(key)
+    if not mode:
+        return None, "n", "📑 Укажите режим патронов: <code>р</code> / <code>+</code> / <code>-</code> / <code>=</code> / <code>чат</code>"
+
+    if mode != "c":
+        if len(toks) > 1:
+            return None, "n", "📑 Для этого режима указывается только одна переменная: <code>р</code> / <code>+</code> / <code>-</code> / <code>=</code>"
+        return mode, "n", ""
+
+    flt = "n"
+    if len(toks) >= 2:
+        flt = INF_CHAT_FILTER_SYNONYMS.get(toks[1].lower(), "")
+        if not flt:
+            return None, "n", "📑 Для режима <code>чат</code> допустимы только фильтры: <code>+</code> / <code>-</code> / <code>=</code>"
+
+    if len(toks) > 2:
+        return None, "n", "📑 Для режима <code>чат</code> допустима только одна дополнительная переменная: <code>+</code> / <code>-</code> / <code>=</code>"
+
+    return mode, flt or "n", ""
+
+def _pathogens_ui_data(uid: int, kind: str, count: int = 1, mode: str = "", chat_filter: str = "n") -> str:
+    if str(kind or "") != "R":
+        return f"PATHUI:{int(uid)}:{kind}:{int(count)}"
+
+    m, f = _normalize_quick_infect_pref(mode, chat_filter)
+    return f"PATHUI:{int(uid)}:{kind}:{int(count)}:{m}:{f}"
 
 def _pathogens_ui_parse(data: str):
     try:
         p = (data or "").split(":")
-        if len(p) != 4 or p[0] != "PATHUI":
+        if not p or p[0] != "PATHUI":
             return None
-        return int(p[1]), str(p[2]), int(p[3])
+
+        if len(p) == 4:
+            return {
+                "owner_id": int(p[1]),
+                "kind": str(p[2]),
+                "count": int(p[3]),
+                "mode": "",
+                "chat_filter": "n",
+            }
+
+        if len(p) == 6:
+            return {
+                "owner_id": int(p[1]),
+                "kind": str(p[2]),
+                "count": int(p[3]),
+                "mode": str(p[4]),
+                "chat_filter": str(p[5]),
+            }
+
+        return None
     except Exception:
         return None
 
 def kb_pathogens(uid: int) -> InlineKeyboardMarkup:
+    mode, chat_filter = get_quick_infect_pref(int(uid))
+
     kb = InlineKeyboardMarkup()
-    kb.row(_ikb("Провести быстрое заражение", callback_data=_pathogens_ui_data(uid, "R", 1), style="success"))
     kb.row(
-        _ikb("× 2", callback_data=_pathogens_ui_data(uid, "R", 2), style="success"),
-        _ikb("× 5", callback_data=_pathogens_ui_data(uid, "R", 5), style="success"),
-        _ikb("× 10", callback_data=_pathogens_ui_data(uid, "R", 10), style="success"),
+        _ikb(
+            "Провести быстрое заражение",
+            callback_data=_pathogens_ui_data(uid, "R", 1, mode, chat_filter),
+            style="success"
+        )
+    )
+    kb.row(
+        _ikb("× 2", callback_data=_pathogens_ui_data(uid, "R", 2, mode, chat_filter), style="success"),
+        _ikb("× 5", callback_data=_pathogens_ui_data(uid, "R", 5, mode, chat_filter), style="success"),
+        _ikb("× 10", callback_data=_pathogens_ui_data(uid, "R", 10, mode, chat_filter), style="success"),
     )
     return kb
 
@@ -12796,16 +14714,20 @@ def render_pathogens_info(uid: int) -> str:
     ensure_lab_exists(int(uid))
     lab = get_lab(int(uid))
     pathogen_name = (lab["pathogen_name"] or "").strip() or "неизвестный патоген"
+    mode, chat_filter = get_quick_infect_pref(int(uid))
 
     lines = []
     lines.append("📋 Краткая сводка")
     lines.append(f'🏷 Имя патогена: {h(pathogen_name)}')
+    lines.append(f'🎯 {_quick_infect_mode_text(mode, chat_filter)}')
+    lines.append("")
     lines.append(f'🧪 Кол-во патогенов: {int(lab["ready_pathogens"] or 0)} из {int(lab["total_pathogens"] or 0)}')
     npi = int(lab["next_pathogen_in"] or 0)
     if npi > 0:
         lines.append(f'⏱️ Новый патоген через {_format_hms(npi)}')
     else:
         lines.append('⏱️ Достигнут лимит производства')
+
     return "\n".join(lines)
 
 def kb_pathogen_info(uid: int) -> InlineKeyboardMarkup:
@@ -13192,7 +15114,7 @@ def on_new_chat_members(message):
                 f"🔬Для вашего удобства в пользовании ботом, рекомендую ознакомиться со "
                 f'<a href="{h(URL_COMMANDS)}">списком всех команд</a>.\n\n'
                 "⚪️ В целях безопасности от спама и стабильной работы в боте по умолчанию установлен лимит на ответ в 2-3 секунды\n"
-                "❗Для более корректной работы команд, рекомендую выдать мне приписку администратора. Права администратора выдавать не обязательно.\n\n"
+                "❗Для более корректной работы команд и обновления списков чата, рекомендую выдать мне приписку администратора. Права администратора выдавать не обязательно.\n\n"
                 f'Остались вопросы? Можете обратиться в <a href="{h(URL_SUPPORT_CHAT)}">наш официальный чат тех.поддержки</a>.'
             )
             bot.send_message(message.chat.id, txt, disable_web_page_preview=True)
@@ -13388,11 +15310,24 @@ def cb_buy_vaccine(cq):
         if status == "NO_FEVER":
             text = "📝 У вас нет горячки. Нет необходимости покупать вакцину."
         elif status == "NO_MONEY":
+            source_chat_id = int(getattr(getattr(cq, "message", None), "chat", None).id) if getattr(cq, "message", None) and getattr(cq.message, "chat", None) else 0
+            source_message_id = int(getattr(getattr(cq, "message", None), "message_id", 0) or 0)
+            set_balance_chain_state(
+                int(uid),
+                BALCHAIN_VACCINE,
+                "Повторить покупку",
+                {"action": "buy"},
+                source_chat_id=source_chat_id,
+                source_message_id=source_message_id
+            )
             text = "📝 У вас недостаточно средств."
+            rm = kb_open_balance(int(uid))
         elif status == "FAIL":
+            clear_balance_chain_state(int(uid))
             text = VACCINE_FAIL_TEXT
             rm = kb_vaccine_retry(uid)
         else:
+            clear_balance_chain_state(int(uid))
             text = (
                 "💉 Вакцина излечила вас от горячки.\n"
                 f"🧾 Потрачено {vaccine_spent_text(spent_res, spent_mat)}"
@@ -13404,7 +15339,7 @@ def cb_buy_vaccine(cq):
                 chat_id=cq.message.chat.id,
                 msg_id=cq.message.message_id,
                 parse_mode="HTML",
-                reply_markup=None,
+                reply_markup=rm,
                 disable_web_page_preview=True
             )
         if cq.message:
@@ -13413,7 +15348,7 @@ def cb_buy_vaccine(cq):
                 chat_id=cq.message.chat.id,
                 msg_id=cq.message.message_id,
                 parse_mode="HTML",
-                reply_markup=None,
+                reply_markup=rm,
                 disable_web_page_preview=True
             )
         bot.answer_callback_query(cq.id)
@@ -13638,7 +15573,7 @@ def cb_autoanswer_toggle(cq):
 @bot.callback_query_handler(func=lambda cq: (cq.data or "").startswith(f"{BALUI_TAG}:"))
 def cb_balance_synth_ui(cq):
     try:
-        uid, act = _balui_parse(cq.data or "")
+        uid, act, extra = _balui_parse(cq.data or "")
         if uid is None:
             bot.answer_callback_query(cq.id)
             return
@@ -13647,12 +15582,23 @@ def cb_balance_synth_ui(cq):
             bot.answer_callback_query(cq.id)
             return
 
+        if act == "R":
+            force_attempt = (str(extra or "").strip().upper() == "S")
+            if not _resume_balance_chain(cq, int(uid), force_attempt=force_attempt):
+                bot.answer_callback_query(cq.id, "Повторить действие пока нельзя.", show_alert=False)
+                return
+            bot.answer_callback_query(cq.id)
+            return
+
         if act == "S":
             text = synth_attempt(uid)
             rm = kb_synth(uid)
         elif act == "B":
             text = render_balance(uid)
-            rm = kb_balance_self(uid)
+            if str(extra or "").strip().upper() == "S":
+                rm = kb_balance_after_synth(uid)
+            else:
+                rm = kb_balance_self(uid)
         else:
             bot.answer_callback_query(cq.id)
             return
@@ -13774,7 +15720,12 @@ def cb_pathogens_ui(cq):
             bot.answer_callback_query(cq.id)
             return
 
-        owner_id, kind, count = info
+        owner_id = int(info["owner_id"])
+        kind = str(info["kind"])
+        count = int(info["count"])
+        mode = str(info.get("mode") or "")
+        chat_filter = str(info.get("chat_filter") or "n")
+
         if int(cq.from_user.id) != int(owner_id):
             bot.answer_callback_query(cq.id)
             return
@@ -13813,7 +15764,36 @@ def cb_pathogens_ui(cq):
 
         parsed = _P()
         if kind == "R":
-            parsed.args = f"р {int(count)}"
+            if not mode:
+                mode, chat_filter = get_quick_infect_pref(int(owner_id))
+
+            mode, chat_filter = _normalize_quick_infect_pref(mode, chat_filter)
+
+            if mode == "c":
+                msg_chat = getattr(cq, "message", None)
+                msg_chat_type = (getattr(getattr(msg_chat, "chat", None), "type", "") or "").lower()
+                if msg_chat_type not in ("group", "supergroup"):
+                    bot.answer_callback_query(cq.id, "📑 Режим «чат» нельзя использовать в личных сообщениях бота.", show_alert=True)
+                    return
+
+                fl = ""
+                if chat_filter == "p":
+                    fl = " больше"
+                elif chat_filter == "m":
+                    fl = " меньше"
+                elif chat_filter == "e":
+                    fl = " равный"
+
+                parsed.args = f"чат {int(count)}{fl}".strip()
+
+            elif mode == "p":
+                parsed.args = f"больше {int(count)}"
+            elif mode == "m":
+                parsed.args = f"меньше {int(count)}"
+            elif mode == "e":
+                parsed.args = f"равный {int(count)}"
+            else:
+                parsed.args = f"р {int(count)}"
 
         class _FakeChat:
             pass
@@ -14108,6 +16088,96 @@ def cb_corp_inv_reject(cq):
         except Exception:
             pass
 
+@bot.callback_query_handler(func=lambda cq: (cq.data or "").startswith(f"{CB_CORP_TX}:"))
+def cb_corp_transfer_mix(cq):
+    try:
+        p = (cq.data or "").split(":")
+        if len(p) != 7:
+            bot.answer_callback_query(cq.id)
+            return
+
+        _tag, action, uid_s, mode_s, target_id_s, res_s, mat_s = p
+        uid = int(uid_s)
+        target_id = int(target_id_s)
+        res_amount = int(res_s)
+        mat_amount = int(mat_s)
+        cmd = _corp_transfer_cmd_from_mode(mode_s)
+
+        if int(cq.from_user.id) != int(uid):
+            bot.answer_callback_query(cq.id)
+            return
+
+        if cmd not in ("corp_send_res", "corp_send_mat") or target_id <= 0:
+            bot.answer_callback_query(cq.id)
+            return
+
+        def _edit_current(text: str, rm=None):
+            if cq.inline_message_id:
+                limited_edit_message_text(
+                    text=text,
+                    inline_id=cq.inline_message_id,
+                    parse_mode="HTML",
+                    reply_markup=rm,
+                    disable_web_page_preview=True
+                )
+            else:
+                limited_edit_message_text(
+                    text=text,
+                    chat_id=cq.message.chat.id,
+                    msg_id=cq.message.message_id,
+                    parse_mode="HTML",
+                    reply_markup=rm,
+                    disable_web_page_preview=True
+                )
+
+        if str(action or "").upper() == "C":
+            st = get_balance_chain_state(int(uid))
+            if st and str(st.get("chain_kind") or "") == BALCHAIN_CORP_TRANSFER:
+                clear_balance_chain_state(int(uid))
+            _edit_current("📝 Перевод прерван.", rm=None)
+            bot.answer_callback_query(cq.id)
+            return
+
+        ok, err = _corp_transfer_apply(
+            int(uid),
+            int(target_id),
+            res_amount=int(res_amount),
+            mat_amount=int(mat_amount)
+        )
+
+        if not ok:
+            if err in ("📝 У вас нет столько био-ресурсов.", "📝 У вас нет столько био-материалов."):
+                set_balance_chain_state(
+                    int(uid),
+                    BALCHAIN_CORP_TRANSFER,
+                    "Повторить перевод",
+                    {"cmd": cmd, "amount": int(res_amount + mat_amount), "target_id": int(target_id)},
+                    source_chat_id=int(getattr(getattr(cq, "message", None), "chat", None).id) if getattr(cq, "message", None) and getattr(cq.message, "chat", None) else 0,
+                    source_message_id=int(getattr(getattr(cq, "message", None), "message_id", 0) or 0)
+                )
+                _edit_current(err, rm=kb_open_balance(int(uid)))
+            else:
+                _edit_current(err, rm=None)
+
+            bot.answer_callback_query(cq.id)
+            return
+
+        st = get_balance_chain_state(int(uid))
+        if st and str(st.get("chain_kind") or "") == BALCHAIN_CORP_TRANSFER:
+            clear_balance_chain_state(int(uid))
+
+        _edit_current(
+            _corp_transfer_success_text(int(target_id), int(res_amount), int(mat_amount)),
+            rm=None
+        )
+        bot.answer_callback_query(cq.id)
+    except Exception as e:
+        send_error_report("cb_corp_transfer_mix", e)
+        try:
+            bot.answer_callback_query(cq.id)
+        except Exception:
+            pass
+
 @bot.callback_query_handler(func=lambda cq: (cq.data or "").startswith(f"{CORPUI_TAG}:"))
 def cb_corpui(cq):
     try:
@@ -14136,6 +16206,12 @@ def cb_corpui(cq):
                 bot.answer_callback_query(cq.id)
                 return
             text, rm = render_corp_members_text(corp, viewer_id)
+
+        elif act == "R":
+            if not corp_is_owner_or_deputy(corp_id, viewer_id):
+                bot.answer_callback_query(cq.id)
+                return
+            text, rm = render_corp_requests_text(corp, viewer_id)
 
         elif act in ("O", "C"):
             if not corp_is_owner_or_deputy(corp_id, viewer_id):
@@ -14249,7 +16325,7 @@ def cb_settings_ui(cq):
                 (int(uid),)
             )
             if not lab_row or int(lab_row["la"] or 0) != 1:
-                bot.answer_callback_query(cq.id, "У вас нет активной Лаборатории.", show_alert=True)
+                bot.answer_callback_query(cq.id, "📑 У вас нет активной Лаборатории.", show_alert=True)
                 return
 
             if act == "HB":
@@ -14333,7 +16409,7 @@ def cb_report_ui(cq):
             return
 
         if act == "RESTORE" and not get_deleted_lab_row(int(uid)):
-            bot.answer_callback_query(cq.id, "У вас нет сохранённой лаборатории для восстановления.", show_alert=True)
+            bot.answer_callback_query(cq.id, "📑 У вас нет сохранённой лаборатории для восстановления.", show_alert=True)
             return
 
         report_set_state(int(uid), act, "await_content")
@@ -14763,14 +16839,16 @@ def cb_lab_delete_ok(cq):
             return
 
         ok, text = _perform_lab_delete(int(target_uid))
+        out_text = build_inactive_lab_text(int(target_uid), after_delete=True) if ok else text
+        rm = kb_inactive_lab_actions(int(target_uid)) if ok else None
 
         if cq.message:
             limited_edit_message_text(
-                text=text,
+                text=out_text,
                 chat_id=cq.message.chat.id,
                 msg_id=cq.message.message_id,
                 parse_mode="HTML",
-                reply_markup=None,
+                reply_markup=rm,
                 disable_web_page_preview=True
             )
 
@@ -14811,6 +16889,107 @@ def cb_lab_delete_cancel(cq):
         except Exception:
             pass
 
+@bot.callback_query_handler(func=lambda cq: (cq.data or "").startswith(f"{CB_LAB_CREATE}:"))
+def cb_lab_create(cq):
+    try:
+        p = (cq.data or "").split(":")
+        if len(p) != 3:
+            bot.answer_callback_query(cq.id)
+            return
+
+        target_uid = int(p[2])
+        if int(cq.from_user.id) != int(target_uid):
+            bot.answer_callback_query(cq.id)
+            return
+
+        if not is_lab_active(int(target_uid)):
+            ensure_lab_exists(int(target_uid))
+            if get_deleted_lab_row(int(target_uid)):
+                _set_deleted_lab_restore_offer_suppressed(int(target_uid), True)
+            mark_lab_active(int(target_uid))
+            _maybe_apply_deleted_lab_bonus(int(target_uid))
+
+        is_inline = bool(getattr(cq, "inline_message_id", None))
+        text = render_lab(int(target_uid))
+        rm = kb_lab_dossier_inline(int(target_uid)) if is_inline else kb_lab_dossier(int(target_uid))
+        _lab_state_edit_current(cq, text, rm=rm)
+
+        bot.answer_callback_query(cq.id, "Лаборатория создана.")
+    except Exception as e:
+        send_error_report("cb_lab_create", e)
+        try:
+            bot.answer_callback_query(cq.id)
+        except Exception:
+            pass
+
+@bot.callback_query_handler(func=lambda cq: (cq.data or "").startswith(f"{CB_LAB_RESTORE}:"))
+def cb_lab_restore(cq):
+    try:
+        p = (cq.data or "").split(":")
+        if len(p) != 3:
+            bot.answer_callback_query(cq.id)
+            return
+
+        target_uid = int(p[2])
+        if int(cq.from_user.id) != int(target_uid):
+            bot.answer_callback_query(cq.id)
+            return
+
+        ok, text = _restore_deleted_lab(int(target_uid), support_mode=False)
+        if ok:
+            is_inline = bool(getattr(cq, "inline_message_id", None))
+            text = render_lab(int(target_uid))
+            rm = kb_lab_dossier_inline(int(target_uid)) if is_inline else kb_lab_dossier(int(target_uid))
+        else:
+            rm = kb_inactive_lab_actions(int(target_uid))
+
+        _lab_state_edit_current(cq, text, rm=rm)
+        bot.answer_callback_query(cq.id, "Лаборатория восстановлена." if ok else "Не удалось восстановить лабораторию.", show_alert=not ok)
+    except Exception as e:
+        send_error_report("cb_lab_restore", e)
+        try:
+            bot.answer_callback_query(cq.id)
+        except Exception:
+            pass
+
+@bot.callback_query_handler(func=lambda cq: (cq.data or "").startswith(f"{CB_LAB_RESTORE_REQ}"))
+def cb_lab_restore_req(cq):
+    try:
+        p = (cq.data or "").split(":")
+        if len(p) != 4:
+            bot.answer_callback_query(cq.id)
+            return
+
+        target_uid = int(p[3])
+        if int(cq.from_user.id) != int(target_uid):
+            bot.answer_callback_query(cq.id)
+            return
+
+        if not get_deleted_lab_row(int(target_uid)):
+            bot.answer_callback_query(cq.id, "📑 Сохранённая лаборатория не найдена.", show_alert=True)
+            return
+
+        if cq.message and cq.message.chat.type == "private":
+            report_clear_state(int(target_uid))
+            report_set_state(int(target_uid), "RESTORE", "await_content")
+            _lab_state_edit_current(cq, _report_prompt(int(target_uid), "RESTORE"), rm=None)
+            bot.answer_callback_query(cq.id)
+            return
+
+        ok, info_text = _start_restore_report_flow_for_user(int(target_uid))
+        _lab_state_edit_current(
+            cq,
+            info_text,
+            rm=kb_open_bot_pm() if not ok else None
+        )
+        bot.answer_callback_query(cq.id)
+    except Exception as e:
+        send_error_report("cb_lab_restore_req", e)
+        try:
+            bot.answer_callback_query(cq.id)
+        except Exception:
+            pass
+
 # DUELS
 CB_DUEL_ACCEPT = "DUEL_ACCEPT"
 CB_DUEL_DECLINE = "DUEL_DECLINE"
@@ -14821,6 +17000,7 @@ CB_DUEL_SURRENDER = "DUEL_SURRENDER"
 CB_DUEL_CANCEL = "DUEL_CANCEL"
 CB_DUEL_INV_CANCEL = "DUEL_INV_CANCEL"
 CB_DUEL_REMATCH = "DUEL_REMATCH"
+CB_DUEL_RANDOM = "DUEL_RANDOM"
 
 DUEL_INVITE_TIMEOUT_SEC = 5 * 60
 DUEL_TURN_TIMEOUT_SEC = 5 * 60
@@ -14842,6 +17022,16 @@ def _duel_inv_cancel_cb(invite_id: int, challenger_id: int) -> str:
 
 def _duel_rematch_cb(duel_id: int, actor_id: int = 0) -> str:
     return f"{CB_DUEL_REMATCH}:{int(duel_id)}:{int(actor_id)}"
+
+def _duel_random_cb(actor_id: int) -> str:
+    return f"{CB_DUEL_RANDOM}:{int(actor_id)}"
+
+def kb_duel_no_active(actor_id: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup()
+    kb.row(
+        _ikb("Случайная дуэль", callback_data=_duel_random_cb(int(actor_id)), style="primary")
+    )
+    return kb
 
 def kb_duel_invite(invite_id: int, target_id: int, challenger_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup(row_width=2)
@@ -14980,6 +17170,46 @@ def _duel_user_has_outgoing_pending_invite_in_chat(chat_id: int, user_id: int) -
     )
     return row is not None
 
+def _duel_user_has_any_pending_invite_in_chat(chat_id: int, user_id: int) -> bool:
+    row = db_one(
+        "SELECT 1 FROM duel_invites "
+        "WHERE chat_id=? AND status='pending' AND (challenger_id=? OR target_id=?) "
+        "LIMIT 1",
+        (int(chat_id), int(user_id), int(user_id))
+    )
+    return row is not None
+
+def _duel_random_candidate_ids(chat_id: int, actor_id: int) -> list[int]:
+    rows = db_all(
+        "SELECT cm.user_id, COALESCE(u.is_bot,0) AS is_bot "
+        "FROM chat_members cm "
+        "LEFT JOIN users u ON u.user_id=cm.user_id "
+        "WHERE cm.chat_id=? AND cm.user_id<>? "
+        "ORDER BY cm.user_id ASC",
+        (int(chat_id), int(actor_id))
+    ) or []
+
+    out: list[int] = []
+    for r in rows:
+        uid = int(r["user_id"] or 0)
+        if uid <= 0:
+            continue
+        if int(r["is_bot"] or 0) == 1:
+            continue
+        if _duel_user_has_active_duel_in_chat(int(chat_id), int(uid)):
+            continue
+        if _duel_user_has_any_pending_invite_in_chat(int(chat_id), int(uid)):
+            continue
+        out.append(int(uid))
+
+    return out
+
+def _duel_pick_random_target(chat_id: int, actor_id: int) -> int:
+    pool = _duel_random_candidate_ids(int(chat_id), int(actor_id))
+    if not pool:
+        return 0
+    return int(random.choice(pool))
+
 def _duel_latest_pending_invite_for_target(chat_id: int, target_id: int):
     return db_one(
         "SELECT invite_id, chat_id, challenger_id, target_id, stake_amount, created_at, expires_at, status, msg_chat_id, msg_id "
@@ -15109,10 +17339,10 @@ def _duel_start_rematch_from_finished(duel_row, actor_id: int) -> tuple[bool, st
 
     if stake_amount > 0:
         if not _duel_take_materials(int(challenger_id), int(stake_amount)):
-            return False, "📑 У одного из участников недостаточно био-материалов для реванша."
+            return False, "📝 У одного из участников недостаточно био-материалов для реванша."
         if not _duel_take_materials(int(target_id), int(stake_amount)):
             _duel_refund_materials(int(challenger_id), int(stake_amount))
-            return False, "📑 У одного из участников недостаточно био-материалов для реванша."
+            return False, "📝 У одного из участников недостаточно био-материалов для реванша."
 
     now = int(now_ts())
     first_turn_id = random.choice([int(challenger_id), int(target_id)])
@@ -15837,7 +18067,7 @@ def _duel_place_bet(chat_id: int, bettor_id: int, candidate_id: int, amount: int
     have_row = db_one("SELECT COALESCE(all_bio_mater,0) AS m FROM labs WHERE user_id=?", (int(bettor_id),))
     have = int(have_row["m"] or 0) if have_row else 0
     if have < int(amount):
-        return False, "📑 У вас нет столько био-материалов для ставки.", duel_row
+        return False, "📝 У вас нет столько био-материалов для ставки.", duel_row
 
     old_bet = _duel_bet_by_user(int(duel_id), int(bettor_id))
     if old_bet:
@@ -16241,7 +18471,7 @@ def _duel_accept_invite(invite_id: int, actor_id: int, *, edit_invite_message: b
         return False, "📑 Вы уже участвуете в другой дуэли в этом чате."
 
     if stake_amount > 0 and not _duel_take_materials(int(target_id), int(stake_amount)):
-        return False, "📑 У вас недостаточно био-материалов для дуэли со ставкой."
+        return False, "📝 У вас недостаточно био-материалов для дуэли со ставкой."
 
     now = int(now_ts())
     first_turn_id = random.choice([int(challenger_id), int(target_id)])
@@ -16387,11 +18617,24 @@ def handle_duel_commands(message, parsed: Parsed):
             return
 
         if not ok:
-            bot.reply_to(message, msg)
+            if msg == "📝 У вас нет столько био-материалов для ставки.":
+                set_balance_chain_state_from_message(
+                    message,
+                    BALCHAIN_DUEL_BET,
+                    "Повторить ставку",
+                    {"amount": int(amount), "target_id": int(target_id)}
+                )
+                bot.reply_to(message, msg, reply_markup=kb_open_balance(int(uid)))
+            else:
+                bot.reply_to(message, msg)
             return
 
         with chat_name_context(int(chat_id)):
             target_tag = public_user_tag(int(target_id))
+
+        st = get_balance_chain_state(int(uid))
+        if st and str(st.get("chain_kind") or "") == BALCHAIN_DUEL_BET:
+            clear_balance_chain_state(int(uid))
 
         bot.reply_to(
             message,
@@ -16412,7 +18655,10 @@ def handle_duel_commands(message, parsed: Parsed):
             if parsed.cmd == "duel_accept":
                 ok, msg = _duel_accept_invite(int(inv["invite_id"]), int(uid), edit_invite_message=False)
                 if not ok:
-                    bot.reply_to(message, msg)
+                    if msg == "📝 У вас недостаточно био-материалов для дуэли со ставкой.":
+                        bot.reply_to(message, msg, reply_markup=kb_open_balance(int(uid)))
+                    else:
+                        bot.reply_to(message, msg)
                     return
 
                 duel_row = _duel_active_by_user_in_chat(int(chat_id), int(uid))
@@ -16468,7 +18714,11 @@ def handle_duel_commands(message, parsed: Parsed):
     
         duel_row = _duel_active_by_user_in_chat(int(chat_id), int(uid))
         if not duel_row:
-            bot.reply_to(message, "📑 В этом чате у вас нет активной дуэли.")
+            bot.reply_to(
+                message,
+                "📑 В этом чате у вас нет активной дуэли.",
+                reply_markup=kb_duel_no_active(int(uid))
+            )
             return
     
         try:
@@ -16491,7 +18741,11 @@ def handle_duel_commands(message, parsed: Parsed):
     if parsed.cmd in ("duel_fire", "duel_aim", "duel_break_aim", "duel_surrender"):
         duel_row = _duel_active_by_user_in_chat(int(chat_id), int(uid))
         if not duel_row:
-            bot.reply_to(message, "📑 В этом чате у вас нет активной дуэли.")
+            bot.reply_to(
+                message,
+                "📑 В этом чате у вас нет активной дуэли.",
+                reply_markup=kb_duel_no_active(int(uid))
+            )
             return
 
         action_map = {
@@ -16551,8 +18805,22 @@ def handle_duel_commands(message, parsed: Parsed):
         return
 
     if stake_amount > 0 and not _duel_take_materials(int(uid), int(stake_amount)):
-        bot.reply_to(message, "📑 У вас недостаточно био-материалов для дуэли со ставкой.")
+        set_balance_chain_state_from_message(
+            message,
+            BALCHAIN_DUEL_STAKE,
+            "Повторить вызов",
+            {"stake_amount": int(stake_amount), "target_id": int(target_id)}
+        )
+        bot.reply_to(
+            message,
+            "📝 У вас недостаточно био-материалов для дуэли со ставкой.",
+            reply_markup=kb_open_balance(int(uid))
+        )
         return
+
+    st = get_balance_chain_state(int(uid))
+    if st and str(st.get("chain_kind") or "") == BALCHAIN_DUEL_STAKE:
+        clear_balance_chain_state(int(uid))
 
     try:
         invite_id = _duel_create_invite(int(chat_id), int(uid), int(target_id), int(stake_amount))
@@ -16575,6 +18843,78 @@ def handle_duel_commands(message, parsed: Parsed):
         send_error_report("duel_create_invite", e)
         bot.reply_to(message, "📑 Не удалось отправить вызов на дуэль.")
         return
+
+@bot.callback_query_handler(func=lambda cq: (cq.data or "").startswith(f"{CB_DUEL_RANDOM}:"))
+def cb_duel_random(cq):
+    try:
+        parts = (cq.data or "").split(":")
+        if len(parts) != 2:
+            bot.answer_callback_query(cq.id)
+            return
+
+        actor_id = int(parts[1] or 0)
+        if int(cq.from_user.id) != int(actor_id):
+            bot.answer_callback_query(cq.id)
+            return
+
+        if not getattr(cq, "message", None) or not getattr(cq.message, "chat", None):
+            bot.answer_callback_query(cq.id)
+            return
+
+        chat_id = int(cq.message.chat.id)
+        chat_type = (getattr(cq.message.chat, "type", "") or "").lower()
+        if chat_type not in ("group", "supergroup"):
+            bot.answer_callback_query(cq.id)
+            return
+
+        def _edit_current(text: str, rm=None):
+            limited_edit_message_text(
+                text=text,
+                chat_id=int(cq.message.chat.id),
+                msg_id=int(cq.message.message_id),
+                parse_mode="HTML",
+                reply_markup=rm,
+                disable_web_page_preview=True
+            )
+
+        if _duel_user_has_active_duel_in_chat(int(chat_id), int(actor_id)) or _duel_user_has_any_pending_invite_in_chat(int(chat_id), int(actor_id)):
+            _edit_current("📑 Вы уже участвуете в дуэли или ожидаете решения по вызову в этом чате.", rm=None)
+            bot.answer_callback_query(cq.id)
+            return
+
+        target_id = _duel_pick_random_target(int(chat_id), int(actor_id))
+        if target_id <= 0:
+            _edit_current(
+                "📑 В этом чате не найден подходящий соперник для случайной дуэли.",
+                rm=kb_duel_no_active(int(actor_id))
+            )
+            bot.answer_callback_query(cq.id)
+            return
+
+        invite_id = 0
+        try:
+            invite_id = _duel_create_invite(int(chat_id), int(actor_id), int(target_id), 0)
+            txt = _duel_invite_text(int(chat_id), int(actor_id), int(target_id), 0)
+            rm = kb_duel_invite(int(invite_id), int(target_id), int(actor_id))
+
+            _edit_current(txt, rm=rm)
+            _duel_mark_invite_message(int(invite_id), int(chat_id), int(cq.message.message_id))
+        except Exception as e:
+            try:
+                if int(invite_id or 0) > 0:
+                    db_exec("DELETE FROM duel_invites WHERE invite_id=?", (int(invite_id),), commit=True)
+            except Exception:
+                pass
+            send_error_report("cb_duel_random", e)
+            _edit_current("📑 Не удалось подобрать достойного соперника для дуэли.", rm=kb_duel_no_active(int(actor_id)))
+
+        bot.answer_callback_query(cq.id)
+    except Exception as e:
+        send_error_report("cb_duel_random_outer", e)
+        try:
+            bot.answer_callback_query(cq.id)
+        except Exception:
+            pass
 
 @bot.callback_query_handler(func=lambda cq: (cq.data or "").startswith(f"{CB_DUEL_ACCEPT}:"))
 def cb_duel_accept(cq):
@@ -17971,6 +20311,7 @@ def handle_sabotage_command(message, parsed: Parsed, edit_ctx: Optional[dict] = 
     t_ids = int(t["t_ids"] or 1)
 
     p = _calc_sabotage_success_pct(a_rea, t_ips)
+    fail_p = 100.0 - float(p)
 
     ur_t = get_user_row(int(target_id))
     t_un = (ur_t["username"] or "") if ur_t else ""
@@ -18143,7 +20484,7 @@ def handle_sabotage_command(message, parsed: Parsed, edit_ctx: Optional[dict] = 
     _emit(
         "🥷 Диверсия провалилась.\n"
         f"Цель: «{target_tag}»\n"
-        f"❌ Неудача ({_fmt_pct_text(p)})\n"
+        f"❌ Неудача ({_fmt_pct_text(fail_p)})\n"
         f"🧾 Компенсация ущерба: {spent_txt}\n"
         "⏱️ КД на цель: 24 часа"
     )
@@ -18154,7 +20495,7 @@ def handle_lab_commands(message, parsed: Parsed):
     ensure_creator_is_support()
 
     if parsed.cmd not in (
-        "lab_delete", "restore_lab", "lab_delete_confirm_phrase",
+        "lab_delete", "lab_delete_now", "restore_lab", "lab_delete_confirm_phrase",
         "labname_clear", "pathogenname_clear",
         "chatname_set", "chatname_show", "chatname_clear"
     ):
@@ -18162,7 +20503,13 @@ def handle_lab_commands(message, parsed: Parsed):
 
     if parsed.cmd == "lab_delete":
         if not is_lab_active(int(uid)):
-            bot.reply_to(message, "📑 У вас нет активной Лаборатории.")
+            bot.reply_to(
+                message,
+                build_inactive_lab_text(int(uid), after_delete=False),
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=kb_inactive_lab_actions(int(uid))
+            )
             return
 
         set_lab_delete_pending(int(uid))
@@ -18175,12 +20522,47 @@ def handle_lab_commands(message, parsed: Parsed):
         )
         return
 
+    if parsed.cmd == "lab_delete_now":
+        clear_lab_delete_pending(int(uid))
+
+        if not is_lab_active(int(uid)):
+            bot.reply_to(
+                message,
+                build_inactive_lab_text(int(uid), after_delete=False),
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=kb_inactive_lab_actions(int(uid))
+            )
+            return
+
+        ok, text = _perform_lab_delete(int(uid))
+        rm = kb_inactive_lab_actions(int(uid)) if ok else None
+        out_text = build_inactive_lab_text(int(uid), after_delete=True) if ok else text
+
+        bot.reply_to(
+            message,
+            out_text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=rm
+        )
+        return
+
     if parsed.cmd == "lab_delete_confirm_phrase":
         if not has_lab_delete_pending(int(uid)):
             return
 
         ok, text = _perform_lab_delete(int(uid))
-        bot.reply_to(message, text, parse_mode="HTML", disable_web_page_preview=True)
+        rm = kb_inactive_lab_actions(int(uid)) if ok else None
+        out_text = build_inactive_lab_text(int(uid), after_delete=True) if ok else text
+
+        bot.reply_to(
+            message,
+            out_text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=rm
+        )
         return
 
     if parsed.cmd == "restore_lab":
@@ -18376,6 +20758,24 @@ def handle_lab_commands(message, parsed: Parsed):
         return
 
     if parsed.cmd == "pathogens_info":
+        pref_args = (parsed.args or "").strip()
+        if pref_args:
+            mode, chat_filter, err = _parse_quick_infect_pref_args(pref_args)
+            if err:
+                bot.reply_to(message, err, parse_mode="HTML", disable_web_page_preview=True)
+                return
+
+            if mode == "c" and message.chat.type not in ("group", "supergroup"):
+                bot.reply_to(
+                    message,
+                    "📑 Режим <code>чат</code> нельзя использовать в личных сообщениях бота.",
+                    parse_mode="HTML",
+                    disable_web_page_preview=True
+                )
+                return
+
+            set_quick_infect_pref(int(uid), mode, chat_filter)
+
         bot.reply_to(
             message,
             render_pathogens_info(int(uid)),
@@ -18397,8 +20797,7 @@ def handle_lab_commands(message, parsed: Parsed):
 
     if parsed.cmd in ("lab", "mylab"):
         _merge_placeholder_to_real_user(message.from_user)
-        mark_lab_active(int(uid))
-        _maybe_apply_deleted_lab_bonus(int(uid))
+
         if parsed.cmd == "mylab":
             target_id = int(uid)
             target_user_obj = message.from_user
@@ -18415,6 +20814,16 @@ def handle_lab_commands(message, parsed: Parsed):
 
         if target_user_obj is not None:
             capture_user_context(message, target_user_obj)
+
+        if int(target_id) == int(uid) and not is_lab_active(int(uid)):
+            bot.reply_to(
+                message,
+                build_inactive_lab_text(int(uid), after_delete=False),
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=kb_inactive_lab_actions(int(uid))
+            )
+            return
         
         tok = (parsed.args.split()[0] if parsed.args else "")
         if is_bot_target(target_id, target_user_obj, tok):
@@ -19086,30 +21495,74 @@ def handle_corp_commands(message, parsed: Parsed):
             return
 
         try:
-            if parsed.cmd == "corp_send_res":
-                ok, err = _corp_transfer_apply(int(uid), int(target_id), res_amount=int(amount), mat_amount=0)
-                if not ok:
-                    bot.reply_to(message, err)
-                    return
+            cmd = str(parsed.cmd or "").strip()
+            plan = _corp_transfer_plan(int(uid), cmd, int(amount))
 
-                word = _ru_form(int(amount), "био-ресурс", "био-ресурса", "био-ресурсов")
+            if not bool(plan.get("ok")):
+                set_balance_chain_state_from_message(
+                    message,
+                    BALCHAIN_CORP_TRANSFER,
+                    "Повторить перевод",
+                    {"cmd": cmd, "amount": int(amount), "target_id": int(target_id)}
+                )
                 bot.reply_to(
                     message,
-                    f"✅Успех. Игроку {_corp_actor_tag(int(target_id))} передано 🧬 {_fmt_k(int(amount))} {word}.",
-                    parse_mode="HTML",
-                    disable_web_page_preview=True
+                    _corp_transfer_shortage_error(cmd),
+                    reply_markup=kb_open_balance(int(uid))
                 )
                 return
 
-            ok, err = _corp_transfer_apply(int(uid), int(target_id), res_amount=0, mat_amount=int(amount))
-            if not ok:
-                bot.reply_to(message, err)
+            if bool(plan.get("mixed")) or bool(plan.get("substitute_only")):
+                bot.reply_to(
+                    message,
+                    _corp_transfer_mix_text(
+                        cmd,
+                        int(target_id),
+                        int(plan["res_amount"]),
+                        int(plan["mat_amount"])
+                    ),
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                    reply_markup=kb_corp_transfer_mix_offer(
+                        int(uid),
+                        cmd,
+                        int(target_id),
+                        int(plan["res_amount"]),
+                        int(plan["mat_amount"])
+                    )
+                )
                 return
 
-            word = _ru_form(int(amount), "био-материал", "био-материала", "био-материалов")
+            ok, err = _corp_transfer_apply(
+                int(uid),
+                int(target_id),
+                res_amount=int(plan["res_amount"]),
+                mat_amount=int(plan["mat_amount"])
+            )
+            if not ok:
+                if err in ("📝 У вас нет столько био-ресурсов.", "📝 У вас нет столько био-материалов."):
+                    set_balance_chain_state_from_message(
+                        message,
+                        BALCHAIN_CORP_TRANSFER,
+                        "Повторить перевод",
+                        {"cmd": cmd, "amount": int(amount), "target_id": int(target_id)}
+                    )
+                    bot.reply_to(message, err, reply_markup=kb_open_balance(int(uid)))
+                else:
+                    bot.reply_to(message, err)
+                return
+
+            st = get_balance_chain_state(int(uid))
+            if st and str(st.get("chain_kind") or "") == BALCHAIN_CORP_TRANSFER:
+                clear_balance_chain_state(int(uid))
+
             bot.reply_to(
                 message,
-                f"✅Успех. Игроку {_corp_actor_tag(int(target_id))} передано 💊 {_fmt_k(int(amount))} {word}.",
+                _corp_transfer_success_text(
+                    int(target_id),
+                    int(plan["res_amount"]),
+                    int(plan["mat_amount"])
+                ),
                 parse_mode="HTML",
                 disable_web_page_preview=True
             )
@@ -19216,6 +21669,19 @@ def handle_corp_commands(message, parsed: Parsed):
                 )
                 return
             corp = corp_by_id(my_cid)
+
+        if corp is None and parsed.cmd == "corp_info":
+            target_id, target_user_obj = resolve_target_from_reply_or_args(message, parsed)
+            if target_id is not None:
+                if target_user_obj is not None:
+                    capture_user_context(message, target_user_obj)
+
+                rcid, _ = get_user_corp_resolved(int(target_id))
+                if rcid > 0:
+                    corp = corp_by_id(int(rcid))
+                else:
+                    bot.reply_to(message, "📑 Этот пользователь не состоит в Корпорации.")
+                    return
 
         if corp is None and not name and message.reply_to_message and getattr(message.reply_to_message, "from_user", None):
             ru = message.reply_to_message.from_user
@@ -19866,6 +22332,11 @@ def text_router(message):
         if parsed.cmd == "owner_remove":
             handle_owner_remove_command(message, parsed)
             return
+        
+        # data base
+        if parsed.cmd in ("db_fife", "db_fife_stat", "db_fife_msg", "its"):
+            handle_owner_db_commands(message, parsed)
+            return
 
         # коффициенты заражения
         if parsed.cmd == "edit_k":
@@ -20087,11 +22558,21 @@ def text_router(message):
 
             status, spent_res, spent_mat = try_buy_vaccine(uid)
             if status == "NO_MONEY":
-                bot.reply_to(message, "📝 У вас недостаточно средств.")
+                set_balance_chain_state_from_message(
+                    message,
+                    BALCHAIN_VACCINE,
+                    "Повторить покупку",
+                    {"action": "buy"}
+                )
+                bot.reply_to(message, "📝 У вас недостаточно средств.", reply_markup=kb_open_balance(int(uid)))
             elif status == "NO_FEVER":
                 bot.reply_to(message, "📝 У вас нет горячки. Нет необходимости покупать вакцину.")
             elif status == "FAIL":
                 bot.reply_to(message, VACCINE_FAIL_TEXT, disable_web_page_preview=True, reply_markup=kb_vaccine_retry(uid))
+                st = get_balance_chain_state(int(uid))
+                if st and str(st.get("chain_kind") or "") == BALCHAIN_VACCINE:
+                    clear_balance_chain_state(int(uid))
+
             else:
                 bot.reply_to(
                     message,
@@ -20125,7 +22606,7 @@ def text_router(message):
             "lab", "mylab", "labname", "pathogenname",
             "labname_clear", "pathogenname_clear",
             "chatname_set", "chatname_show", "chatname_clear",
-            "lab_delete", "restore_lab", "lab_delete_confirm_phrase",
+            "lab_delete", "lab_delete_now", "restore_lab", "lab_delete_confirm_phrase",
             "pathogens_info", "pathogen_info"
         ):
             handle_lab_commands(message, parsed)
