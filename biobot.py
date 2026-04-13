@@ -4466,8 +4466,8 @@ def get_user_corp_resolved(user_id: int) -> tuple[int, str]:
     return cid, cname
 
 def same_corp(viewer_id: int, target_id: int) -> bool:
-    c1, _ = get_user_corp(int(viewer_id))
-    c2, _ = get_user_corp(int(target_id))
+    c1, _ = get_user_corp_resolved(int(viewer_id))
+    c2, _ = get_user_corp_resolved(int(target_id))
     return (c1 > 0) and (c1 == c2)
 
 def corp_by_name(name: str):
@@ -10555,8 +10555,20 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="buy_vaccine", args="")
 
     # использовать вакцину
-    if low == "использовать вакцину" or low.startswith("использовать вакцину"):
-        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="use_vaccine", args="")
+    if low in ("использовать вакцину", "использовать вакцин") or low.startswith(
+        ("использовать вакцину ", "использовать вакцин ")
+    ):
+        rest = ""
+        parts = t.split(" ", 2)
+    
+        if low.startswith(("использовать вакцину ", "использовать вакцин ")):
+            if len(parts) >= 3:
+                rest = parts[2].strip()
+        else:
+            if len(parts) >= 2:
+                rest = parts[1].strip()
+    
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="use_vaccine", args=rest)
 
     # модерирование
     if low in ("удалить лабу", "удалить лабораторию", "удалить лаб"):
