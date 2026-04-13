@@ -6,8 +6,11 @@ import json
 import math
 import time
 import heapq
+import shutil
 import random
+import zipfile
 import sqlite3
+import tempfile
 import calendar
 import itertools
 import functools
@@ -90,6 +93,18 @@ OLD_DB_PATH = os.path.join(OLD_DATA_DIR, "bio_war.db")
 OLD_DB_WAL_PATH = OLD_DB_PATH + "-wal"
 OLD_DB_IMPORT_MARKER_PATH = os.path.join(DATA_DIR, "old_db_import_state.json")
 os.makedirs(DATA_DIR, exist_ok=True)
+
+DB_EXPORTS_DIR = os.path.join(DATA_DIR, "db_exports")
+DB_BACKUP_DIR = os.path.join(DATA_DIR, "db_backup")
+DB_IMPORTS_DIR = os.path.join(DATA_DIR, "db_imports")
+
+DB_BACKUP_MAIN_PATH = os.path.join(DB_BACKUP_DIR, "bio_war_backup.db")
+DB_BACKUP_MAIN_WAL_PATH = DB_BACKUP_MAIN_PATH + "-wal"
+DB_BACKUP_DELETED_PATH = os.path.join(DB_BACKUP_DIR, "deleted_labs_backup.db")
+
+os.makedirs(DB_EXPORTS_DIR, exist_ok=True)
+os.makedirs(DB_BACKUP_DIR, exist_ok=True)
+os.makedirs(DB_IMPORTS_DIR, exist_ok=True)
 
 LEGACY_DB_PATH = os.path.join(BASE_DIR, "bio_war.db")
 LEGACY_DELETED_DB_PATH = os.path.join(BASE_DIR, "deleted_labs.db")
@@ -731,16 +746,57 @@ def autoanswer_trigger(defender_id: int, organizer_id: int, chat_id: int, reply_
     fever_until = int(fr["f"] if fr else 0)
     fever_pat = (fr["fp"] if fr else "") or ""
     if fever_until > now:
-        left = fever_until - now
-        txt = ( 
-            _auto_header(defender_id, chat_id, "🌡️")
-            + f"❎ Не удалось заразить {org_q}: Горячка, вызванная {_pat_for_fever(fever_pat)}, "
-            + f"время выздоровления {_format_hms(left)}"
+        auto_vac = int(lab_def["ready_vaccines"] or 0)
+    
+        if auto_vac > 0:
+            status_vac, used_vac = try_use_vaccine(defender_id, min(10, auto_vac))
+    
+            if status_vac == "OK":
+                lab_def = get_lab(defender_id)
+    
+                txt = (
+                    _auto_header(defender_id, chat_id, "💉")
+                    +f"Использовано {int(used_vac)} вакцин.\n"
+                    + f"Повторяю попытку заражения {org_q}..."
+                )
+                _auto_send_reply(chat_id, reply_to_msg_id, txt)
+    
+                fr = db_one(
+                    "SELECT COALESCE(fever_until_ts,0) AS f, COALESCE(fever_pathogen,'') AS fp FROM labs WHERE user_id=?",
+                    (defender_id,)
+                )
+                fever_until = int(fr["f"] if fr else 0)
+                fever_pat = (fr["fp"] if fr else "") or ""
+    
+            elif status_vac in ("FAIL", "NO_VACCINE"):
+                left = max(0, fever_until - now)
+                txt = (
+                    _auto_header(defender_id, chat_id, "🌡️")
+                    + f"❎ Не удалось заразить {org_q}: Горячка, вызванная {_pat_for_fever(fever_pat)}, "
+                    + f"время выздоровления {_format_hms(left)}"
+                )
+                _auto_send_reply(chat_id, reply_to_msg_id, txt)
+                db_exec(
+                    "UPDATE autoanswer_state SET waiting_hot=1, waiting_hot_since=? WHERE user_id=?",
+                    (int(now), defender_id),
+                    commit=True
+                )
+                return
+    
+        if fever_until > now:
+            left = fever_until - now
+            txt = (
+                _auto_header(defender_id, chat_id, "🌡️")
+                + f"❎ Не удалось заразить {org_q}: Горячка, вызванная {_pat_for_fever(fever_pat)}, "
+                + f"время выздоровления {_format_hms(left)}"
             )
-        _auto_send_reply(chat_id, reply_to_msg_id, txt)
-        db_exec("UPDATE autoanswer_state SET waiting_hot=1, waiting_hot_since=? WHERE user_id=?",
-                (int(now), defender_id), commit=True)
-        return
+            _auto_send_reply(chat_id, reply_to_msg_id, txt)
+            db_exec(
+                "UPDATE autoanswer_state SET waiting_hot=1, waiting_hot_since=? WHERE user_id=?",
+                (int(now), defender_id),
+                commit=True
+            )
+            return
 
     ready = int(lab_def["ready_pathogens"] or 0)
     if ready <= 0:
@@ -1071,6 +1127,163 @@ def refresh_bot_identity():
 _ERROR_REPORT_LAST: Dict[str, int] = {}
 ERROR_REPORT_COOLDOWN_SEC = 60
 
+def _service_notify_user_ids() -> List[int]:
+    ids: List[int] = []
+    seen = set()
+
+    def _add(v):
+        try:
+            uid = int(v or 0)
+        except Exception:
+            return
+        if uid <= 0 or uid in seen:
+            return
+        seen.add(uid)
+        ids.append(uid)
+
+    try:
+        ensure_creator_role_state()
+    except Exception:
+        pass
+
+    try:
+        _add(get_current_creator_id())
+    except Exception:
+        pass
+
+    try:
+        for r in (get_bot_owners() or []):
+            try:
+                _add(int(r["user_id"]))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    if not ids:
+        _add(CREATOR_ID)
+        _add(OWNER_ID)
+
+    return ids
+
+def _report_notify_user_ids() -> List[int]:
+    ids: List[int] = []
+    seen = set()
+
+    def _add(v):
+        try:
+            uid = int(v or 0)
+        except Exception:
+            return
+        if uid <= 0 or uid in seen:
+            return
+        seen.add(uid)
+        ids.append(uid)
+
+    try:
+        ensure_creator_role_state()
+    except Exception:
+        pass
+
+    try:
+        _add(get_current_creator_id())
+    except Exception:
+        pass
+
+    try:
+        for r in (get_bot_owners() or []):
+            try:
+                _add(int(r["user_id"]))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    try:
+        for r in (get_support_agents() or []):
+            try:
+                _add(int(r["user_id"]))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    if not ids:
+        for uid in _service_notify_user_ids():
+            _add(uid)
+
+    return ids
+
+def _send_message_to_report_recipients(text: str, *, parse_mode: str = "HTML", disable_web_page_preview: bool = True) -> bool:
+    ok = False
+    for uid in _report_notify_user_ids():
+        try:
+            bot.send_message(
+                int(uid),
+                text,
+                parse_mode=parse_mode,
+                disable_web_page_preview=disable_web_page_preview
+            )
+            ok = True
+        except Exception:
+            pass
+    return ok
+
+def _send_media_to_report_recipients(media_type: str, media_file_id: str, *, caption: str = "", parse_mode: Optional[str] = "HTML") -> bool:
+    ok = False
+    mtype = str(media_type or "").strip().lower()
+    fid = str(media_file_id or "").strip()
+    if not fid or mtype not in ("photo", "video"):
+        return False
+
+    for uid in _report_notify_user_ids():
+        try:
+            if mtype == "photo":
+                if caption:
+                    bot.send_photo(int(uid), fid, caption=caption, parse_mode=parse_mode)
+                else:
+                    bot.send_photo(int(uid), fid)
+            else:
+                if caption:
+                    bot.send_video(int(uid), fid, caption=caption, parse_mode=parse_mode)
+                else:
+                    bot.send_video(int(uid), fid)
+            ok = True
+        except Exception:
+            pass
+
+    return ok
+
+def _send_document_to_service_recipients(payload: bytes, filename: str, caption: str = "") -> bool:
+    ok = False
+    raw = payload if isinstance(payload, (bytes, bytearray)) else bytes(str(payload or ""), "utf-8", errors="replace")
+
+    for uid in _service_notify_user_ids():
+        try:
+            bio = io.BytesIO(raw)
+            bio.name = str(filename or "service_report.txt")
+            bot.send_document(int(uid), bio, caption=caption or None)
+            ok = True
+        except Exception:
+            pass
+
+    return ok
+
+def _send_message_to_service_recipients(text: str, *, parse_mode: str = "HTML", disable_web_page_preview: bool = True) -> bool:
+    ok = False
+    for uid in _service_notify_user_ids():
+        try:
+            bot.send_message(
+                int(uid),
+                text,
+                parse_mode=parse_mode,
+                disable_web_page_preview=disable_web_page_preview
+            )
+            ok = True
+        except Exception:
+            pass
+    return ok
+
 def send_error_report(context: str, exc: Exception | None = None) -> None:
     try:
         now = int(time.time())
@@ -1089,18 +1302,23 @@ def send_error_report(context: str, exc: Exception | None = None) -> None:
         ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
         payload = f"[{ts}] {context}\n\n{tb}".encode("utf-8", errors="replace")
 
-        bio = io.BytesIO(payload)
-        bio.name = f"bot_error_{now}.txt"
-        bot.send_document(OWNER_ID, bio, caption=f"Ошибка бота: {context}")
+        _send_document_to_service_recipients(
+            payload,
+            f"bot_error_{now}.txt",
+            caption=f"Ошибка бота: {context}"
+        )
     except Exception:
         pass
 
 def _thread_excepthook(args):
     try:
+        now = int(time.time())
         text = "".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback))
-        bio = io.BytesIO(text.encode("utf-8", errors="replace"))
-        bio.name = f"thread_error_{int(time.time())}.txt"
-        bot.send_document(OWNER_ID, bio, caption=f"Поток: {getattr(args.thread, 'name', 'thread')}")
+        _send_document_to_service_recipients(
+            text.encode("utf-8", errors="replace"),
+            f"thread_error_{now}.txt",
+            caption=f"Поток: {getattr(args.thread, 'name', 'thread')}"
+        )
     except Exception:
         pass
     
@@ -1108,10 +1326,13 @@ threading.excepthook = _thread_excepthook
 
 def _sys_excepthook(exc_type, exc_value, exc_tb):
     try:
+        now = int(time.time())
         text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
-        bio = io.BytesIO(text.encode("utf-8", errors="replace"))
-        bio.name = f"fatal_error_{int(time.time())}.txt"
-        bot.send_document(OWNER_ID, bio, caption="Необработанная ошибка")
+        _send_document_to_service_recipients(
+            text.encode("utf-8", errors="replace"),
+            f"fatal_error_{now}.txt",
+            caption="Необработанная ошибка"
+        )
     except Exception:
         pass
     sys.__excepthook__(exc_type, exc_value, exc_tb)
@@ -2147,18 +2368,6 @@ conn.execute("PRAGMA synchronous=NORMAL;")
 conn.execute("PRAGMA busy_timeout=8000;")
 conn.execute("PRAGMA wal_autocheckpoint=256;")   # ~1MB при page_size=4096
 
-def integrity_ok(c: sqlite3.Connection) -> bool:
-    try:
-        r = c.execute("PRAGMA integrity_check;").fetchone()
-        return bool(r and (r[0] == "ok" or r[0] == "OK"))
-    except Exception:
-        return False
-with DB_LOCK:
-    try:
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
-    except Exception:
-        pass
-
 _DB_COMMITS_SINCE_CKPT = 0
 
 def db_one(sql: str, params=()):
@@ -2460,6 +2669,11 @@ def _housekeeping_daemon():
         try:
             now = now_ts()
 
+            try:
+                _maybe_promote_unavailable_creator(force=False)
+            except Exception as e:
+                send_error_report("_maybe_promote_unavailable_creator", e)
+
             db_exec(
                 "UPDATE autoanswer_state "
                 "SET used=0, reset_at=?, waiting_no_pathogens=0, waiting_since=0, waiting_hot=0, waiting_hot_since=0 "
@@ -2529,6 +2743,23 @@ def init_db():
         role        TEXT NOT NULL DEFAULT 'support',
         added_by    INTEGER,
         added_at    INTEGER
+    );
+    """, commit=True)
+
+    db_exec("""
+    CREATE TABLE IF NOT EXISTS bot_creator (
+        slot_id              INTEGER PRIMARY KEY CHECK(slot_id=1),
+        user_id              INTEGER NOT NULL,
+        updated_at           INTEGER NOT NULL DEFAULT 0,
+        promoted_from_owner  INTEGER NOT NULL DEFAULT 0
+    );
+    """, commit=True)
+
+    db_exec("""
+    CREATE TABLE IF NOT EXISTS bot_owners (
+        user_id     INTEGER PRIMARY KEY,
+        added_by    INTEGER NOT NULL DEFAULT 0,
+        added_at    INTEGER NOT NULL DEFAULT 0
     );
     """, commit=True)
 
@@ -2809,6 +3040,17 @@ def init_db():
         repeat_spec   TEXT NOT NULL DEFAULT '',
         next_run_ts   INTEGER NOT NULL DEFAULT 0,
         updated_at    INTEGER NOT NULL DEFAULT 0
+    );
+    """, commit=True)
+
+    db_exec("""
+    CREATE TABLE IF NOT EXISTS db_file_exports (
+        db_id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        source_kind   TEXT NOT NULL DEFAULT '',
+        archive_path  TEXT NOT NULL DEFAULT '',
+        requested_by  INTEGER NOT NULL DEFAULT 0,
+        created_at    INTEGER NOT NULL DEFAULT 0,
+        request_text  TEXT NOT NULL DEFAULT ''
     );
     """, commit=True)
 
@@ -3867,12 +4109,287 @@ def upsert_user(tg_user):
         1 if bool(getattr(tg_user, "is_bot", False)) else 0
     ), commit=True)
 
+def get_current_creator_id() -> int:
+    row = db_one("SELECT user_id FROM bot_creator WHERE slot_id=1 LIMIT 1")
+    try:
+        uid = int(row["user_id"] or 0) if row else 0
+    except Exception:
+        uid = 0
+    return uid if uid > 0 else int(CREATOR_ID)
+
+def ensure_creator_role_state():
+    row = db_one("SELECT user_id FROM bot_creator WHERE slot_id=1 LIMIT 1")
+    try:
+        current_uid = int(row["user_id"] or 0) if row else 0
+    except Exception:
+        current_uid = 0
+
+    if current_uid <= 0:
+        db_exec(
+            "INSERT INTO bot_creator(slot_id, user_id, updated_at, promoted_from_owner) "
+            "VALUES (1,?,?,0) "
+            "ON CONFLICT(slot_id) DO UPDATE SET "
+            "user_id=excluded.user_id, "
+            "updated_at=excluded.updated_at, "
+            "promoted_from_owner=excluded.promoted_from_owner",
+            (int(CREATOR_ID), int(now_ts())),
+            commit=True
+        )
+
+def get_bot_owners() -> List[sqlite3.Row]:
+    return db_all("""
+        SELECT bo.user_id, bo.added_by, bo.added_at,
+               u.username, u.first_name, u.last_name, u.last_seen
+        FROM bot_owners bo
+        LEFT JOIN users u ON u.user_id = bo.user_id
+        ORDER BY bo.added_at ASC, bo.user_id ASC
+    """)
+
+def is_creator(user_id: int) -> bool:
+    return int(user_id) == int(get_current_creator_id())
+
+def is_owner(user_id: int) -> bool:
+    row = db_one("SELECT 1 FROM bot_owners WHERE user_id=? LIMIT 1", (int(user_id),))
+    return bool(row)
+
+def is_agent(user_id: int) -> bool:
+    uid = int(user_id)
+    if is_creator(uid) or is_owner(uid):
+        return False
+    row = db_one("SELECT 1 FROM support_agents WHERE user_id=? LIMIT 1", (uid,))
+    return bool(row)
+
+def can_use_owner_commands(user_id: int) -> bool:
+    return is_owner(int(user_id))
+
+def can_manage_owners(user_id: int) -> bool:
+    return is_creator(int(user_id))
+
+def can_manage_agents(user_id: int) -> bool:
+    return is_owner(int(user_id))
+
+def add_bot_owner(target_id: int, added_by: int) -> None:
+    db_exec("""
+        INSERT INTO bot_owners(user_id, added_by, added_at)
+        VALUES(?,?,?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            added_by=excluded.added_by,
+            added_at=excluded.added_at
+    """, (int(target_id), int(added_by), int(now_ts())), commit=True)
+
+def remove_bot_owner(target_id: int) -> None:
+    db_exec("DELETE FROM bot_owners WHERE user_id=?", (int(target_id),), commit=True)
+
+def add_agent(target_id: int, added_by: int, role: str = "support") -> None:
+    db_exec("""
+        INSERT INTO support_agents(user_id, role, added_by, added_at)
+        VALUES(?,?,?,?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            role=excluded.role,
+            added_by=excluded.added_by,
+            added_at=excluded.added_at
+    """, (int(target_id), str(role or "support"), int(added_by), int(now_ts())), commit=True)
+
+def remove_agent(target_id: int):
+    db_exec("DELETE FROM support_agents WHERE user_id=?", (int(target_id),), commit=True)
+
+def promote_next_owner_to_creator() -> Optional[int]:
+    current_creator = int(get_current_creator_id())
+
+    row = db_one(
+        "SELECT user_id FROM bot_owners "
+        "WHERE user_id<>? "
+        "ORDER BY added_at ASC, user_id ASC "
+        "LIMIT 1",
+        (int(current_creator),)
+    )
+    if not row:
+        return None
+
+    new_creator_id = int(row["user_id"])
+    db_exec(
+        "INSERT INTO bot_creator(slot_id, user_id, updated_at, promoted_from_owner) "
+        "VALUES (1,?,?,1) "
+        "ON CONFLICT(slot_id) DO UPDATE SET "
+        "user_id=excluded.user_id, "
+        "updated_at=excluded.updated_at, "
+        "promoted_from_owner=excluded.promoted_from_owner",
+        (int(new_creator_id), int(now_ts())),
+        commit=True
+    )
+    return int(new_creator_id)
+
+# аварийная передача прав
+CREATOR_AUDIT_INTERVAL_SEC = 6 * 3600
+_CREATOR_AUDIT_NEXT_TS = 0
+
+def _normalize_deleted_account_text(s: str) -> str:
+    return re.sub(r"\s+", " ", _strip_invisible(s or "")).strip().casefold()
+
+def _looks_like_deleted_account_profile(username: str, first_name: str, last_name: str) -> bool:
+    un = _normalize_username_for_link(username or "")
+    if un:
+        return False
+
+    first = _normalize_deleted_account_text(first_name or "")
+    full = _normalize_deleted_account_text(f"{first_name or ''} {last_name or ''}")
+
+    markers = {
+        "deleted account",
+        "удаленный аккаунт",
+        "удалённый аккаунт",
+    }
+    return first in markers or full in markers
+
+def _save_role_user_snapshot(user_id: int, username: str, first_name: str, last_name: str):
+    db_exec(
+        "INSERT INTO users(user_id, username, first_name, last_name, last_seen, is_placeholder, is_bot) "
+        "VALUES(?,?,?,?,?,?,?) "
+        "ON CONFLICT(user_id) DO UPDATE SET "
+        "username=excluded.username, "
+        "first_name=excluded.first_name, "
+        "last_name=excluded.last_name, "
+        "last_seen=excluded.last_seen, "
+        "is_placeholder=0",
+        (
+            int(user_id),
+            (username or "").lower() if (username or "").strip() else None,
+            (first_name or "").strip() or None,
+            (last_name or "").strip() or None,
+            int(now_ts()),
+            0,
+            0,
+        ),
+        commit=True
+    )
+
+def _is_creator_inaccessible_error(exc: Exception) -> bool:
+    s = str(exc or "").lower()
+    return (
+        _is_chat_not_found_error(exc)
+        or "private chat not found" in s
+        or "user not found" in s
+        or "user is deactivated" in s
+        or "user_deactivated" in s
+        or "bot was blocked by the user" in s
+    )
+
+def _creator_unavailable_reason(user_id: int) -> tuple[bool, str]:
+    uid = int(user_id)
+
+    row = get_user_row(uid)
+    if row and _looks_like_deleted_account_profile(
+        (row["username"] or ""),
+        (row["first_name"] or ""),
+        (row["last_name"] or "")
+    ):
+        return True, "deleted_profile_db"
+
+    try:
+        ch = bot.get_chat(uid)
+
+        username = (getattr(ch, "username", "") or "").strip().lower()
+        first_name = (
+            getattr(ch, "first_name", None)
+            or getattr(ch, "title", None)
+            or ""
+        )
+        last_name = getattr(ch, "last_name", None) or ""
+
+        _save_role_user_snapshot(uid, username, first_name, last_name)
+
+        if _looks_like_deleted_account_profile(username, first_name, last_name):
+            return True, "deleted_profile_api"
+
+        return False, ""
+
+    except Exception as e:
+        if _is_transient_telegram_network_error(e):
+            return False, ""
+        if _is_creator_inaccessible_error(e):
+            return True, str(e)
+        return False, ""
+
+def _role_user_tag(user_id: int) -> str:
+    uid = int(user_id)
+    row = get_user_row(uid)
+    if not row:
+        return f"<code>{uid}</code>"
+
+    un = (row["username"] or "")
+    disp = standard_display_name(
+        row["first_name"] or "",
+        row["last_name"] or "",
+        un,
+        uid
+    )
+    return tg_mention(uid, disp, username=un)
+
+def _maybe_promote_unavailable_creator(force: bool = False) -> Optional[int]:
+    global _CREATOR_AUDIT_NEXT_TS
+
+    ensure_creator_role_state()
+
+    now = int(now_ts())
+    if not force and now < int(_CREATOR_AUDIT_NEXT_TS or 0):
+        return None
+
+    _CREATOR_AUDIT_NEXT_TS = int(now + CREATOR_AUDIT_INTERVAL_SEC)
+
+    old_creator_id = int(get_current_creator_id())
+    must_promote, reason = _creator_unavailable_reason(int(old_creator_id))
+    if not must_promote:
+        return None
+
+    new_creator_id = promote_next_owner_to_creator()
+    if not new_creator_id or int(new_creator_id) == int(old_creator_id):
+        return None
+
+    try:
+        db_exec("DELETE FROM bot_owners WHERE user_id=?", (int(old_creator_id),), commit=True)
+    except Exception:
+        pass
+
+    try:
+        db_exec("DELETE FROM support_agents WHERE user_id=?", (int(old_creator_id),), commit=True)
+    except Exception:
+        pass
+
+    ensure_creator_is_support()
+
+    text = (
+        "⚠️ Текущий создатель бота более недоступен для бота.\n"
+        f"Новым создателем назначен {_role_user_tag(int(new_creator_id))}."
+    )
+
+    if str(reason or "").strip():
+        text += f"\n📋 Причина: <code>{h(str(reason)[:300])}</code>"
+
+    try:
+        _send_message_to_service_recipients(
+            text,
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
+    except Exception:
+        pass
+
+    return int(new_creator_id)
+
 def ensure_creator_is_support():
+    """
+    Совместимый bootstrap для старой логики.
+    Пока старые handler'ы ещё не переведены на creator/owner/agent,
+    оставляем creator в support_agents, чтобы ничего не сломать.
+    """
+    ensure_creator_role_state()
+
+    creator_id = int(get_current_creator_id())
     db_exec("""
         INSERT INTO support_agents(user_id, role, added_by, added_at)
         VALUES(?,?,?,?)
         ON CONFLICT(user_id) DO NOTHING
-    """, (int(CREATOR_ID), "support", int(CREATOR_ID), now_ts()), commit=True)
+    """, (creator_id, "support", creator_id, now_ts()), commit=True)
 
 def ensure_lab_exists(user_id: int):
     uid = int(user_id)
@@ -4348,7 +4865,7 @@ def _corp_transfer_mix_text(cmd: str, target_id: int, res_amount: int, mat_amoun
     if res_amount <= 0 and mat_amount > 0:
         return (
             f"{shortage}\n"
-            f"Однако для перевода игроку {target_tag} можно полностью заменить сумму на био-материалы:\n"
+            f"Однако для перевода игроку <b>{target_tag}</b> можно полностью заменить сумму на био-материалы:\n"
             f"💊 {_fmt_k(mat_amount)}\n"
             "Подтвердить перевод?"
         )
@@ -4356,14 +4873,14 @@ def _corp_transfer_mix_text(cmd: str, target_id: int, res_amount: int, mat_amoun
     if mat_amount <= 0 and res_amount > 0:
         return (
             f"{shortage}\n"
-            f"Однако для перевода игроку {target_tag} можно полностью заменить сумму на био-ресурсы:\n"
+            f"Однако для перевода игроку <b>{target_tag}</b> можно полностью заменить сумму на био-ресурсы:\n"
             f"🧬 {_fmt_k(res_amount)}\n"
             "Подтвердить перевод?"
         )
 
     return (
         f"{shortage}\n"
-        f"Однако для перевода игроку {target_tag} можно использовать смешанную сумму:\n"
+        f"Однако для перевода игроку <b>{target_tag}</b> можно использовать смешанную сумму:\n"
         f"🧬 {_fmt_k(res_amount)} + 💊 {_fmt_k(mat_amount)}\n"
         "Подтвердить перевод?"
     )
@@ -4375,16 +4892,65 @@ def _corp_transfer_success_text(target_id: int, res_amount: int, mat_amount: int
 
     if res_amount > 0 and mat_amount > 0:
         return (
-            f"✅Успех. Игроку {target_tag} передано "
+            f"✅Успех. Игроку <b>{target_tag}</b> передано "
             f"🧬 {_fmt_k(res_amount)} + 💊 {_fmt_k(mat_amount)}."
         )
 
     if res_amount > 0:
         word = _ru_form(int(res_amount), "био-ресурс", "био-ресурса", "био-ресурсов")
-        return f"✅Успех. Игроку {target_tag} передано 🧬 {_fmt_k(int(res_amount))} {word}."
+        return f"✅Успех. Игроку <b>{target_tag}</b> передано 🧬 {_fmt_k(int(res_amount))} {word}."
 
     word = _ru_form(int(mat_amount), "био-материал", "био-материала", "био-материалов")
-    return f"✅Успех. Игроку {target_tag} передано 💊 {_fmt_k(int(mat_amount))} {word}."
+    return f"✅Успех. Игроку <b>{target_tag}</b> передано 💊 {_fmt_k(int(mat_amount))} {word}."
+
+def _corp_transfer_notify_text(sender_id: int, res_amount: int, mat_amount: int) -> str:
+    sender_tag = _corp_actor_tag(int(sender_id))
+    res_amount = int(res_amount or 0)
+    mat_amount = int(mat_amount or 0)
+
+    if res_amount > 0 and mat_amount > 0:
+        return (
+            f"🏦 Участник вашей Корпорации <b>{sender_tag}</b> перевёл вам "
+            f"🧬 {_fmt_k(res_amount)} + 💊 {_fmt_k(mat_amount)}."
+        )
+
+    if res_amount > 0:
+        word = _ru_form(int(res_amount), "био-ресурс", "био-ресурса", "био-ресурсов")
+        return (
+            f"🏦 Участник вашей Корпорации <b>{sender_tag}</b> перевёл вам "
+            f"🧬 {_fmt_k(int(res_amount))} {word}."
+        )
+
+    word = _ru_form(int(mat_amount), "био-материал", "био-материала", "био-материалов")
+    return (
+        f"🏦 Участник вашей Корпорации <b>{sender_tag}</b> перевёл вам "
+        f"💊 {_fmt_k(int(mat_amount))} {word}."
+    )
+
+def _maybe_send_corp_transfer_notification(sender_id: int, target_id: int, res_amount: int, mat_amount: int):
+    try:
+        sender_id = int(sender_id)
+        target_id = int(target_id)
+        res_amount = int(res_amount or 0)
+        mat_amount = int(mat_amount or 0)
+
+        if target_id <= 0 or sender_id <= 0 or sender_id == target_id:
+            return
+
+        if res_amount <= 0 and mat_amount <= 0:
+            return
+
+        if corp_notify_enabled(int(target_id)) != 1:
+            return
+
+        send_user_notification(
+            int(target_id),
+            _corp_transfer_notify_text(int(sender_id), int(res_amount), int(mat_amount)),
+            respect_notify_off=False
+        )
+
+    except Exception as e:
+        send_error_report("corp_transfer_notify", e)
 
 def _corp_transfer_mix_cb(action: str, uid: int, cmd: str, target_id: int, res_amount: int, mat_amount: int) -> str:
     return (
@@ -4467,6 +5033,13 @@ def _corp_transfer_apply(sender_id: int, target_id: int, *, res_amount: int = 0,
                 c.close()
             except Exception:
                 pass
+
+    _maybe_send_corp_transfer_notification(
+        int(sender_id),
+        int(target_id),
+        int(res_amount),
+        int(mat_amount)
+    )
 
     return True, ""
 
@@ -4748,7 +5321,7 @@ def _corp_request_resolve(request_id: int, actor_id: int, approved: bool) -> tup
     user_id = int(req["user_id"])
 
     if not corp_is_owner_or_deputy(corp_id, int(actor_id)):
-        return False, "📑 Решение по заявке могут принимать только владелец и заместители."
+        return False, "📑 Решение по заявке могут принимать только агенты тех.поддержки."
 
     corp = corp_by_id(corp_id)
     if not corp:
@@ -5448,17 +6021,23 @@ def get_support_agents() -> List[sqlite3.Row]:
         SELECT sa.user_id, sa.role, sa.added_at, u.username, u.first_name, u.last_name, u.last_seen
         FROM support_agents sa
         LEFT JOIN users u ON u.user_id = sa.user_id
+        WHERE sa.user_id<>?
+          AND NOT EXISTS (
+              SELECT 1 FROM bot_owners bo WHERE bo.user_id=sa.user_id
+          )
         ORDER BY sa.added_at ASC
-    """)
+    """, (int(get_current_creator_id()),)) or []
 
 def is_support(user_id: int) -> bool:
-    if int(user_id) == int(CREATOR_ID):
-        return True
-    row = db_one("SELECT 1 FROM support_agents WHERE user_id=? LIMIT 1", (int(user_id),))
-    return bool(row)
+    uid = int(user_id)
+    return is_agent(uid) or can_use_owner_commands(uid)
 
 def can_manage_support(user_id: int) -> bool:
-    return int(user_id) == int(CREATOR_ID)
+    """
+    Совместимый wrapper для старых owner-only handler'ов.
+    Теперь owner-команды доступны только владельцам.
+    """
+    return can_manage_agents(int(user_id))
 
 def find_user_id_by_username(username: str) -> Optional[int]:
     username = (username or "").strip().lstrip("@").lower()
@@ -6033,19 +6612,6 @@ def _merge_placeholder_for_uid_if_possible(user_or_id):
     fake.last_name = row["last_name"] or ""
     _merge_placeholder_to_real_user(fake)
 
-def add_support_agent(target_id: int, added_by: int, role: str = "support") -> None:
-    db_exec("""
-        INSERT INTO support_agents(user_id, role, added_by, added_at)
-        VALUES(?,?,?,?)
-        ON CONFLICT(user_id) DO UPDATE SET
-            role=excluded.role,
-            added_by=excluded.added_by,
-            added_at=excluded.added_at
-    """, (int(target_id), role, int(added_by), now_ts()), commit=True)
-
-def remove_support_agent(target_id: int):
-    db_exec("DELETE FROM support_agents WHERE user_id=?", (int(target_id),), commit=True)
-
 def get_name_restriction_row(user_id: int):
     return db_one(
         "SELECT user_id, "
@@ -6576,48 +7142,75 @@ def build_agents_panel_text(user_id: int) -> str:
             int(uid)
         ) if self_row else str(uid)
     )
-    role_word = "создатель" if uid == int(CREATOR_ID) else "агент"
 
-    agents = get_support_agents()
-    online, offline = split_agents_by_online(agents)
+    if is_creator(uid):
+        role_word = "создатель"
+    elif is_owner(uid):
+        role_word = "старший агент"
+    else:
+        role_word = "агент"
 
-    online = [a for a in online if int(a["user_id"]) != uid]
-    offline = [a for a in offline if int(a["user_id"]) != uid]
+    owner_rows = _panel_owner_rows(uid)
+    owner_online, owner_offline = split_agents_by_online(owner_rows)
+
+    agent_rows = [a for a in get_support_agents() if int(a["user_id"]) != uid]
+    agent_online, agent_offline = split_agents_by_online(agent_rows)
 
     lines = []
     lines.append(f"🔬 Приветствуем вас, {role_word} <b>{h(self_name)}</b>, в {h(BOT_TITLE)}")
-    lines.append("👨‍⚕️ <b>Другие агенты поддержки</b>")
 
-    if not online and not offline:
+    lines.append("💎 <b>Создатель и старшие агенты</b>")
+    if not owner_online and not owner_offline:
         lines.append("Список пока пуст.")
     else:
-        if online:
+        if owner_online:
             lines.append("🟢 Онлайн")
-            for a in online:
-                lines.append(format_agent_line(a))
-        if offline:
+            for a in owner_online:
+                role_txt = str(a.get('role_text', '')).strip()
+                prefix = f"{role_txt.capitalize()}: " if role_txt else ""
+                lines.append(prefix + format_agent_line(a))
+        if owner_offline:
             lines.append("🔘 Оффлайн")
-            for a in offline:
+            for a in owner_offline:
+                role_txt = str(a.get('role_text', '')).strip()
+                prefix = f"{role_txt.capitalize()}: " if role_txt else ""
+                lines.append(prefix + format_agent_line(a))
+
+    lines.append("")
+    lines.append("👨‍⚕️ <b>Агенты техподдержки</b>")
+    if not agent_online and not agent_offline:
+        lines.append("Список пока пуст.")
+    else:
+        if agent_online:
+            lines.append("🟢 Онлайн")
+            for a in agent_online:
+                lines.append(format_agent_line(a))
+        if agent_offline:
+            lines.append("🔘 Оффлайн")
+            for a in agent_offline:
                 lines.append(format_agent_line(a))
 
     lines.append("")
     lines.append("💬 Следующие доступные Вам команды:")
     lines.append("<blockquote expandable>")
-    lines.append("📒 Раздел агента")
-    lines.append("/bot_ban + {причина с новой строки} — заблокировать пользователя")
-    lines.append("/bot_unban — разблокировать пользователя")
-    lines.append("/remake_lab — восстановить лабораторию")
-    lines.append("<code>/+lab_name</code> | <code>/-lab_name</code> + {причина с новой строки} — разрешает/запрещает имена лаборатории для пользователя")
-    lines.append("<code>/+pat_name</code> | <code>/-pat_name</code> + {причина с новой строки} — разрешает/запрещает имена патогена для пользователя")
-    lines.append("<code>/+user_name</code> | <code>/-user_name</code> + {причина с новой строки} — разрешает/запрещает смену имени для пользователя")
-    lines.append("<code>/+corp_name</code> | <code>/-corp_name</code> + {причина с новой строки} — разрешает/запрещает имена корпорации для пользователя")
-    lines.append("/blacklist — список пользователей с ограничениями")
-    if uid == int(CREATOR_ID):
-        lines.append("")
-        lines.append("📒 Раздел владельца / Редактирования бота")
-        lines.append("/owner — назначить агента")
-        lines.append("/owner_remove — снять права с агента")
+
+    if is_support(uid):
+        lines.append("📒 Раздел агента техподдержки")
+        lines.append("/bot_ban + {причина с новой строки} — заблокировать пользователя")
+        lines.append("/bot_unban — разблокировать пользователя")
+        lines.append("/remake_lab — восстановить лабораторию")
+        lines.append("<code>/+lab_name</code> | <code>/-lab_name</code> + {причина с новой строки} — разрешает/запрещает имена лаборатории для пользователя")
+        lines.append("<code>/+pat_name</code> | <code>/-pat_name</code> + {причина с новой строки} — разрешает/запрещает имена патогена для пользователя")
+        lines.append("<code>/+user_name</code> | <code>/-user_name</code> + {причина с новой строки} — разрешает/запрещает смену имени для пользователя")
+        lines.append("<code>/+corp_name</code> | <code>/-corp_name</code> + {причина с новой строки} — разрешает/запрещает имена корпорации для пользователя")
+        lines.append("/blacklist — список пользователей с ограничениями")
         lines.append("/users — список всех пользователей")
+        lines.append("")
+
+    if can_use_owner_commands(uid):
+        lines.append("📒 Раздел старшего агента")
+        lines.append("/agent — назначить агента техподдержки")
+        lines.append("/agent_remove — снять права агента техподдержки")
         lines.append("/its + {ссылка} + {<code>бот</code>|<code>юзер</code>} — ручное редактирование списка")
         lines.append("/edit_k — изменить k")
         lines.append("/edit_b — изменить β")
@@ -6629,14 +7222,21 @@ def build_agents_panel_text(user_id: int) -> str:
         lines.append("/db_fife — файл базы данных")
         lines.append("/db_fife_upd — обновить базу данных")
         lines.append("")
-    if uid == int(CREATOR_ID):
         lines.append("🎁 Раздел промокоды:")
         lines.append("/promocode_generate — генерация случайного временного промокода")
         lines.append("/promocode_create — создание промокода")
         lines.append("/promocode_all — список всех промокодов")
         lines.append("/promocode_delete — удалить промокод")
-    lines.append("</blockquote>")
+        lines.append("")
 
+    if is_creator(uid):
+        lines.append("📒 Раздел создателя")
+        lines.append("/my_owner — выдать себе права старшего агента")
+        lines.append("/my_owner_remove — снять с себя права старшего агента")
+        lines.append("/owner — назначить старшего агента")
+        lines.append("/owner_remove — снять права старшего агента")
+
+    lines.append("</blockquote>")
     return "\n".join(lines)
 
 def get_bot_ban_row(user_id: int):
@@ -6782,7 +7382,7 @@ def handle_admin_service_commands(message, parsed: "Parsed"):
         bot.reply_to(message, "📑 Укажите пользователя через @username, user_id или reply.")
         return
 
-    if int(target_id) == int(CREATOR_ID) and parsed.cmd == "bot_ban":
+    if int(target_id) == int(get_current_creator_id()) and parsed.cmd == "bot_ban":
         bot.reply_to(message, "📑 У меня нет такой власти(")
         return
 
@@ -6908,6 +7508,84 @@ def _db_schedule_row(user_id: int):
         (int(user_id),)
     )
 
+DB_FILE_MSG_MIN_SECONDS = 12 * 3600
+DB_FILE_MSG_MAX_SECONDS = 30 * 86400
+
+def _db_schedule_clear(user_id: int):
+    db_exec(
+        "DELETE FROM db_file_msg_schedule WHERE user_id=?",
+        (int(user_id),),
+        commit=True
+    )
+
+def _db_schedule_total_seconds(spec: dict) -> int:
+    if not spec:
+        return 0
+
+    return int(
+        int(spec.get("months", 0) or 0) * 30 * 86400
+        + int(spec.get("weeks", 0) or 0) * 7 * 86400
+        + int(spec.get("days", 0) or 0) * 86400
+        + int(spec.get("hours", 0) or 0) * 3600
+        + int(spec.get("minutes", 0) or 0) * 60
+    )
+
+def _db_schedule_validate_spec(spec: dict) -> tuple[bool, str]:
+    total_sec = _db_schedule_total_seconds(spec)
+
+    if total_sec < DB_FILE_MSG_MIN_SECONDS:
+        return False, "📑 Минимальный период автосэйва — 12 часов."
+
+    if total_sec > DB_FILE_MSG_MAX_SECONDS:
+        return False, "📑 Максимальный период автосэйва — 1 месяц."
+
+    return True, ""
+
+def _dbstat_cb(user_id: int, action: str) -> str:
+    return f"{DBSTATUI_TAG}:{int(user_id)}:{str(action or '').strip().upper()}"
+
+def _dbstat_parse_cb(data: str):
+    try:
+        parts = (data or "").split(":")
+        if len(parts) != 3 or parts[0] != DBSTATUI_TAG:
+            return None
+        return {
+            "user_id": int(parts[1]),
+            "action": (parts[2] or "").strip().upper(),
+        }
+    except Exception:
+        return None
+
+def kb_db_file_stat(owner_id: int):
+    row = _db_schedule_row(int(owner_id))
+    next_send_ts = int(row["next_run_ts"] or 0) if row else 0
+
+    kb = InlineKeyboardMarkup(row_width=2)
+
+    if next_send_ts > 0:
+        kb.row(
+            _ikb(
+                "Сбросить автосэйв",
+                callback_data=_dbstat_cb(int(owner_id), "RESET"),
+                style="danger"
+            ),
+            _ikb(
+                "Список db_id",
+                callback_data=_dbstat_cb(int(owner_id), "LIST"),
+                style="primary"
+            )
+        )
+    else:
+        kb.add(
+            _ikb(
+                "Список db_id",
+                callback_data=_dbstat_cb(int(owner_id), "LIST"),
+                style="primary"
+            )
+        )
+
+    return kb
+
 def _db_schedule_set(user_id: int, spec: dict):
     next_run_ts = int(_timer_apply_period(datetime.fromtimestamp(now_ts()), spec).timestamp())
     db_exec(
@@ -6943,6 +7621,738 @@ def _db_snapshot_copy(src_path: str, prefix: str) -> str:
 
     ok = _sqlite_backup_file(src_path, tmp_path)
     return tmp_path if ok and os.path.exists(tmp_path) else ""
+
+def _db_export_source_title(source_kind: str) -> str:
+    kind = str(source_kind or "").strip().upper()
+    return "Backup" if kind == "BACKUP" else "Основная база данных"
+
+def _db_file_export_cb(user_id: int, source_kind: str) -> str:
+    return f"{DBFILEUI_TAG}:{int(user_id)}:{str(source_kind or '').strip().upper()}"
+
+def _db_file_export_parse_cb(data: str):
+    try:
+        parts = (data or "").split(":")
+        if len(parts) != 3 or parts[0] != DBFILEUI_TAG:
+            return None
+        return {
+            "user_id": int(parts[1]),
+            "source_kind": (parts[2] or "").strip().upper(),
+        }
+    except Exception:
+        return None
+
+def kb_db_file_export_choice(user_id: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.row(
+        _ikb(
+            "Основная база данных",
+            callback_data=_db_file_export_cb(int(user_id), "MAIN"),
+            style="primary"
+        ),
+        _ikb(
+            "Backup",
+            callback_data=_db_file_export_cb(int(user_id), "BACKUP"),
+            style="primary"
+        )
+    )
+    return kb
+
+def _copy_file_to_temp(src_path: str, prefix: str, suffix: str = "") -> str:
+    if not src_path or not os.path.exists(src_path):
+        return ""
+
+    suf = str(suffix or "").strip()
+    if not suf:
+        _, ext = os.path.splitext(src_path)
+        suf = ext or ""
+
+    tmp_path = os.path.join(
+        DATA_DIR,
+        f"{prefix}_{int(now_ts())}_{random.randint(1000, 9999)}{suf}"
+    )
+
+    try:
+        with open(src_path, "rb") as src, open(tmp_path, "wb") as dst:
+            dst.write(src.read())
+        return tmp_path
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+        return ""
+
+def _db_export_collect_parts(source_kind: str):
+    kind = str(source_kind or "").strip().upper()
+    parts = []
+    temp_paths = []
+
+    if kind == "MAIN":
+        with DB_LOCK:
+            try:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+            except Exception:
+                pass
+
+            main_copy = _copy_file_to_temp(DB_PATH, "db_export_main", ".db")
+            wal_copy = ""
+            if _path_size(DB_PATH + "-wal") > 0:
+                wal_copy = _copy_file_to_temp(DB_PATH + "-wal", "db_export_main_wal", ".db-wal")
+
+        deleted_copy = _db_snapshot_copy(DELETED_DB_PATH, "db_export_deleted")
+
+        if main_copy:
+            parts.append((main_copy, "bio_war.db"))
+            temp_paths.append(main_copy)
+
+        if wal_copy:
+            parts.append((wal_copy, "bio_war.db-wal"))
+            temp_paths.append(wal_copy)
+
+        if deleted_copy:
+            parts.append((deleted_copy, "deleted_labs.db"))
+            temp_paths.append(deleted_copy)
+
+        if not parts:
+            return [], temp_paths, "📑 Не удалось подготовить текущую базу данных."
+
+        return parts, temp_paths, ""
+
+    if kind == "BACKUP":
+        main_copy = _copy_file_to_temp(DB_BACKUP_MAIN_PATH, "db_export_backup_main", ".db")
+        wal_copy = ""
+        if _path_size(DB_BACKUP_MAIN_WAL_PATH) > 0:
+            wal_copy = _copy_file_to_temp(DB_BACKUP_MAIN_WAL_PATH, "db_export_backup_wal", ".db-wal")
+        deleted_copy = _copy_file_to_temp(DB_BACKUP_DELETED_PATH, "db_export_backup_deleted", ".db")
+
+        if main_copy:
+            parts.append((main_copy, "bio_war.db"))
+            temp_paths.append(main_copy)
+
+        if wal_copy:
+            parts.append((wal_copy, "bio_war.db-wal"))
+            temp_paths.append(wal_copy)
+
+        if deleted_copy:
+            parts.append((deleted_copy, "deleted_labs.db"))
+            temp_paths.append(deleted_copy)
+
+        if not parts:
+            return [], temp_paths, "📑 Backup ещё не создан."
+
+        return parts, temp_paths, ""
+
+    return [], temp_paths, "📑 Неизвестный тип источника базы данных."
+
+def _db_export_create_row(source_kind: str, requested_by: int, request_text: str) -> int:
+    with DB_LOCK:
+        c = conn.cursor()
+        try:
+            c.execute("BEGIN")
+            c.execute(
+                "INSERT INTO db_file_exports(source_kind, archive_path, requested_by, created_at, request_text) "
+                "VALUES (?,?,?,?,?)",
+                (
+                    str(source_kind or "").strip().upper(),
+                    "",
+                    int(requested_by),
+                    int(now_ts()),
+                    str(request_text or "").strip(),
+                )
+            )
+            export_id = int(c.lastrowid or 0)
+            conn.commit()
+            return export_id
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            try:
+                c.close()
+            except Exception:
+                pass
+
+def _db_export_update_path(db_id: int, archive_path: str):
+    db_exec(
+        "UPDATE db_file_exports SET archive_path=? WHERE db_id=?",
+        (str(archive_path or ""), int(db_id)),
+        commit=True
+    )
+
+def _db_export_delete_row(db_id: int):
+    db_exec("DELETE FROM db_file_exports WHERE db_id=?", (int(db_id),), commit=True)
+
+def _db_export_archive_path(db_id: int, source_kind: str) -> str:
+    kind = str(source_kind or "").strip().upper()
+    stem = "backup" if kind == "BACKUP" else "main"
+    return os.path.join(DB_EXPORTS_DIR, f"db_{stem}_{int(db_id)}.zip")
+
+def _build_db_export_archive(db_id: int, source_kind: str) -> tuple[bool, str, str]:
+    parts, temp_paths, err = _db_export_collect_parts(source_kind)
+    if not parts:
+        for p in temp_paths:
+            try:
+                if p and os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
+        return False, "", err or "📑 Не удалось подготовить архив базы данных."
+
+    archive_path = _db_export_archive_path(int(db_id), source_kind)
+
+    try:
+        try:
+            if os.path.exists(archive_path):
+                os.remove(archive_path)
+        except Exception:
+            pass
+
+        with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for src_path, arcname in parts:
+                if src_path and os.path.exists(src_path):
+                    zf.write(src_path, arcname=arcname)
+
+        if not os.path.exists(archive_path):
+            return False, "", "📑 Не удалось собрать архив базы данных."
+
+        return True, archive_path, ""
+
+    finally:
+        for p in temp_paths:
+            try:
+                if p and os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
+
+def _db_export_row_by_id(db_id: int):
+    return db_one(
+        "SELECT db_id, source_kind, archive_path, requested_by, created_at, request_text "
+        "FROM db_file_exports WHERE db_id=? LIMIT 1",
+        (int(db_id),)
+    )
+
+def _db_upd_safe_basename(name: str) -> str:
+    base = os.path.basename(str(name or "").replace("\\", "/")).strip()
+    if not base:
+        base = "db_file.bin"
+    base = re.sub(r"[^A-Za-zА-Яа-я0-9._-]+", "_", base)
+    return base or "db_file.bin"
+
+def _db_upd_temp_path(prefix: str, name: str) -> str:
+    return os.path.join(
+        DB_IMPORTS_DIR,
+        f"{prefix}_{int(now_ts())}_{random.randint(1000, 9999)}_{_db_upd_safe_basename(name)}"
+    )
+
+def _db_upd_remove_path(path: str):
+    try:
+        if not path:
+            return
+        if os.path.isdir(path):
+            shutil.rmtree(path, ignore_errors=True)
+        elif os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
+
+def _db_upd_download_document(doc) -> str:
+    tg_file = bot.get_file(doc.file_id)
+    raw = bot.download_file(tg_file.file_path)
+
+    file_name = getattr(doc, "file_name", "") or "db_file.bin"
+    local_path = _db_upd_temp_path("dbupd", file_name)
+
+    with open(local_path, "wb") as f:
+        f.write(raw)
+
+    return local_path
+
+def _sqlite_table_names(path: str) -> set[str]:
+    names = set()
+    c = None
+    try:
+        c = sqlite3.connect(path, check_same_thread=False)
+        rows = c.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+        for r in rows:
+            try:
+                names.add(str(r[0]))
+            except Exception:
+                pass
+    except Exception:
+        return set()
+    finally:
+        try:
+            if c is not None:
+                c.close()
+        except Exception:
+            pass
+    return names
+
+def _db_upd_sqlite_kind(path: str) -> str:
+    if not path or not os.path.exists(path):
+        return ""
+
+    if not _sqlite_file_integrity_ok(path):
+        return ""
+
+    tables = _sqlite_table_names(path)
+
+    if "labs" in tables and "users" in tables:
+        return "MAIN"
+
+    if "deleted_labs" in tables:
+        return "DELETED"
+
+    return ""
+
+def _db_upd_collect_source_documents(message):
+    docs = []
+    seen = set()
+
+    def _add_doc(msg):
+        if not msg:
+            return
+        doc = getattr(msg, "document", None)
+        if not doc:
+            return
+        fid = str(getattr(doc, "file_id", "") or "")
+        if fid and fid not in seen:
+            seen.add(fid)
+            docs.append(doc)
+
+    _add_doc(message)
+    _add_doc(getattr(message, "reply_to_message", None))
+    return docs
+
+def _db_upd_resolve_local_files(local_paths: list[str]) -> tuple[bool, dict, list[str], str]:
+    cleanup_paths: list[str] = []
+
+    zip_paths = [p for p in local_paths if str(p).lower().endswith(".zip")]
+    if zip_paths:
+        zip_path = zip_paths[0]
+        extract_dir = _db_upd_temp_path("dbupd_zip", "extract")
+        os.makedirs(extract_dir, exist_ok=True)
+        cleanup_paths.append(extract_dir)
+
+        extracted = []
+        try:
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                for info in zf.infolist():
+                    if info.is_dir():
+                        continue
+
+                    base = _db_upd_safe_basename(info.filename)
+                    low = base.lower()
+                    if not (
+                        low.endswith(".db")
+                        or low.endswith(".db-wal")
+                        or low.endswith(".wal")
+                    ):
+                        continue
+
+                    dst = os.path.join(extract_dir, base)
+                    with zf.open(info, "r") as src, open(dst, "wb") as out:
+                        shutil.copyfileobj(src, out)
+
+                    extracted.append(dst)
+        except Exception:
+            return False, {}, cleanup_paths, "📑 Не удалось открыть .zip архив базы данных."
+
+        if not extracted:
+            return False, {}, cleanup_paths, "📑 В архиве не найдены файлы баз данных."
+
+        local_paths = extracted
+
+    db_paths = [p for p in local_paths if str(p).lower().endswith(".db")]
+    wal_paths = [
+        p for p in local_paths
+        if str(p).lower().endswith(".db-wal") or str(p).lower().endswith(".wal")
+    ]
+
+    main_db = ""
+    deleted_db = ""
+    main_wal = ""
+
+    for p in db_paths:
+        kind = _db_upd_sqlite_kind(p)
+        if kind == "MAIN" and not main_db:
+            main_db = p
+        elif kind == "DELETED" and not deleted_db:
+            deleted_db = p
+
+    if main_db and wal_paths:
+        wanted = main_db + "-wal"
+        chosen = ""
+
+        main_base = os.path.basename(main_db).lower()
+        main_stem = main_base[:-3] if main_base.endswith(".db") else main_base
+
+        for p in wal_paths:
+            low = os.path.basename(p).lower()
+            if low in (
+                main_base + "-wal",
+                main_stem + ".db-wal",
+                main_stem + "-wal",
+            ):
+                chosen = p
+                break
+
+        if not chosen:
+            chosen = wal_paths[0]
+
+        if chosen != wanted:
+            try:
+                shutil.copyfile(chosen, wanted)
+                chosen = wanted
+                cleanup_paths.append(wanted)
+            except Exception:
+                pass
+
+        if os.path.exists(chosen):
+            main_wal = chosen
+
+    if not main_db and not deleted_db:
+        return False, {}, cleanup_paths, (
+            "📑 Не удалось определить тип базы данных. "
+            "Используйте .db или .zip, содержащий основную и/или deleted_labs базу."
+        )
+
+    return True, {
+        "main_db": main_db,
+        "main_wal": main_wal,
+        "deleted_db": deleted_db,
+    }, cleanup_paths, ""
+
+def _import_sqlite_snapshot_into_deleted_current(snapshot_path: str) -> list[str]:
+    init_deleted_db()
+
+    conn2 = sqlite3.connect(DELETED_DB_PATH, check_same_thread=False)
+    conn2.row_factory = sqlite3.Row
+
+    imported_tables: list[str] = []
+    attached = False
+
+    try:
+        try:
+            conn2.execute("DETACH DATABASE old_import")
+        except Exception:
+            pass
+
+        conn2.execute("ATTACH DATABASE ? AS old_import", (snapshot_path,))
+        attached = True
+
+        old_tables = [
+            r[0]
+            for r in conn2.execute(
+                "SELECT name FROM old_import.sqlite_master "
+                "WHERE type='table' AND name NOT LIKE 'sqlite_%' "
+                "ORDER BY name ASC"
+            ).fetchall()
+        ]
+
+        cur_tables = {
+            r[0]
+            for r in conn2.execute(
+                "SELECT name FROM main.sqlite_master "
+                "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            ).fetchall()
+        }
+
+        conn2.execute("BEGIN")
+
+        for table in old_tables:
+            if table not in cur_tables:
+                continue
+
+            old_cols = [
+                r[1]
+                for r in conn2.execute(f"PRAGMA old_import.table_info({_q_ident(table)})").fetchall()
+            ]
+            cur_cols = {
+                r[1]
+                for r in conn2.execute(f"PRAGMA main.table_info({_q_ident(table)})").fetchall()
+            }
+
+            cols = [c for c in old_cols if c in cur_cols]
+            if not cols:
+                continue
+
+            col_sql = ", ".join(_q_ident(c) for c in cols)
+
+            conn2.execute(
+                f"INSERT OR REPLACE INTO main.{_q_ident(table)} ({col_sql}) "
+                f"SELECT {col_sql} FROM old_import.{_q_ident(table)}"
+            )
+            imported_tables.append(str(table))
+
+        conn2.commit()
+        return imported_tables
+
+    except Exception:
+        try:
+            conn2.rollback()
+        except Exception:
+            pass
+        raise
+
+    finally:
+        if attached:
+            try:
+                conn2.execute("DETACH DATABASE old_import")
+            except Exception:
+                pass
+        try:
+            conn2.close()
+        except Exception:
+            pass
+
+def _db_upd_import_main_db(src_db_path: str) -> tuple[bool, str, list[str]]:
+    snapshot_path = _db_upd_temp_path("dbupd_main_snapshot", "main.db")
+    try:
+        _copy_sqlite_db_snapshot(src_db_path, snapshot_path)
+
+        snap_conn = sqlite3.connect(snapshot_path, check_same_thread=False)
+        try:
+            if not _sqlite_integrity_ok_local(snap_conn):
+                return False, "📑 Проверка целостности основной базы данных не пройдена.", []
+        finally:
+            try:
+                snap_conn.close()
+            except Exception:
+                pass
+
+        imported_tables = _import_sqlite_snapshot_into_current(snapshot_path)
+
+        with DB_LOCK:
+            try:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+            except Exception:
+                pass
+
+        return True, "", imported_tables
+
+    except Exception as e:
+        send_error_report("_db_upd_import_main_db", e)
+        return False, "📑 Не удалось импортировать основную базу данных.", []
+
+    finally:
+        _db_upd_remove_path(snapshot_path)
+
+def _db_upd_import_deleted_db(src_db_path: str) -> tuple[bool, str, list[str]]:
+    snapshot_path = _db_upd_temp_path("dbupd_deleted_snapshot", "deleted.db")
+    try:
+        _copy_sqlite_db_snapshot(src_db_path, snapshot_path)
+
+        snap_conn = sqlite3.connect(snapshot_path, check_same_thread=False)
+        try:
+            if not _sqlite_integrity_ok_local(snap_conn):
+                return False, "📑 Проверка целостности базы удалённых лабораторий не пройдена.", []
+        finally:
+            try:
+                snap_conn.close()
+            except Exception:
+                pass
+
+        imported_tables = _import_sqlite_snapshot_into_deleted_current(snapshot_path)
+        return True, "", imported_tables
+
+    except Exception as e:
+        send_error_report("_db_upd_import_deleted_db", e)
+        return False, "📑 Не удалось импортировать базу удалённых лабораторий.", []
+
+    finally:
+        _db_upd_remove_path(snapshot_path)
+
+def _db_upd_copy_binary(src_path: str, dst_path: str) -> bool:
+    try:
+        os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+        with open(src_path, "rb") as src, open(dst_path, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+        return True
+    except Exception:
+        return False
+
+def _db_upd_refresh_backup_files(main_db: str = "", main_wal: str = "", deleted_db: str = "") -> tuple[bool, str]:
+    if main_db:
+        if not _sqlite_backup_file(main_db, DB_BACKUP_MAIN_PATH):
+            return False, "📑 Не удалось обновить backup основной базы данных."
+
+        if main_wal and os.path.exists(main_wal):
+            if not _db_upd_copy_binary(main_wal, DB_BACKUP_MAIN_WAL_PATH):
+                return False, "📑 Не удалось обновить backup WAL-файла."
+        else:
+            _db_upd_remove_path(DB_BACKUP_MAIN_WAL_PATH)
+
+    if deleted_db:
+        if not _sqlite_backup_file(deleted_db, DB_BACKUP_DELETED_PATH):
+            return False, "📑 Не удалось обновить backup базы удалённых лабораторий."
+
+    return True, ""
+
+def _db_upd_apply_local_files(local_paths: list[str], source_label: str = "") -> tuple[bool, str]:
+    ok, bundle, cleanup_paths, err = _db_upd_resolve_local_files(local_paths)
+    if not ok:
+        for p in cleanup_paths:
+            _db_upd_remove_path(p)
+        return False, err
+
+    try:
+        imported_parts = []
+
+        main_db = str(bundle.get("main_db", "") or "")
+        main_wal = str(bundle.get("main_wal", "") or "")
+        deleted_db = str(bundle.get("deleted_db", "") or "")
+
+        if main_db:
+            ok_main, err_main, tables_main = _db_upd_import_main_db(main_db)
+            if not ok_main:
+                return False, err_main
+            imported_parts.append(
+                f"Основная БД: {len(tables_main)} таблиц"
+            )
+
+        if deleted_db:
+            ok_del, err_del, tables_del = _db_upd_import_deleted_db(deleted_db)
+            if not ok_del:
+                return False, err_del
+            imported_parts.append(
+                f"Deleted labs: {len(tables_del)} таблиц"
+            )
+
+        if not imported_parts:
+            return False, "📑 Не найдено содержимое для импорта."
+
+        ok_backup, err_backup = _db_upd_refresh_backup_files(
+            main_db=main_db,
+            main_wal=main_wal,
+            deleted_db=deleted_db
+        )
+        if not ok_backup:
+            return False, err_backup
+
+        lines = ["✅ Базы данных обновлены."]
+        if source_label:
+            lines.append(f"Источник: {h(source_label)}")
+        lines.extend(imported_parts)
+
+        return True, "\n".join(lines)
+
+    finally:
+        for p in cleanup_paths:
+            _db_upd_remove_path(p)
+
+def _db_upd_apply_by_db_id(db_id: int) -> tuple[bool, str]:
+    row = _db_export_row_by_id(int(db_id))
+    if not row:
+        return False, "📑 Архив с таким db_id не найден."
+
+    archive_path = (row["archive_path"] or "").strip()
+    if not archive_path or not os.path.exists(archive_path):
+        return False, "📑 Файл архива для этого db_id больше недоступен."
+
+    title = _db_export_source_title((row["source_kind"] or "").strip())
+    return _db_upd_apply_local_files(
+        [archive_path],
+        source_label=f"db_id {int(db_id)} ({title})"
+    )
+
+def _handle_db_fife_upd_command(message, parsed: "Parsed") -> tuple[bool, str]:
+    args = (parsed.args or "").strip()
+
+    if args.isdigit():
+        return _db_upd_apply_by_db_id(int(args))
+
+    docs = _db_upd_collect_source_documents(message)
+    if not docs:
+        return False, (
+            "📑 Используйте <code>/db_fife_upd</code> одним из способов:\n"
+            "1. ответом на сообщение с <code>.db</code> или <code>.zip</code>\n"
+            "2. сообщением с прикреплённым документом и caption-командой\n"
+            "3. <code>/db_fife_upd &lt;db_id&gt;</code> в личных сообщениях бота"
+        )
+
+    local_paths = []
+    try:
+        for doc in docs:
+            file_name = (getattr(doc, "file_name", "") or "").strip()
+            low = file_name.lower()
+
+            if not (
+                low.endswith(".db")
+                or low.endswith(".zip")
+                or low.endswith(".db-wal")
+                or low.endswith(".wal")
+            ):
+                continue
+
+            local_paths.append(_db_upd_download_document(doc))
+
+        if not local_paths:
+            return False, "📑 Поддерживаются только .db, .db-wal и .zip файлы баз данных."
+
+        return _db_upd_apply_local_files(local_paths, source_label="document upload")
+
+    except Exception as e:
+        send_error_report("_handle_db_fife_upd_command", e)
+        return False, "📑 Не удалось подготовить файлы для обновления базы данных."
+
+    finally:
+        for p in local_paths:
+            _db_upd_remove_path(p)
+
+def _send_db_export_archive(chat_id: int, requested_by: int, source_kind: str) -> tuple[bool, str]:
+    title = _db_export_source_title(source_kind)
+
+    db_id = 0
+    archive_path = ""
+
+    try:
+        db_id = _db_export_create_row(str(source_kind or "").strip().upper(), int(requested_by), title)
+        if db_id <= 0:
+            return False, "📑 Не удалось зарегистрировать архив базы данных."
+
+        ok, archive_path, err = _build_db_export_archive(int(db_id), source_kind)
+        if not ok:
+            _db_export_delete_row(int(db_id))
+            return False, err or "📑 Не удалось подготовить архив базы данных."
+
+        _db_export_update_path(int(db_id), archive_path)
+
+        with open(archive_path, "rb") as f:
+            bio = io.BytesIO(f.read())
+            bio.name = os.path.basename(archive_path)
+            bot.send_document(
+                int(chat_id),
+                bio,
+                caption=f"📦 {title}\n🆔 db_id: <code>{int(db_id)}</code>",
+                parse_mode="HTML"
+            )
+
+        return True, (
+            "✅ Архив базы данных отправлен.\n"
+        )
+
+    except Exception as e:
+        send_error_report("_send_db_export_archive", e)
+
+        try:
+            if archive_path and os.path.exists(archive_path):
+                os.remove(archive_path)
+        except Exception:
+            pass
+
+        if int(db_id) > 0:
+            try:
+                _db_export_delete_row(int(db_id))
+            except Exception:
+                pass
+
+        return False, "📑 Не удалось отправить архив базы данных."
 
 def _send_db_files_to_chat(chat_id: int) -> tuple[bool, str]:
     main_copy = ""
@@ -7016,6 +8426,63 @@ def render_db_file_stat_text(owner_id: int) -> str:
 
     return "\n".join(lines)
 
+def _fmt_db_export_source(source_kind: str) -> str:
+    kind = str(source_kind or "").strip().upper()
+    if kind == "BACKUP":
+        return "backup"
+    return "main"
+
+def _db_export_rows(limit: int = 200):
+    return db_all(
+        "SELECT db_id, source_kind, archive_path, requested_by, created_at, request_text "
+        "FROM db_file_exports "
+        "ORDER BY db_id DESC "
+        "LIMIT ?",
+        (int(limit),)
+    ) or []
+
+def render_db_export_ids_text(owner_id: int) -> str:
+    rows = _db_export_rows(200)
+
+    lines = []
+    lines.append("🧾 Список известных db_id")
+
+    if not rows:
+        lines.append("<blockquote expandable>Список db_id пока пуст.</blockquote>")
+        return "\n".join(lines)
+
+    lines.append("<blockquote expandable>")
+    for r in rows:
+        db_id = int(r["db_id"] or 0)
+        source_kind = _fmt_db_export_source(r["source_kind"] or "")
+        created_at = int(r["created_at"] or 0)
+        dt_txt = time.strftime("%d.%m.%Y %H:%M", time.localtime(created_at)) if created_at > 0 else "—"
+        request_text = (r["request_text"] or "").strip()
+        if request_text:
+            lines.append(
+                f"<code>{db_id}</code> | {h(source_kind)} | {h(dt_txt)} | {h(request_text)}"
+            )
+        else:
+            lines.append(
+                f"<code>{db_id}</code> | {h(source_kind)} | {h(dt_txt)}"
+            )
+    lines.append("</blockquote>")
+    lines.append("")
+    lines.append("💬 Каждый <code>db_id</code> можно скопировать из списка и использовать далее в /db_fife_upd")
+
+    return "\n".join(lines)
+
+def kb_db_export_ids(owner_id: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup()
+    kb.add(
+        _ikb(
+            "Состояние db",
+            callback_data=_dbstat_cb(int(owner_id), "BACK"),
+            style="primary"
+        )
+    )
+    return kb
+
 def _run_db_file_msg_once(now_value: int):
     rows = db_all(
         "SELECT user_id, repeat_spec, next_run_ts, updated_at "
@@ -7067,16 +8534,19 @@ def handle_owner_db_commands(message, parsed: "Parsed"):
     upsert_user(message.from_user)
 
     if message.chat.type != "private":
-        bot.reply_to(message, "📑 Эта команда работает только в личных сообщениях бота.")
         return
 
     if not can_manage_support(uid):
-        bot.reply_to(message, "📑 Эта команда доступна только владельцу бота.")
         return
 
     if parsed.cmd == "db_fife":
-        ok, msg = _send_db_files_to_chat(int(message.chat.id))
-        bot.reply_to(message, msg)
+        bot.reply_to(
+            message,
+            "📦 Какие файлы баз данных отправить?",
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=kb_db_file_export_choice(int(uid))
+        )
         return
 
     if parsed.cmd == "db_fife_stat":
@@ -7084,20 +8554,48 @@ def handle_owner_db_commands(message, parsed: "Parsed"):
             message,
             render_db_file_stat_text(int(uid)),
             parse_mode="HTML",
-            disable_web_page_preview=True
+            disable_web_page_preview=True,
+            reply_markup=kb_db_file_stat(int(uid))
         )
         return
 
     if parsed.cmd == "db_fife_msg":
-        spec, err = _timer_parse_period_spec((parsed.args or "").strip())
+        raw_args = (parsed.args or "").strip()
+
+        if raw_args == "0":
+            row = _db_schedule_row(int(uid))
+            if not row or int(row["next_run_ts"] or 0) <= 0:
+                bot.reply_to(message, "📑 Автосэйв уже выключен.")
+                return
+
+            _db_schedule_clear(int(uid))
+            bot.reply_to(message, "✅ Автосэйв сброшен.")
+            return
+
+        spec, err = _timer_parse_period_spec(raw_args)
         if not spec:
             bot.reply_to(message, err)
+            return
+
+        ok, limit_err = _db_schedule_validate_spec(spec)
+        if not ok:
+            bot.reply_to(message, limit_err)
             return
 
         _db_schedule_set(int(uid), spec)
         bot.reply_to(
             message,
             f"✅ Автосэйв включен.\n⌛ {_timer_spec_to_text(spec)}",
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
+        return
+
+    if parsed.cmd == "db_fife_upd":
+        ok, msg = _handle_db_fife_upd_command(message, parsed)
+        bot.reply_to(
+            message,
+            msg,
             parse_mode="HTML",
             disable_web_page_preview=True
         )
@@ -7220,7 +8718,7 @@ def _pick_random_common_chat_for_user(user_id: int) -> int:
     set_notify_prefs(int(user_id), cid, 0)
     return cid
 
-def send_user_notification(user_id: int, text: str):
+def send_user_notification(user_id: int, text: str, *, respect_notify_off: bool = True):
     """
     Отправляет уведомление пользователю по правилам:
     - если уведомления отключены -> None
@@ -7234,7 +8732,7 @@ def send_user_notification(user_id: int, text: str):
 
     try:
         notify_chat_id, notify_off = get_notify_prefs(uid)
-        if int(notify_off) == 1 and int(notify_chat_id) == 0:
+        if respect_notify_off and int(notify_off) == 1 and int(notify_chat_id) == 0:
             return None
 
         pm_opened = get_pm_opened(uid)
@@ -7437,10 +8935,7 @@ def render_settings_text(user_id: int, current_chat_id: int = 0) -> str:
     lines.append(f"Уведомления: {notify_txt}")
 
     if int(cid) > 0:
-        if role in ("owner", "deputy"):
-            corp_notify_txt = "🔊" if corp_notify_enabled(uid) == 1 else "🔇"
-        else:
-            corp_notify_txt = "—"
+        corp_notify_txt = "🔊" if corp_notify_enabled(uid) == 1 else "🔇"
         lines.append(f"Корпоративные уведомления: {corp_notify_txt}")
 
     if deleted_row:
@@ -7496,7 +8991,7 @@ def kb_settings(
             kb.add(_ikb("Перевести уведомления в этот чат", callback_data=_settings_cb(uid, "NCHAT"), style="primary"))
 
     _cid, _cname, role = _user_corp_role_soft(uid)
-    if role in ("owner", "deputy"):
+    if int(_cid) > 0:
         en = corp_notify_enabled(uid)
         kb.add(
             _ikb(
@@ -7550,6 +9045,21 @@ def _report_parse_cb(data: str):
     except Exception:
         return None, None
 
+def _report_is_test_user(user_id: int) -> bool:
+    uid = int(user_id)
+    return is_creator(uid) or is_owner(uid) or is_agent(uid)
+
+def _report_test_prefix_html() -> str:
+    return "<b>⚠️ Это тестовое сообщение</b>"
+
+def _report_text_for_user(user_id: int, text: str) -> str:
+    body = str(text or "").strip()
+    if _report_is_test_user(int(user_id)):
+        if body:
+            return f"{_report_test_prefix_html()}\n{body}"
+        return _report_test_prefix_html()
+    return body
+
 def kb_report_menu(uid: int, *, appeal_only: bool = False) -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup(row_width=2)
 
@@ -7572,12 +9082,13 @@ def _report_prompt(uid: int, cat: str) -> str:
     cat = str(cat or "").upper()
 
     if cat == "USER":
-        return (
+        text = (
             "Отправьте одним сообщением:\n"
-            "1-я строка @username нарушителя\n"
-            "со 2-й строки описание проблемы\n\n"
+            "・ 1-я строка @username нарушителя\n"
+            "・ со 2-й строки описание проблемы\n\n"
             "Можно прикрепить фото или видео к этому сообщению."
         )
+        return _report_text_for_user(int(uid), text)
 
     if cat == "RESTORE":
         row = get_deleted_lab_row(int(uid))
@@ -7589,41 +9100,51 @@ def _report_prompt(uid: int, cat: str) -> str:
                 f"\n\n🧾 Лаборатория удалена: <code>{h(_fmt_ts(deleted_at))}</code>\n"
                 f"🧾 Крайний срок восстановления через поддержку: <code>{h(_fmt_ts(purge_at))}</code>"
             )
-        return (
-            "Опишите запрос на восстановление лаборатории одним сообщением.\n"
+        text = (
+            "Опишите Ваш запрос на восстановление лаборатории одним сообщением.\n"
             "Можно приложить фото или видео.\n"
-            "Желательно указать, почему требуется восстановление через поддержку."
+            "Подробнее опишите причину."
             f"{extra}"
         )
+        return _report_text_for_user(int(uid), text)
 
     if cat == "APPEAL":
-        return (
+        text = (
             "Отправьте описание апелляции одним сообщением.\n\n"
             "Можно прикрепить фото или видео к этому сообщению."
         )
+        return _report_text_for_user(int(uid), text)
 
-    return (
+    text = (
         "Отправьте описание проблемы одним сообщением.\n\n"
         "Можно прикрепить фото или видео к этому сообщению."
     )
+    return _report_text_for_user(int(uid), text)
 
-def _send_report_to_owner(admin_text: str, media_type: str = "", media_file_id: str = "") -> bool:
+def _send_report_to_service_team(admin_text: str, media_type: str = "", media_file_id: str = "") -> bool:
     try:
         if media_type and media_file_id:
             if len(admin_text) <= 900:
-                if media_type == "photo":
-                    bot.send_photo(OWNER_ID, media_file_id, caption=admin_text, parse_mode="HTML")
-                else:
-                    bot.send_video(OWNER_ID, media_file_id, caption=admin_text, parse_mode="HTML")
-            else:
-                bot.send_message(OWNER_ID, admin_text, parse_mode="HTML", disable_web_page_preview=True)
-                if media_type == "photo":
-                    bot.send_photo(OWNER_ID, media_file_id)
-                else:
-                    bot.send_video(OWNER_ID, media_file_id)
-        else:
-            bot.send_message(OWNER_ID, admin_text, parse_mode="HTML", disable_web_page_preview=True)
-        return True
+                return _send_media_to_report_recipients(
+                    media_type,
+                    media_file_id,
+                    caption=admin_text,
+                    parse_mode="HTML"
+                )
+
+            ok_text = _send_message_to_report_recipients(
+                admin_text,
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
+            ok_media = _send_media_to_report_recipients(media_type, media_file_id)
+            return bool(ok_text or ok_media)
+
+        return _send_message_to_report_recipients(
+            admin_text,
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
     except Exception:
         return False
 
@@ -7640,11 +9161,15 @@ def _handle_report_content_message(message) -> bool:
         raw = (message.caption or "").strip()
 
     if raw.startswith("/"):
-        bot.reply_to(message, "Заполните форму одним сообщением (текст + опционально фото/видео).")
-        return True
+        return False
 
     if not raw:
-        bot.reply_to(message, "Пустое сообщение. Пришлите текст описания, при желании добавив фото или видео.")
+        bot.reply_to(
+            message,
+            _report_text_for_user(uid, "Пустое сообщение. Пришлите текст описания, при желании добавив фото или видео."),
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
         return True
 
     target_un = ""
@@ -7654,17 +9179,39 @@ def _handle_report_content_message(message) -> bool:
 
     if is_bot_banned(int(uid)) and cat_u != "APPEAL":
         report_clear_state(int(uid))
-        bot.reply_to(message, "Для заблокированных пользователей доступна только апелляция.")
+        bot.reply_to(
+            message,
+            _report_text_for_user(uid, "Для заблокированных пользователей доступна только апелляция."),
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
         return True
 
     if cat_u == "USER":
         lines = raw.splitlines()
         if not lines or not lines[0].strip().startswith("@"):
+            bot.reply_to(
+                message,
+                _report_text_for_user(
+                    uid,
+                    "Для жалобы на пользователя укажите сообщение в формате:\n"
+                    "1-я строка — @username нарушителя\n"
+                    "со 2-й строки — описание проблемы."
+                ),
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
             return True
+
         target_un = lines[0].strip()
         desc = "\n".join(lines[1:]).strip()
         if not desc:
-            bot.reply_to(message, "Добавьте описание проблемы со второй строки.")
+            bot.reply_to(
+                message,
+                _report_text_for_user(uid, "Добавьте описание проблемы со второй строки."),
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
             return True
     else:
         desc = raw.strip()
@@ -7675,7 +9222,7 @@ def _handle_report_content_message(message) -> bool:
     ts_txt = _fmt_ts(now_ts())
     cat_title = REPORT_CATS.get(cat_u, cat_u)
 
-    admin_text = f"Репорт {h(ts_txt)}\nОт {from_line}\nКатегория {h(cat_title)}\n"
+    admin_text = f"Репорт {h(ts_txt)}\nОт {from_line}\nКатегория: {h(cat_title)}\n"
 
     if cat_u == "USER":
         admin_text += f"На {h(target_un)}\n"
@@ -7693,6 +9240,9 @@ def _handle_report_content_message(message) -> bool:
     admin_text += "Описание проблемы:\n"
     admin_text += f"<i>{h(desc)}</i>"
 
+    if _report_is_test_user(uid):
+        admin_text = f"{_report_test_prefix_html()}\n{admin_text}"
+
     media_type = ""
     media_file_id = ""
     try:
@@ -7706,22 +9256,41 @@ def _handle_report_content_message(message) -> bool:
         media_type = ""
         media_file_id = ""
 
-    ok = _send_report_to_owner(admin_text, media_type=media_type, media_file_id=media_file_id)
+    ok = _send_report_to_service_team(admin_text, media_type=media_type, media_file_id=media_file_id)
     if not ok:
-        bot.reply_to(message, "Не удалось отправить репорт. Попробуйте позже.")
+        bot.reply_to(
+            message,
+            _report_text_for_user(uid, "Не удалось отправить репорт. Попробуйте позже."),
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
         return True
 
     report_clear_state(uid)
 
     if cat_u == "RESTORE":
-        bot.reply_to(message, "Запрос на восстановление лаборатории отправлен администрации на рассмотрение.")
+        bot.reply_to(
+            message,
+            _report_text_for_user(uid, "Запрос на восстановление лаборатории отправлен тех.поддержке на рассмотрение."),
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
     else:
-        bot.reply_to(message, "Репорт отправлен администратору на рассмотрение. Благодарим вас за поддержку проекта.")
+        bot.reply_to(
+            message,
+            _report_text_for_user(uid, "Репорт отправлен тех.поддержке на рассмотрение. Благодарим вас за поддержку проекта."),
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
     return True
 
 def handle_report_command(message):
     if message.chat.type != "private":
-        bot.reply_to(message, "📑 Эта команда работает только в личных сообщениях бота.")
+        bot.reply_to(
+            message,
+            "📑 Эта команда работает только в личных сообщениях бота.",
+            reply_markup=kb_open_bot_pm()
+        )
         return
 
     uid = int(message.from_user.id)
@@ -7732,7 +9301,9 @@ def handle_report_command(message):
 
     bot.reply_to(
         message,
-        "Выберите категорию запроса:",
+        _report_text_for_user(uid, "Выберите категорию запроса:"),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
         reply_markup=kb_report_menu(uid, appeal_only=appeal_only)
     )
 
@@ -7830,10 +9401,6 @@ def get_balance_chain_button_text(user_id: int) -> str:
     if not state:
         return ""
     return str(state.get("button_text") or "").strip()
-
-def has_balance_chain_state(user_id: int) -> bool:
-    state = get_balance_chain_state(int(user_id))
-    return bool(state and str(state.get("chain_kind") or "").strip())
 
 # chat member
 def remember_chat_member(chat_id: int, tg_user):
@@ -8092,47 +9659,6 @@ def _pick_reply_target_id(message, *, exclude_user_ids=None) -> Optional[int]:
         return int(ids[0])
     return int(random.choice(ids))
 
-def _resolve_target_from_reply_message_content(message, *, exclude_user_id: int = 0) -> Optional[int]:
-    rm = getattr(message, "reply_to_message", None)
-    if not rm:
-        return None
-
-    exclude_user_id = int(exclude_user_id or 0)
-    raw, ents = _reply_message_text_and_entities(rm)
-
-    for e in ents:
-        et = (getattr(e, "type", "") or "").strip().lower()
-
-        if et == "text_mention":
-            u = getattr(e, "user", None)
-            if u and getattr(u, "id", None):
-                uid = int(u.id)
-                if uid != exclude_user_id:
-                    try:
-                        capture_user_context(message, u)
-                    except Exception:
-                        pass
-                    return uid
-
-        token = ""
-        if et == "text_link":
-            token = (getattr(e, "url", "") or "").strip()
-        elif et == "url":
-            token = _entity_slice_text(raw, e).strip()
-        elif et == "mention":
-            token = _entity_slice_text(raw, e).strip()
-
-        if token:
-            tid = _strict_single_target_token(token)
-            if tid is not None and int(tid) != exclude_user_id:
-                return int(tid)
-
-    tid = _resolve_single_target_from_text(raw, _strict_single_target_token)
-    if tid is not None and int(tid) != exclude_user_id:
-        return int(tid)
-
-    return None
-
 def resolve_target_from_reply_or_args(message, parsed: Optional["Parsed"]):
     """
     Возвращает (target_id, target_user_obj_or_None).
@@ -8346,13 +9872,22 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
         c = parts[0].lower()
         a = parts[1].strip() if len(parts) > 1 else ""
 
-        if c in ("owner", "агент", "owner_remove", "agents", 
-                 "blacklist", "users", "bot_ban", "bot_unban", "remake_lab", 
-                 "db_fife", "db_fife_stat", "db_fife_msg", "its"):
+        if c in (
+            "owner", "owner_remove",
+            "my_owner", "my_owner_remove",
+            "agent", "агент", "agent_remove",
+            "agents",
+            "blacklist", "users", "bot_ban", "bot_unban", "remake_lab",
+            "db_fife", "db_fife_stat", "db_fife_msg", "db_fife_upd", "its"
+        ):
             cmd_map = {
                 "owner": "owner",
-                "агент": "owner",
                 "owner_remove": "owner_remove",
+                "my_owner": "my_owner",
+                "my_owner_remove": "my_owner_remove",
+                "agent": "agent",
+                "агент": "agent",
+                "agent_remove": "agent_remove",
                 "agents": "agents_panel",
                 "blacklist": "blacklist",
                 "users": "users_list",
@@ -8362,6 +9897,7 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
                 "db_fife": "db_fife",
                 "db_fife_stat": "db_fife_stat",
                 "db_fife_msg": "db_fife_msg",
+                "db_fife_upd": "db_fife_upd",
                 "its": "its",
             }
             return Parsed(raw=raw_multiline, has_prefix_char=True, prefix_char=pch, cmd=cmd_map[c], args=a)
@@ -8388,10 +9924,20 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
         parts = body.split(" ", 1)
         c = parts[0].lower()
         a = parts[1].strip() if len(parts) > 1 else ""
-        if c in ("owner", "агент"):
-            return Parsed(raw=raw, has_prefix_char=True, prefix_char=prefix_char, cmd="owner", args=a)
+        if c in ("owner", "owner_remove", "my_owner", "my_owner_remove", "agent", "агент", "agent_remove"):
+            cmd_map = {
+                "owner": "owner",
+                "owner_remove": "owner_remove",
+                "my_owner": "my_owner",
+                "my_owner_remove": "my_owner_remove",
+                "agent": "agent",
+                "агент": "agent",
+                "agent_remove": "agent_remove",
+            }
+            return Parsed(raw=raw, has_prefix_char=True, prefix_char=prefix_char, cmd=cmd_map[c], args=a)
+
         if c in ("bot_ban", "bot_unban", "remake_lab",
-                 "db_fife", "db_fife_stat", "db_fife_msg", "its"):
+                 "db_fife", "db_fife_stat", "db_fife_msg", "db_fife_upd", "its"):
             return Parsed(raw=raw, has_prefix_char=True, prefix_char=prefix_char, cmd=c, args=a)
         return None
 
@@ -8467,12 +10013,39 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
     if low in ("agents", "агенты"):
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="agents_panel", args="")
 
+    if low == "my_owner":
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="my_owner", args="")
+
+    if low == "my_owner_remove":
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="my_owner_remove", args="")
+
+    if low == "owner" or low.startswith("owner "):
+        rest = ""
+        parts = t.split(" ", 1)
+        if len(parts) > 1:
+            rest = parts[1].strip()
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="owner", args=rest)
+
     if low.startswith("owner_remove"):
         rest = ""
         parts = t.split(" ", 1)
         if len(parts) > 1:
             rest = parts[1].strip()
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="owner_remove", args=rest)
+
+    if low == "agent" or low == "агент" or low.startswith("agent ") or low.startswith("агент "):
+        rest = ""
+        parts = t.split(" ", 1)
+        if len(parts) > 1:
+            rest = parts[1].strip()
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="agent", args=rest)
+
+    if low.startswith("agent_remove"):
+        rest = ""
+        parts = t.split(" ", 1)
+        if len(parts) > 1:
+            rest = parts[1].strip()
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="agent_remove", args=rest)
 
     if low == "blacklist":
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="blacklist", args="")
@@ -9137,34 +10710,92 @@ def format_agent_line(a: sqlite3.Row) -> str:
     name = standard_display_name(fn, ln, username, uid)
     return tg_mention(uid, name, username=username)
 
+def _panel_role_row(user_id: int, role_text: str):
+    uid = int(user_id)
+    row = get_user_row(uid)
+    return {
+        "user_id": uid,
+        "username": (row["username"] or "") if row else "",
+        "first_name": (row["first_name"] or "") if row else "",
+        "last_name": (row["last_name"] or "") if row else "",
+        "last_seen": int(row["last_seen"] or 0) if row else 0,
+        "role_text": str(role_text or "").strip(),
+    }
+
+def _panel_owner_rows(exclude_user_id: int = 0):
+    rows = []
+    creator_id = int(get_current_creator_id())
+
+    rows.append(_panel_role_row(creator_id, "создатель"))
+
+    for r in get_bot_owners():
+        uid = int(r["user_id"])
+        if uid == creator_id:
+            continue
+        rows.append(_panel_role_row(uid, "старший агент"))
+
+    out = []
+    seen = set()
+    for r in rows:
+        uid = int(r["user_id"])
+        if uid == int(exclude_user_id):
+            continue
+        if uid in seen:
+            continue
+        seen.add(uid)
+        out.append(r)
+    return out
+
 def build_start_text(user) -> str:
-    agents = get_support_agents()
-    online, offline = split_agents_by_online(agents)
+    support_rows = []
+    seen = set()
+
+    for r in _panel_owner_rows(0):
+        uid = int(r["user_id"])
+        if uid in seen:
+            continue
+        seen.add(uid)
+        support_rows.append(r)
+
+    for r in get_support_agents():
+        uid = int(r["user_id"])
+        if uid in seen:
+            continue
+        seen.add(uid)
+        support_rows.append(r)
+
+    online, offline = split_agents_by_online(support_rows)
 
     u_name = user_full_name(user)
+
+    def _support_line(a) -> str:
+        prefix = ""
+        return prefix + format_agent_line(a)
 
     lines = []
     lines.append(f'👋 Приветствуем вас, <b>{h(u_name)}</b>, в {h(BOT_TITLE)}')
     lines.append(f'Я создан на основе старой игры бота <a href="{h(IRIS_BOT_LINK)}">Iris | Чат-менеджер</a> с некоторыми доработками.\n')
     lines.append("Что вас интересует?")
     lines.append(f'1. <code>Био настройки</code> — более гибкая настройка параметров уведомлений и прочего.')
-    lines.append(f'2. <code>Био репорт</code> — если заметили, что в моей работе что-то не так, уведомите агентов.\n')
+    lines.append(f'2. <code>Био репорт</code> — если заметили, что в моей работе что-то не так, уведомите тех.поддержку.\n')
 
     lines.append('👨‍⚕️ <b>Агенты поддержки</b>, которые могут ответить на ваши вопросы')
 
-    if online:
-        lines.append("🟢 Онлайн")
-        lines.extend([format_agent_line(a) for a in online])
-    if offline:
-        lines.append("🔘 Оффлайн")
-        lines.extend([format_agent_line(a) for a in offline])
+    if not online and not offline:
+        lines.append("Список пока пуст.")
+    else:
+        if online:
+            lines.append("🟢 Онлайн")
+            lines.extend([_support_line(a) for a in online])
+        if offline:
+            lines.append("🔘 Оффлайн")
+            lines.extend([_support_line(a) for a in offline])
 
     lines.append("")
     lines.append(f'📑 Список всех команд <a href="{h(URL_COMMANDS)}">с их описанием</a>')
     lines.append(f'📑 Чат <a href="{h(URL_SUPPORT_CHAT)}">тех.поддержки</a>')
     lines.append(f'📑 Основной <a href="{h(URL_DEV_CHANNEL)}">канал разработки бота</a>')
     lines.append(f'💬 Для повторного вызова агент-листа, введите в чат \"<code>.помощь</code>\"')
-
 
     return "\n".join(lines)
 
@@ -9546,8 +11177,8 @@ def handle_agents_panel_command(message):
         return
 
     uid = int(message.from_user.id)
-    if not is_support(uid):
-        bot.reply_to(message, "📑 Эта команда доступна только агентам техподдержки и владельцу бота.")
+    if not (is_creator(uid) or is_support(uid)):
+        bot.reply_to(message, "📑 Эта команда доступна только технической поддержке.")
         return
 
     bot.reply_to(
@@ -9557,25 +11188,141 @@ def handle_agents_panel_command(message):
         disable_web_page_preview=True
     )
 
+def handle_my_owner_command(message, parsed: Parsed):
+    if not parsed.has_prefix_char or parsed.cmd != "my_owner":
+        return
+    if message.chat.type != "private":
+        bot.reply_to(message, "📑 Эта команда работает только в личных сообщениях бота.")
+        return
+
+    uid = int(message.from_user.id)
+    if not is_creator(uid):
+        bot.reply_to(message, "📑 Только создатель бота может выдавать себе owner-права.")
+        return
+
+    if is_owner(uid):
+        bot.reply_to(message, "📑 У вас уже есть owner-права.")
+        return
+
+    add_bot_owner(uid, uid)
+    bot.reply_to(message, "✅ Вы выдали себе owner-права.")
+
+def handle_my_owner_remove_command(message, parsed: Parsed):
+    if not parsed.has_prefix_char or parsed.cmd != "my_owner_remove":
+        return
+    if message.chat.type != "private":
+        bot.reply_to(message, "📑 Эта команда работает только в личных сообщениях бота.")
+        return
+
+    uid = int(message.from_user.id)
+    if not is_creator(uid):
+        bot.reply_to(message, "📑 Только создатель бота может снимать с себя owner-права.")
+        return
+
+    if not is_owner(uid):
+        bot.reply_to(message, "📑 У вас уже нет owner-прав.")
+        return
+
+    remove_bot_owner(uid)
+    bot.reply_to(message, "✅ Вы сняли с себя owner-права.")
+
 def handle_owner_remove_command(message, parsed: Parsed):
     if message.chat.type != "private":
         bot.reply_to(message, "📑 Эта команда работает только в личных сообщениях бота.")
         return
 
     uid = int(message.from_user.id)
-    if not can_manage_support(uid):
-        bot.reply_to(message, "📑 Только владелец бота может снимать права с агента.")
+    if not can_manage_owners(uid):
+        bot.reply_to(message, "📑 Только создатель бота может снимать owner-права.")
         return
 
     target_id = resolve_target_id((parsed.args or "").strip())
     if target_id is None:
         return
 
-    if int(target_id) == int(CREATOR_ID):
-        bot.reply_to(message, "📑 Нельзя снять права с создателя бота.")
+    current_creator_id = int(get_current_creator_id())
+    if int(target_id) == current_creator_id:
+        bot.reply_to(message, "📑 Нельзя снять owner-права с текущего создателя через /owner_remove. Используйте /my_owner_remove.")
         return
 
-    remove_support_agent(int(target_id))
+    if not is_owner(int(target_id)):
+        bot.reply_to(message, f"📑 Пользователь <code>{int(target_id)}</code> не является старшим агентом.", parse_mode="HTML")
+        return
+
+    remove_bot_owner(int(target_id))
+    bot.reply_to(message, f"✅ Пользователь <code>{int(target_id)}</code> больше не является старшим агентом.", parse_mode="HTML")
+
+def handle_agent_command(message, parsed: Parsed):
+    if not parsed.has_prefix_char or parsed.cmd != "agent":
+        return
+    if message.chat.type != "private":
+        bot.reply_to(message, "📑 Эта команда работает только в личных сообщениях бота.")
+        return
+
+    uid = int(message.from_user.id)
+    if not can_manage_agents(uid):
+        bot.reply_to(message, "📑 Только старший агент может назначать агентов техподдержки.")
+        return
+
+    target_id = resolve_target_id((parsed.args or "").strip())
+    if target_id is None:
+        return
+
+    current_creator_id = int(get_current_creator_id())
+    if int(target_id) == current_creator_id:
+        bot.reply_to(message, "📑 Создателя бота нельзя назначить агентом техподдержки.")
+        return
+
+    if is_owner(int(target_id)):
+        bot.reply_to(message, "📑 Старшему агенту не нужно выдавать права агента техподдержки отдельно.")
+        return
+
+    if is_agent(int(target_id)):
+        bot.reply_to(message, f"📑 Пользователь <code>{int(target_id)}</code> уже является агентом техподдержки.", parse_mode="HTML")
+        return
+
+    add_agent(int(target_id), uid)
+
+    row = get_user_row(int(target_id))
+    disp = display_name(row["first_name"] or "", row["last_name"] or "", row["username"] or "", int(target_id)) if row else str(int(target_id))
+    un = (row["username"] or "") if row else ""
+    bot.reply_to(
+        message,
+        f"✅ Пользователь <b>{tg_mention(int(target_id), disp, username=un)}</b> назначен агентом технической поддержки.",
+        parse_mode="HTML",
+        disable_web_page_preview=True
+    )
+
+def handle_agent_remove_command(message, parsed: Parsed):
+    if not parsed.has_prefix_char or parsed.cmd != "agent_remove":
+        return
+    if message.chat.type != "private":
+        bot.reply_to(message, "📑 Эта команда работает только в личных сообщениях бота.")
+        return
+
+    uid = int(message.from_user.id)
+    if not can_manage_agents(uid):
+        bot.reply_to(message, "📑 Только старший агент может снимать права агента техподдержки.")
+        return
+
+    target_id = resolve_target_id((parsed.args or "").strip())
+    if target_id is None:
+        return
+
+    current_creator_id = int(get_current_creator_id())
+    if int(target_id) == current_creator_id:
+        bot.reply_to(message, "📑 Нельзя снять права агента с текущего создателя бота.")
+        return
+
+    if is_owner(int(target_id)):
+        bot.reply_to(message, "📑 У старшего агента нет отдельной агентской роли для снятия.")
+        return
+
+    if not is_agent(int(target_id)):
+        bot.reply_to(message, f"📑 Пользователь <code>{int(target_id)}</code> не является агентом техподдержки.", parse_mode="HTML")
+        return
+
+    remove_agent(int(target_id))
     bot.reply_to(message, f"✅ Пользователь <code>{int(target_id)}</code> больше не является агентом техподдержки.", parse_mode="HTML")
 
 def handle_edit_k_command(message, parsed: Parsed):
@@ -9637,7 +11384,7 @@ def handle_admin_name_restriction_command(message, parsed: Parsed):
 
     uid = int(message.from_user.id)
     if not is_support(uid):
-        bot.reply_to(message, "📑 Эта команда доступна только агентам техподдержки и владельцу бота.")
+        bot.reply_to(message, "📑 Эта команда доступна только агентам техподдержки")
         return
 
     first_line, _body = _timer_first_line_and_body(message.text or "")
@@ -9698,7 +11445,7 @@ def handle_blacklist_command(message):
 
     uid = int(message.from_user.id)
     if not is_support(uid):
-        bot.reply_to(message, "📑 Эта команда доступна только агентам техподдержки и владельцу бота.")
+        bot.reply_to(message, "📑 Эта команда доступна только агентам техподдержки")
         return
 
     text, rm = render_blacklist_text(1)
@@ -9711,7 +11458,7 @@ def handle_users_list_command(message):
 
     uid = int(message.from_user.id)
     if not is_support(uid):
-        bot.reply_to(message, "📑 Эта команда доступна только агентам техподдержки и владельцу бота.")
+        bot.reply_to(message, "📑 Эта команда доступна только агентам техподдержки")
         return
 
     text, rm = render_users_text(1)
@@ -11004,7 +12751,8 @@ def _timer_validate_body_command(cmd_text: str) -> tuple[bool, str]:
     if parsed.cmd in (
         "timer_add_rel", "timer_add_abs", "timer_add_cycle",
         "timer_delete", "timer_clear_all", "timer_list",
-        "owner", "owner_remove", "agents_panel",
+        "owner", "owner_remove", "my_owner", "my_owner_remove",
+        "agent", "agent_remove", "agents_panel",
         "bot_ban", "bot_unban", "remake_lab",
         "report", "settings", "blacklist", "users_list",
         "name_lock_lab", "name_lock_pat"
@@ -11168,7 +12916,8 @@ def _execute_timer_command_text(user_id: int, chat_id: int, command_text: str):
     if parsed.cmd in (
         "timer_add_rel", "timer_add_abs", "timer_add_cycle",
         "timer_delete", "timer_clear_all", "timer_list",
-        "owner", "owner_remove", "agents_panel",
+        "owner", "owner_remove", "my_owner", "my_owner_remove",
+        "agent", "agent_remove", "agents_panel",
         "bot_ban", "bot_unban", "remake_lab",
         "report", "settings", "blacklist",
         "name_lock_lab", "name_lock_pat"
@@ -11347,14 +13096,12 @@ def _pick_cof_rost() -> int:
 SYNTH_COOLDOWN_SEC = 4 * 3600 # синтезация кулдаун
 FEVER_SEC = 60                 # горячка 1 мин
 INF_DAY = 1                    # заражение период 1 день
-MAX_FEVER_SEC = 3 * 3600  # максимум горячки 3 часа
 
 VACCINE_PRICE_BASE = 50
 VACCINE_PRICE_STEP = 50
 VACCINE_PRICE_EVERY_AVG_LVLS = 20
 VACCINE_PRICE_MAX = 2500
 
-INF_DURATION_SEC = INF_DAY * 86400 # таймер заражения
 FEVER_MAX_SEC = 3 * 3600  # максимум горячки 3 часа
 REINFECT_CD_SEC = 6 * 3600     # перезаражение 6 часов
 
@@ -11391,11 +13138,11 @@ BLUI_TAG = "K"
 USERSUI_TAG = "US"
 CHATSUI_TAG = "UC"
 EMPACKUI_TAG = "EP"
-RPUI_TAG = "RP"
 PROMOUI_TAG = "PR"
+DBSTATUI_TAG = "DBS"
+DBFILEUI_TAG = "DBF"
 PROMO_PAGE_SIZE = 15
 #           balance-chain kinds
-BALCHAIN_INFECT = "infect"
 BALCHAIN_UPGRADE = "upgrade"
 BALCHAIN_CORP_TRANSFER = "corp_transfer"
 BALCHAIN_VACCINE = "vaccine"
@@ -11979,38 +13726,6 @@ def kb_infect_retry_user_upg(attacker_id: int, target_id: int) -> InlineKeyboard
     )
     return kb
 
-def kb_infect_retry_mass_upg(attacker_id: int, mode: str, chat_filter: str) -> InlineKeyboardMarkup:
-    kb = kb_infect_retry_mass(attacker_id, mode, chat_filter)
-    kb.row(
-        _ikb_premium_lead(
-            "🦠",
-            "Усилить заразность × 1",
-            callback_data=_upg_cb_i("P", attacker_id, "INF", 1, "M", str(mode), str(chat_filter)),
-            style="success"
-        )
-    )
-    kb.row(
-        _ikb_premium_counter(
-            "🦠",
-            "× 2",
-            callback_data=_upg_cb_i("P", attacker_id, "INF", 2, "M", str(mode), str(chat_filter)),
-            style="success"
-        ),
-        _ikb_premium_counter(
-            "🦠",
-            "× 3",
-            callback_data=_upg_cb_i("P", attacker_id, "INF", 3, "M", str(mode), str(chat_filter)),
-            style="success"
-        ),
-        _ikb_premium_counter(
-            "🦠",
-            "× 5",
-            callback_data=_upg_cb_i("P", attacker_id, "INF", 5, "M", str(mode), str(chat_filter)),
-            style="success"
-        ),
-    )
-    return kb
-
 def _parse_infect_cb(data: str):
     try:
         parts = (data or "").split(":")
@@ -12129,16 +13844,6 @@ def _pick_target_from_db(attacker_id: int, mode: str, chat_id: int, chat_filter:
         return random.choice(eq)
 
     return None
-
-def _resolve_target_from_bot_reply(message, attacker_id: int) -> Optional[int]:
-    """
-    Reply на сообщение бота/бота-подобное сообщение:
-    ищем все ссылки/упоминания пользователей, исключаем самого атакующего.
-    Если остаётся одна цель — берём её.
-    Если остаётся несколько — берём случайную.
-    """
-    tid = _pick_reply_target_id(message, exclude_user_ids={int(attacker_id)})
-    return int(tid) if tid is not None else None
 
 def _parse_infect_request(message, parsed: "Parsed", attacker_id: int) -> dict:
     """
@@ -12893,12 +14598,13 @@ CALC_BUFF_METRIC_ALIASES = {
 STRICT_NO_EXTRA_ARGS_CMDS = {
     "help", "commands_link", "report", "settings",
     "autoanswer_status", "autoanswer_on", "autoanswer_off",
-    "buy_vaccine", "use_vaccine",
+    "buy_vaccine",
     "lab_delete", "restore_lab",
     "corp_delete", "corp_open", "corp_close",
     "corp_req_list", "corp_leave", "corp_my",
     "rp_stats",
     "blacklist", "users_list", "agents_panel",
+    "my_owner", "my_owner_remove",
     "synth",
     "balance_show", "balance_hide", "lab_show", "lab_hide",
     "notify_on", "notify_off",
@@ -13969,15 +15675,6 @@ def kb_balance_self(uid: int) -> Optional[InlineKeyboardMarkup]:
 
     return kb if getattr(kb, "keyboard", None) else None
 
-def kb_balance_resume_only(uid: int) -> Optional[InlineKeyboardMarkup]:
-    btn_text = get_balance_chain_button_text(int(uid))
-    if not btn_text:
-        return None
-
-    kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton(btn_text, callback_data=_balui_data(int(uid), "R"), style="primary"))
-    return kb
-
 def kb_balance_after_synth(uid: int) -> Optional[InlineKeyboardMarkup]:
     state = get_balance_chain_state(int(uid))
     if state and str(state.get("chain_kind") or "") == BALCHAIN_UPGRADE:
@@ -14027,12 +15724,6 @@ def _balance_chain_upgrade_button(
         callback_data=callback_data,
         style=style
     )
-
-def _balance_chain_upgrade_skill_token(code: str) -> str:
-    skill = SKILLS.get(str(code or "").strip().upper())
-    if skill:
-        return str(skill.get("title_2") or "").strip()
-    return str(code or "").strip().lower()
 
 def _balance_chain_can_resume(uid: int, state: dict) -> tuple[bool, str]:
     if not state:
@@ -14740,11 +16431,6 @@ def kb_pathogen_info(uid: int) -> InlineKeyboardMarkup:
     )
     return kb
 
-def kb_pathogen_brief_back(uid: int) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("Вернуться к сводке", callback_data=_pathogens_ui_data(uid, "INFO", 0), ))
-    return kb
-
 def render_pathogen_brief(uid: int) -> str:
     ensure_lab_exists(int(uid))
     lab = get_lab(int(uid))
@@ -14959,6 +16645,149 @@ def try_use_vaccine(user_id: int, doses: int = 1) -> tuple[str, int]:
             c.execute("UPDATE labs SET ready_vaccines=? WHERE user_id=?", (v, uid))
             conn.commit()
             return ("FAIL" if used > 0 else "NO_VACCINE"), used
+
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            try:
+                c.close()
+            except Exception:
+                pass
+
+def _parse_use_vaccine_args(message, parsed: "Parsed") -> tuple[int, Optional[int], object]:
+    """
+    Возвращает:
+      doses, target_id, target_user_obj
+
+    Поддержка:
+      использовать вакцину
+      использовать вакцину 5
+      использовать вакцину @user
+      использовать вакцину 5 @user
+      reply + использовать вакцину
+      reply + использовать вакцину 5
+    """
+    args = (parsed.args or "").strip()
+    if not args:
+        return 1, None, None
+
+    parts = args.split(None, 1)
+    doses = 1
+    tail = args
+
+    if parts and parts[0].isdigit():
+        doses = int(parts[0])
+        tail = parts[1].strip() if len(parts) > 1 else ""
+
+    doses = max(1, min(10, int(doses)))
+
+    if not tail:
+        return doses, None, None
+
+    fake = Parsed(
+        raw=parsed.raw,
+        has_prefix_char=parsed.has_prefix_char,
+        prefix_char=parsed.prefix_char,
+        cmd=parsed.cmd,
+        args=tail
+    )
+    target_id, target_user_obj = resolve_target_from_reply_or_args(message, fake)
+    return doses, target_id, target_user_obj
+
+def try_use_vaccine_for_target(actor_id: int, target_id: int, doses: int = 1) -> tuple[str, int]:
+    """
+    actor_id  — у кого списываем ready_vaccines
+    target_id — кого лечим от горячки
+
+    returns: (status, used)
+    status: "OK" | "FAIL" | "NO_FEVER" | "NO_VACCINE" | "NOT_SAME_CORP" | "BAD_TARGET"
+    used: сколько вакцин реально потрачено
+    """
+    actor_id = int(actor_id)
+    target_id = int(target_id)
+
+    if actor_id <= 0 or target_id <= 0:
+        return "BAD_TARGET", 0
+
+    if actor_id == target_id:
+        return try_use_vaccine(actor_id, doses)
+
+    if not same_corp(actor_id, target_id):
+        return "NOT_SAME_CORP", 0
+
+    now = now_ts()
+    _merge_placeholder_for_uid_if_possible(actor_id)
+    _merge_placeholder_for_uid_if_possible(target_id)
+    ensure_lab_exists(actor_id)
+    ensure_lab_exists(target_id)
+
+    try:
+        doses = int(doses)
+    except Exception:
+        doses = 1
+    doses = max(1, min(10, doses))
+
+    used = 0
+
+    with DB_LOCK:
+        c = conn.cursor()
+        try:
+            c.execute("BEGIN")
+
+            actor_row = c.execute(
+                "SELECT COALESCE(ready_vaccines,0) AS v FROM labs WHERE user_id=?",
+                (actor_id,)
+            ).fetchone()
+            target_row = c.execute(
+                "SELECT COALESCE(fever_until_ts,0) AS f FROM labs WHERE user_id=?",
+                (target_id,)
+            ).fetchone()
+
+            v = int(actor_row["v"] if actor_row else 0)
+            fever_until = int(target_row["f"] if target_row else 0)
+
+            if fever_until <= now:
+                conn.rollback()
+                return "NO_FEVER", 0
+
+            if v <= 0:
+                conn.rollback()
+                return "NO_VACCINE", 0
+
+            fail_pct = _vaccine_fail_pct(target_id)
+            cured = False
+
+            for _ in range(doses):
+                if v <= 0:
+                    break
+                v -= 1
+                used += 1
+
+                if fail_pct > 0 and random.randint(1, 100) <= fail_pct:
+                    continue
+
+                cured = True
+                break
+
+            if cured:
+                c.execute(
+                    "UPDATE labs SET ready_vaccines=? WHERE user_id=?",
+                    (int(v), actor_id)
+                )
+                c.execute(
+                    "UPDATE labs SET fever_until_ts=0, fever_pathogen='' WHERE user_id=?",
+                    (target_id,)
+                )
+                conn.commit()
+                return "OK", int(used)
+
+            c.execute(
+                "UPDATE labs SET ready_vaccines=? WHERE user_id=?",
+                (int(v), actor_id)
+            )
+            conn.commit()
+            return "FAIL", int(used)
 
         except Exception:
             conn.rollback()
@@ -16347,8 +18176,8 @@ def cb_settings_ui(cq):
 
         elif act == "CN":
             _cid, _cname, role = _user_corp_role_soft(int(uid))
-            if role not in ("owner", "deputy"):
-                bot.answer_callback_query(cq.id, "Корпоративные уведомления доступны только владельцу и заместителям.", show_alert=True)
+            if int(_cid) <= 0:
+                bot.answer_callback_query(cq.id, "📑 Вы не состоите в Корпорации.", show_alert=True)
                 return
             cur = corp_notify_enabled(int(uid))
             set_corp_notify_enabled(int(uid), 0 if cur == 1 else 1)
@@ -16359,7 +18188,7 @@ def cb_settings_ui(cq):
 
         current_chat_id = int(cq.message.chat.id) if cq.message else 0
         current_chat_type = (cq.message.chat.type if cq.message else "private")
-        text = render_settings_text(int(uid))
+        text = render_settings_text(int(uid), current_chat_id)
         rm = kb_settings(int(uid), current_chat_id, current_chat_type)
 
         if cq.inline_message_id:
@@ -16554,6 +18383,170 @@ def cb_cof_inf_stats_refresh(cq):
         send_error_report("cb_cof_inf_stats_refresh", e)
         try:
             bot.answer_callback_query(cq.id)
+        except Exception:
+            pass
+
+@bot.callback_query_handler(func=lambda cq: (cq.data or "").startswith(f"{DBFILEUI_TAG}:"))
+def cb_db_file_export(cq):
+    try:
+        payload = _db_file_export_parse_cb(cq.data or "")
+        if not payload:
+            bot.answer_callback_query(cq.id)
+            return
+
+        uid = int(cq.from_user.id)
+        target_uid = int(payload["user_id"])
+        source_kind = (payload["source_kind"] or "").strip().upper()
+
+        if uid != target_uid:
+            bot.answer_callback_query(cq.id, "📑 Это не ваша кнопка.")
+            return
+
+        if not can_manage_support(uid):
+            bot.answer_callback_query(cq.id)
+            return
+
+        ok, msg = _send_db_export_archive(int(uid), int(uid), source_kind)
+        if not ok:
+            try:
+                bot.answer_callback_query(cq.id, msg[:180], show_alert=True)
+            except Exception:
+                bot.answer_callback_query(cq.id)
+            return
+
+        if cq.inline_message_id:
+            limited_edit_message_text(
+                text=msg,
+                inline_id=cq.inline_message_id,
+                parse_mode="HTML",
+                reply_markup=None,
+                disable_web_page_preview=True
+            )
+        elif cq.message:
+            limited_edit_message_text(
+                text=msg,
+                chat_id=cq.message.chat.id,
+                msg_id=cq.message.message_id,
+                parse_mode="HTML",
+                reply_markup=None,
+                disable_web_page_preview=True
+            )
+
+        bot.answer_callback_query(cq.id, "Архив отправлен.")
+    except Exception as e:
+        send_error_report("cb_db_file_export", e)
+        try:
+            bot.answer_callback_query(cq.id, "Не удалось подготовить архив.")
+        except Exception:
+            pass
+
+@bot.callback_query_handler(func=lambda cq: (cq.data or "").startswith(f"{DBSTATUI_TAG}:"))
+def cb_db_file_stat(cq):
+    try:
+        payload = _dbstat_parse_cb(cq.data or "")
+        if not payload:
+            bot.answer_callback_query(cq.id)
+            return
+
+        uid = int(cq.from_user.id)
+        target_uid = int(payload["user_id"])
+        action = (payload["action"] or "").strip().upper()
+
+        if uid != target_uid:
+            bot.answer_callback_query(cq.id, "📑 Это не ваша кнопка.")
+            return
+
+        if not can_manage_support(uid):
+            bot.answer_callback_query(cq.id)
+            return
+
+        if action == "RESET":
+            row = _db_schedule_row(int(uid))
+            if not row or int(row["next_run_ts"] or 0) <= 0:
+                bot.answer_callback_query(cq.id, "📑 Автосэйв уже выключен.")
+                return
+
+            _db_schedule_clear(int(uid))
+            text = render_db_file_stat_text(int(uid))
+            rm = kb_db_file_stat(int(uid))
+
+            if cq.inline_message_id:
+                limited_edit_message_text(
+                    text=text,
+                    inline_id=cq.inline_message_id,
+                    parse_mode="HTML",
+                    reply_markup=rm,
+                    disable_web_page_preview=True
+                )
+            elif cq.message:
+                limited_edit_message_text(
+                    text=text,
+                    chat_id=cq.message.chat.id,
+                    msg_id=cq.message.message_id,
+                    parse_mode="HTML",
+                    reply_markup=rm,
+                    disable_web_page_preview=True
+                )
+
+            bot.answer_callback_query(cq.id, "Автосэйв сброшен.")
+            return
+
+        if action == "LIST":
+            text = render_db_export_ids_text(int(uid))
+            rm = kb_db_export_ids(int(uid))
+
+            if cq.inline_message_id:
+                limited_edit_message_text(
+                    text=text,
+                    inline_id=cq.inline_message_id,
+                    parse_mode="HTML",
+                    reply_markup=rm,
+                    disable_web_page_preview=True
+                )
+            elif cq.message:
+                limited_edit_message_text(
+                    text=text,
+                    chat_id=cq.message.chat.id,
+                    msg_id=cq.message.message_id,
+                    parse_mode="HTML",
+                    reply_markup=rm,
+                    disable_web_page_preview=True
+                )
+
+            bot.answer_callback_query(cq.id)
+            return
+
+        if action == "BACK":
+            text = render_db_file_stat_text(int(uid))
+            rm = kb_db_file_stat(int(uid))
+
+            if cq.inline_message_id:
+                limited_edit_message_text(
+                    text=text,
+                    inline_id=cq.inline_message_id,
+                    parse_mode="HTML",
+                    reply_markup=rm,
+                    disable_web_page_preview=True
+                )
+            elif cq.message:
+                limited_edit_message_text(
+                    text=text,
+                    chat_id=cq.message.chat.id,
+                    msg_id=cq.message.message_id,
+                    parse_mode="HTML",
+                    reply_markup=rm,
+                    disable_web_page_preview=True
+                )
+
+            bot.answer_callback_query(cq.id)
+            return
+
+        bot.answer_callback_query(cq.id)
+
+    except Exception as e:
+        send_error_report("cb_db_file_stat", e)
+        try:
+            bot.answer_callback_query(cq.id, "Не удалось выполнить действие.")
         except Exception:
             pass
 
@@ -17060,10 +19053,6 @@ def kb_duel_rematch(duel_row) -> Optional[InlineKeyboardMarkup]:
         _ikb("⚔️ Реванш", callback_data=_duel_rematch_cb(int(duel_id), int(allowed_id)), style="primary")
     )
     return kb
-
-def _duel_user_tag(chat_id: int, user_id: int) -> str:
-    with chat_name_context(int(chat_id)):
-        return public_user_tag(int(user_id))
 
 def _duel_invite_text(chat_id: int, challenger_id: int, target_id: int, stake_amount: int = 0) -> str:
     with chat_name_context(int(chat_id)):
@@ -19152,8 +21141,13 @@ def handle_owner_command(message, parsed: Parsed):
 
     upsert_user(message.from_user)
 
-    if not can_manage_support(message.from_user.id):
-        bot.reply_to(message, "📑 Ваш ранг не позволяет назначять агентов технической поддержки.")
+    if message.chat.type != "private":
+        bot.reply_to(message, "📑 Эта команда работает только в личных сообщениях бота.")
+        return
+
+    uid = int(message.from_user.id)
+    if not can_manage_owners(uid):
+        bot.reply_to(message, "📑 Только создатель бота может назначать агентов.")
         return
 
     if not parsed.args:
@@ -19163,19 +21157,26 @@ def handle_owner_command(message, parsed: Parsed):
     if target_id is None:
         return
 
-    if parsed.args.strip().startswith("@"):
-        if target_id is None:
-            return
+    current_creator_id = int(get_current_creator_id())
+    if int(target_id) == current_creator_id:
+        bot.reply_to(message, "📑 Нельзя назначить текущего создателя старшим агентом через /owner. Используйте /my_owner.")
+        return
 
-    add_support_agent(target_id, added_by=message.from_user.id, role="support")
-    ensure_lab_exists(target_id)
+    if is_owner(int(target_id)):
+        bot.reply_to(message, f"📑 Пользователь <code>{int(target_id)}</code> уже является старшим агентом.", parse_mode="HTML")
+        return
 
-    row = get_user_row(target_id)
-    disp = display_name(row["first_name"] or "", row["last_name"] or "", row["username"] or "", target_id) if row else str(target_id)
+    add_bot_owner(int(target_id), added_by=uid)
+    ensure_lab_exists(int(target_id))
+
+    row = get_user_row(int(target_id))
+    disp = display_name(row["first_name"] or "", row["last_name"] or "", row["username"] or "", int(target_id)) if row else str(int(target_id))
     un = (row["username"] or "") if row else ""
     bot.reply_to(
         message,
-        f"✅ Пользователь <b>{tg_mention(target_id, disp, username=un)}</b> назначен агентом технической поддержки.", disable_web_page_preview=True,
+        f"✅ Пользователь <b>{tg_mention(int(target_id), disp, username=un)}</b> назначен старшим агентом технической поддержки.",
+        parse_mode="HTML",
+        disable_web_page_preview=True
     )
 
 def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = None, actor_user=None):
@@ -22191,6 +24192,36 @@ def on_report_media(message):
         send_error_report("on_report_media", e)
 
 @bot.message_handler(
+    content_types=["document"],
+    func=lambda m: bool(parse_message_as_command((getattr(m, "caption", "") or "")))
+)
+def on_document_db_command(message):
+    try:
+        parsed = parse_message_as_command((getattr(message, "caption", "") or ""))
+        if not parsed:
+            return ContinueHandling
+
+        if parsed.cmd != "db_fife_upd":
+            return ContinueHandling
+
+        if getattr(message, "from_user", None) is None:
+            return ContinueHandling
+
+        uid = int(message.from_user.id)
+        upsert_user(message.from_user)
+        _merge_placeholder_to_real_user(message.from_user)
+
+        if message.chat.type == "private":
+            set_pm_opened(int(uid), 1)
+            set_notify_prefs(int(uid), 0, 0)
+
+        handle_owner_db_commands(message, parsed)
+    except Exception as e:
+        send_error_report("on_document_db_command", e)
+
+    return ContinueHandling
+
+@bot.message_handler(
     content_types=[
         "text", "photo", "video", "document", "audio", "voice", "sticker",
         "animation", "video_note", "location", "contact", "poll", "dice"
@@ -22242,20 +24273,27 @@ def text_router(message):
         if is_bot_banned(uid):
             if message.chat.type != "private":
                 return
-
+        
             stage, cat = report_get_state(int(uid))
-
+            parsed_banned = parse_message_as_command(message.text or "")
+        
             if stage == "await_content" and str(cat or "").upper() == "APPEAL":
                 upsert_user(message.from_user)
                 _merge_placeholder_to_real_user(message.from_user)
                 set_pm_opened(int(uid), 1)
                 set_notify_prefs(int(uid), 0, 0)
                 ensure_creator_is_support()
-                if _handle_report_content_message(message):
-                    return
-                return
-
-            parsed_banned = parse_message_as_command(message.text or "")
+        
+                if parsed_banned:
+                    if parsed_banned.cmd == "report":
+                        handle_report_command(message)
+                        return
+        
+                    report_clear_state(int(uid))
+                else:
+                    if _handle_report_content_message(message):
+                        return
+        
             if parsed_banned and parsed_banned.cmd == "report":
                 upsert_user(message.from_user)
                 _merge_placeholder_to_real_user(message.from_user)
@@ -22264,7 +24302,7 @@ def text_router(message):
                 ensure_creator_is_support()
                 handle_report_command(message)
                 return
-
+        
             bot.reply_to(message, render_bot_ban_text(uid), disable_web_page_preview=True)
             return
 
@@ -22278,11 +24316,21 @@ def text_router(message):
         if message.chat.type in ("group", "supergroup"):
             remember_chat_member(message.chat.id, message.from_user)       
         ensure_creator_is_support()
-        if message.chat.type == "private" and report_get_state(int(message.from_user.id))[0] == "await_content":
-            if _handle_report_content_message(message):
-                return
 
-        parsed = parse_message_as_command(message.text)
+        parsed = parse_message_as_command(message.text or "")
+        stage, cat = report_get_state(int(uid))
+
+        if message.chat.type == "private" and stage == "await_content":
+            if parsed:
+                if parsed.cmd == "report":
+                    handle_report_command(message)
+                    return
+
+                report_clear_state(int(uid))
+            else:
+                if _handle_report_content_message(message):
+                    return
+
         if not parsed:
             if try_handle_rp_action_message(message):
                 return
@@ -22323,18 +24371,32 @@ def text_router(message):
                     return
                 return
 
-        # /owner
+        if parsed.cmd == "my_owner":
+            handle_my_owner_command(message, parsed)
+            return
+
+        if parsed.cmd == "my_owner_remove":
+            handle_my_owner_remove_command(message, parsed)
+            return
+
         if parsed.cmd == "owner":
             handle_owner_command(message, parsed)
             return
 
-        # /owner_remove
         if parsed.cmd == "owner_remove":
             handle_owner_remove_command(message, parsed)
             return
+
+        if parsed.cmd == "agent":
+            handle_agent_command(message, parsed)
+            return
+
+        if parsed.cmd == "agent_remove":
+            handle_agent_remove_command(message, parsed)
+            return
         
         # data base
-        if parsed.cmd in ("db_fife", "db_fife_stat", "db_fife_msg", "its"):
+        if parsed.cmd in ("db_fife", "db_fife_stat", "db_fife_msg", "db_fife_upd", "its"):
             handle_owner_db_commands(message, parsed)
             return
 
@@ -22507,31 +24569,79 @@ def text_router(message):
         # использовать вакцину
         if parsed.cmd == "use_vaccine":
             uid = int(message.from_user.id)
-            fever_until, fever_pat, vac_cnt = get_fever_and_vaccines(uid)
-            now = now_ts()
-
-            if fever_until <= now:
-                bot.reply_to(message, "📝 У вас нет горячки. Нет необходимости использовать вакцину.")
+            doses, target_id, target_user_obj = _parse_use_vaccine_args(message, parsed)
+        
+            if target_user_obj is not None:
+                capture_user_context(message, target_user_obj)
+        
+            if target_id is None:
+                target_id = int(uid)
+        
+            if int(target_id) == int(uid):
+                fever_until, fever_pat, vac_cnt = get_fever_and_vaccines(uid)
+                now = now_ts()
+        
+                if fever_until <= now:
+                    bot.reply_to(message, "📝 У вас нет горячки. Нет необходимости использовать вакцину.")
+                    return
+        
+                status, used = try_use_vaccine(uid, int(doses))
+        
+                if status == "OK":
+                    word = _ru_form(int(used), "единица", "единицы", "единиц")
+                    bot.reply_to(message, f"💉 Вакцина излечила вас от горячки.\n🧾 Потрачено {int(used)} {word} вакцины")
+                elif status == "FAIL":
+                    bot.reply_to(message, VACCINE_FAIL_TEXT, disable_web_page_preview=True, reply_markup=kb_vaccine_retry(uid))
+                elif status == "NO_VACCINE":
+                    price_txt = _fmt_bio_res(get_vaccine_price(uid))
+                    kb = InlineKeyboardMarkup()
+                    kb.add(InlineKeyboardButton("💉 Купить вакцину", callback_data=_cb_buy_vaccine(uid), style="primary"))
+                    bot.reply_to(
+                        message,
+                        f"💉 Сейчас у вас нет ни одной вакцины. Для быстрого выздоровления вы можете купить вакцину: {price_txt}, команда \"<code>Био купить вакцину</code>\"",
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                        reply_markup=kb
+                    )
+                else:
+                    bot.reply_to(message, "📝 У вас нет горячки. Нет необходимости использовать вакцину.")
                 return
-
-            status, used = try_use_vaccine(uid, 1)
+        
+            if not same_corp(int(uid), int(target_id)):
+                bot.reply_to(message, "📑 Использовать вакцины на другого игрока можно только внутри вашей Корпорации.")
+                return
+        
+            fever_until, fever_pat, _ = get_fever_and_vaccines(int(target_id))
+            now = now_ts()
+        
+            if fever_until <= now:
+                bot.reply_to(message, "📝 У цели нет горячки. Нет необходимости использовать вакцину.")
+                return
+        
+            status, used = try_use_vaccine_for_target(int(uid), int(target_id), int(doses))
+            target_tag = _corp_actor_tag(int(target_id))
+        
             if status == "OK":
-                bot.reply_to(message, "💉 Вакцина излечила вас от горячки.\n🧾 Потрачена 1 единица вакцины")
-            elif status == "FAIL":
-                bot.reply_to(message, VACCINE_FAIL_TEXT, disable_web_page_preview=True, reply_markup=kb_vaccine_retry(uid))
-            elif status == "NO_VACCINE":
-                price_txt = _fmt_bio_res(get_vaccine_price(uid))
-                kb = InlineKeyboardMarkup()
-                kb.add(InlineKeyboardButton("💉 Купить вакцину", callback_data=_cb_buy_vaccine(uid), style="primary"))
+                word = _ru_form(int(used), "единица", "единицы", "единиц")
                 bot.reply_to(
                     message,
-                    f"💉 Сейчас у вас нет ни одной вакцины. Для быстрого выздоровления вы можете купить вакцину: {price_txt}, "
-                    f"команда \"<code>Био купить вакцину</code>\"",
-                    disable_web_page_preview=True,
-                    reply_markup=kb
+                    f"💉 Горячка игрока <b>{target_tag}</b> устранена.\n🧾 Потрачено {int(used)} {word} вакцины",
+                    parse_mode="HTML",
+                    disable_web_page_preview=True
                 )
+            elif status == "FAIL":
+                bot.reply_to(
+                    message,
+                    f"🧿 Вакцина не смогла справиться с болезнью игрока <b>{target_tag}</b>.",
+                    parse_mode="HTML",
+                    disable_web_page_preview=True
+                )
+            elif status == "NO_VACCINE":
+                bot.reply_to(message, "💉 Сейчас у вас нет ни одной вакцины.")
+            elif status == "NOT_SAME_CORP":
+                bot.reply_to(message, "📑 Использовать вакцины на другого игрока можно только внутри вашей Корпорации.")
             else:
-                bot.reply_to(message, "📝 У вас нет горячки. Нет необходимости использовать вакцину.")
+                bot.reply_to(message, "📝 У цели нет горячки. Нет необходимости использовать вакцину.")
             return
 
         # купить вакцину
@@ -22630,6 +24740,12 @@ if __name__ == "__main__":
         raise
 
     ensure_creator_is_support()
+
+    try:
+        _maybe_promote_unavailable_creator(force=True)
+    except Exception as e:
+        send_error_report("_maybe_promote_unavailable_creator_startup", e)
+
     refresh_bot_identity()
     threading.Thread(target=_infection_daemon, daemon=True).start()
     threading.Thread(target=_pathogen_factory_daemon, daemon=True).start()
