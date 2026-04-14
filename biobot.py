@@ -10856,19 +10856,43 @@ def handle_help_command(message):
         ensure_lab_exists(int(message.from_user.id))
     send_welcome_message(int(message.chat.id), message.from_user)
 
+def _format_ping_seconds_ms(delta_ms: int) -> str:
+    delta_ms = max(0, int(delta_ms or 0))
+    sec = delta_ms // 1000
+    ms = delta_ms % 1000
+
+    if ms == 0:
+        return f"{sec} {_ru_form(sec, 'секунда', 'секунды', 'секунд')}"
+
+    return f"{sec},{ms:03d} секунды"
+
 def handle_ping_command(message):
+    started = time.perf_counter()
+
+    text = "ПОНГ\nВремя ответа: 0,000 секунды"
+    sent = bot.reply_to(message, text)
+
+    delta_ms = int(round((time.perf_counter() - started) * 1000))
+    final_text = f"ПОНГ\nВремя ответа: {_format_ping_seconds_ms(delta_ms)}"
+
     try:
-        sent_ts = int(getattr(message, "date", 0) or 0)
+        limited_edit_message_text(
+            text=final_text,
+            chat_id=int(sent.chat.id),
+            msg_id=int(sent.message_id),
+            parse_mode="HTML",
+            reply_markup=None,
+            disable_web_page_preview=True
+        )
     except Exception:
-        sent_ts = 0
-
-    now = int(now_ts())
-    delta = max(0, now - sent_ts)
-
-    bot.reply_to(
-        message,
-        f"ПОНГ\nВремя ответа: {delta} {_ru_form(delta, 'секунда', 'секунды', 'секунд')}"
-    )
+        try:
+            bot.edit_message_text(
+                final_text,
+                chat_id=int(sent.chat.id),
+                message_id=int(sent.message_id)
+            )
+        except Exception:
+            pass
 
 def handle_commands_link(message):
     bot.reply_to(
