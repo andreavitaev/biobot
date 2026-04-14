@@ -10106,6 +10106,9 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
     if low in ("помощь", "help"):
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="help", args="")
 
+    if low == "пинг":
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="ping", args="")
+
     if low in ("команды", "commands"):
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="commands_link", args="")
 
@@ -10405,12 +10408,42 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
     if low in ("моя корп", "моя корпорация", "моя корпа", "моя к"):
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="corp_my", args="")
 
-    if low.startswith(("корп инфо", "корпорация инфо", "икорп", "к инфо", 
-                       "корп", "досье корп", "досье корпорации")):
+    if low in ("моя корп", "моя корпорация", "моя корпа", "моя к"):
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="corp_my", args="")
+
+    if low in ("исключить", "корп кик") or low.startswith(("исключить ", "корп кик ")):
         rest = ""
-        parts = t.split(" ", 2)
-        if len(parts) >= 3:
-            rest = parts[2].strip()
+        parts = t.split(" ", 1)
+        if len(parts) > 1:
+            rest = parts[1].strip()
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="corp_kick", args=rest)
+
+    if low in ("корп заявки", "корпорация заявки"):
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="corp_req_list", args="")
+
+    if low in ("корп покинуть", "корпорация покинуть", "корп выйти", "корпорация выйти", "покинуть", "выйти"):
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="corp_leave", args="")
+
+    if low in ("корп инфо", "корпорация инфо", "икорп", "к инфо", "досье корп", "досье корпорации"):
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="corp_info", args="")
+
+    if low.startswith(("корп инфо ", "корпорация инфо ", "икорп ", "к инфо ", "досье корп ", "досье корпорации ")):
+        prefixes = (
+            "корп инфо ", "корпорация инфо ", "икорп ", "к инфо ",
+            "досье корп ", "досье корпорации "
+        )
+        rest = ""
+        for pref in prefixes:
+            if low.startswith(pref):
+                rest = t[len(pref):].strip()
+                break
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="corp_info", args=rest)
+
+    if low in ("корп", "корпорация", "корпа", "к"):
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="corp_info", args="")
+
+    if low.startswith(("корп ", "корпорация ", "корпа ", "к ")):
+        rest = t.split(" ", 1)[1].strip()
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="corp_info", args=rest)
 
     if low == "вступить" or low.startswith("вступить "):
@@ -10419,9 +10452,6 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
         if len(parts) > 1:
             rest = parts[1].strip()
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="corp_join", args=rest)
-
-    if low == "корп заявки" or low == "корпорация заявки":
-        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="corp_req_list", args="")
 
     if low == "принять" or low.startswith("принять "):
         rest = ""
@@ -10464,16 +10494,6 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
             rest = parts[2].strip()
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="corp_deputy_remove", args=rest)
 
-    if low in ("исключить", "корп кик") or low.startswith(("исключить ", "корп кик ")):
-        rest = ""
-        parts = t.split(" ", 1)
-        if len(parts) > 1:
-            rest = parts[1].strip()
-        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="corp_kick", args=rest)
-
-    if low in ("покинуть", "выйти"):
-        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="corp_leave", args="")
-
     if low == "передать права" or low.startswith("передать права "):
         rest = ""
         parts = t.split(" ", 2)
@@ -10503,7 +10523,7 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="corp_send_mat", args=rest)
 
     # топы
-    if low in ("бтоп", "бстата", "стата", "топ") or low.startswith(("бтоп ", "бстата ", "стата ", "топ ")):
+    if low in ("стата", "топ") or low.startswith(("стата ", "топ ")):
         toks = low.split()
 
         if len(toks) >= 3 and toks[1] in ("корп", "корпораций", "к") and toks[2] == "чата":
@@ -10835,6 +10855,20 @@ def handle_help_command(message):
     if message.chat.type == "private":
         ensure_lab_exists(int(message.from_user.id))
     send_welcome_message(int(message.chat.id), message.from_user)
+
+def handle_ping_command(message):
+    try:
+        sent_ts = int(getattr(message, "date", 0) or 0)
+    except Exception:
+        sent_ts = 0
+
+    now = int(now_ts())
+    delta = max(0, now - sent_ts)
+
+    bot.reply_to(
+        message,
+        f"ПОНГ\nВремя ответа: {delta} {_ru_form(delta, 'секунда', 'секунды', 'секунд')}"
+    )
 
 def handle_commands_link(message):
     bot.reply_to(
@@ -14336,6 +14370,28 @@ def _append_upgrade_return_buttons(rm: Optional[InlineKeyboardMarkup], uid: int,
 
     return rm
 
+def _append_balance_return_buttons(kb: Optional[InlineKeyboardMarkup], uid: int) -> Optional[InlineKeyboardMarkup]:
+    if kb is None:
+        kb = InlineKeyboardMarkup()
+
+    state = get_balance_chain_state(int(uid))
+    if not state:
+        return kb
+
+    kind = str(state.get("chain_kind") or "").strip()
+    payload = state.get("payload") or {}
+
+    src = ""
+    if kind == BALCHAIN_UPGRADE:
+        _code, _steps, src, _ictype, _ictx = _upgrade_payload_parts(payload)
+
+    if src == "D":
+        kb.row(InlineKeyboardButton("Вернуться к досье", callback_data=_labui_data(int(uid), "D"), style="primary"))
+    elif src == "PB":
+        kb.row(InlineKeyboardButton("Вернуться к сводке", callback_data=_pathogens_ui_data(int(uid), "INFO", 0), style="primary"))
+
+    return kb
+
 def _kb_balance_upgrade_actions(uid: int, state: dict, *, from_synth: bool = False) -> Optional[InlineKeyboardMarkup]:
     payload = (state or {}).get("payload") or {}
     code, steps, src, ictype, ictx = _upgrade_payload_parts(payload)
@@ -14608,7 +14664,7 @@ CALC_BUFF_METRIC_ALIASES = {
 }
 
 STRICT_NO_EXTRA_ARGS_CMDS = {
-    "help", "commands_link", "report", "settings",
+    "help", "commands_link", "report", "settings", "ping",
     "autoanswer_status", "autoanswer_on", "autoanswer_off",
     "buy_vaccine",
     "lab_delete", "restore_lab",
@@ -14845,7 +14901,7 @@ def _calc_buff_payload(metric_token: str, lvl1: int, lvl2: int):
             "text": (
                 f"🧮 Калькулятор: ⚗️ Усиления синтеза <b>{n1}</b> → <b>{n2}</b>\n"
                 f"📈 Постоянный бонус: <b>{b1}</b> → <b>{b2}</b>\n"
-                f"🎲 Диапазон базового значения: <b>1</b>..<b>100</b> → <b>{1 + b2}</b>..<b>{100 + b2}</b>"
+                f"🎲 Диапазон базового значения: <b>1</b>..<b>{100 + b1}</b> → <b>1</b>..<b>{100 + b2}</b>"
             )
         }
 
@@ -15685,6 +15741,8 @@ def kb_balance_self(uid: int) -> Optional[InlineKeyboardMarkup]:
     if synth_left_seconds(uid) <= 0:
         kb.add(_ikb_premium_counter("⚗️", "Синтез", callback_data=_balui_data(uid, "S")))
 
+    kb = _append_balance_return_buttons(kb, int(uid))
+
     return kb if getattr(kb, "keyboard", None) else None
 
 def kb_balance_after_synth(uid: int) -> Optional[InlineKeyboardMarkup]:
@@ -15700,6 +15758,8 @@ def kb_balance_after_synth(uid: int) -> Optional[InlineKeyboardMarkup]:
 
     if synth_left_seconds(uid) <= 0:
         kb.add(_ikb_premium_counter("⚗️", "Синтез", callback_data=_balui_data(uid, "S")))
+    
+    kb = _append_balance_return_buttons(kb, int(uid))
 
     return kb if getattr(kb, "keyboard", None) else None
 
@@ -16250,8 +16310,9 @@ def synth_attempt(uid: int) -> str:
         return f"❌ СИНТЕЗ НЕ ВЫПОЛНЕН! Ограничение раз в 4 часа. Следующая добыча через {_format_duration(left)}"
 
     synth_bonus = _synth_bonus_value(synth_lvl)
-    stat_bio_mater = random.randint(1, 100+synth_bonus)
-    base_value = stat_bio_mater
+    base_min = 1
+    base_max = 100 + synth_bonus
+    base_value = random.randint(base_min, base_max)
     cof_rost = _pick_cof_rost()
     bio_mater = int((base_value + synth_bonus) * cof_rost)
 
@@ -16262,7 +16323,7 @@ def synth_attempt(uid: int) -> str:
     )
 
     return (
-        f"⚗️ СИНТЕЗ ЗАВЕРШЁН! Получено 💊 +{bio_mater} = {base_value}×{cof_rost}\n\n"
+        f"⚗️ СИНТЕЗ ЗАВЕРШЁН! Получено 💊 +{bio_mater} = ( {base_value} + {synth_bonus} ) × {cof_rost}\n\n"
         f"🔺 Коэффициент роста: {cof_rost}\n"
         f"📈 Эффективность синтеза: +{synth_bonus}"
     )
@@ -24369,7 +24430,7 @@ def text_router(message):
             "top_corps", "top_corps_chat",
         ) and not has_explicit_bot_prefix(message.text or ""):
             return
-        if parsed.cmd in ("balance", "lab", "mylab", "corp_info"):
+        if parsed.cmd in ("balance", "lab", "mylab"):
             bad = not strict_single_target_args_ok(message, parsed, allow_empty=True)
             if bad:
                 if (parsed.args or "").strip() and try_handle_rp_action_message(message):
@@ -24433,6 +24494,11 @@ def text_router(message):
         # помощь
         if parsed.cmd == "help":
             handle_help_command(message)
+            return
+
+        # пинг
+        if parsed.cmd == "ping":
+            handle_ping_command(message)
             return
 
         # рп стата
