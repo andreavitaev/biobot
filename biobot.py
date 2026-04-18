@@ -10,7 +10,6 @@ import shutil
 import random
 import zipfile
 import sqlite3
-import tempfile
 import calendar
 import itertools
 import functools
@@ -160,6 +159,27 @@ def pick_random_event_text() -> str:
     except Exception:
         return "Произошёл непредвиденный сбой во время операции."
 
+def _parse_gendered_text_line(raw_line: str):
+    s = re.sub(r"\s+", " ", str(raw_line or "").strip())
+    if not s or s.startswith("#"):
+        return None
+
+    if "/" in s:
+        female_raw, male_raw = s.split("/", 1)
+        female = re.sub(r"\s+", " ", female_raw.strip())
+        male = re.sub(r"\s+", " ", male_raw.strip())
+        return {
+            "common": "",
+            "female": female,
+            "male": male,
+        }
+
+    return {
+        "common": s,
+        "female": "",
+        "male": "",
+    }
+
 def load_duel_misalign_texts() -> list[str]:
     global _DUEL_MISALIGN_CACHE, _DUEL_MISALIGN_CACHE_MTIME
 
@@ -178,25 +198,41 @@ def load_duel_misalign_texts() -> list[str]:
                 s = (line or "").strip()
                 if not s or s.startswith("#"):
                     continue
-                items.append(s)
+                row = _parse_gendered_text_line(line)
+                if row:
+                    items.append(row)
     except Exception:
         pass
 
     if not items:
         items = [
-            "внезапным манёвром сбил концентрацию соперника",
+            {"common": "внезапным манёвром сбил концентрацию соперника", "female": "", "male": ""}
         ]
 
     _DUEL_MISALIGN_CACHE = items
     _DUEL_MISALIGN_CACHE_MTIME = mtime
     return items
 
-def pick_duel_misalign_text() -> str:
+def pick_duel_misalign_text(actor_id: int = 0) -> str:
     items = load_duel_misalign_texts()
     try:
-        return random.choice(items)
+        row = random.choice(items)
     except Exception:
-        return "ловко сбил концентрацию соперника"
+        row = {"common": "ловко сбил концентрацию соперника", "female": "", "male": ""}
+
+    g = get_user_gender(int(actor_id)) if int(actor_id or 0) > 0 else "male"
+
+    common = str(row.get("common") or "").strip()
+    female = str(row.get("female") or "").strip()
+    male = str(row.get("male") or "").strip()
+
+    if common:
+        return common
+    if g == "female" and female:
+        return female
+    if g == "male" and male:
+        return male
+    return male or female or "ловко сбил концентрацию соперника"
 
 def load_rp_actions() -> dict:
     global _RP_ACTIONS_CACHE, _RP_ACTIONS_CACHE_MTIME
@@ -213,57 +249,10 @@ def load_rp_actions() -> dict:
     try:
         with open(RP_ACTIONS_PATH, "r", encoding="utf-8") as f:
             for raw in f:
-                s = (raw or "").strip()
-                if not s or s.startswith("#"):
+                row = _parse_rp_action_file_line(raw)
+                if not row:
                     continue
-
-                parts = [p.strip() for p in s.split("|")]
-
-                emoji = ""
-                premium_id = ""
-                trigger = ""
-                action_text = ""
-                stat1 = ""
-                stat2 = ""
-                if len(parts) >= 4 and (parts[1].isdigit() or parts[1] == ""):
-                    while len(parts) < 6:
-                        parts.append("")
-                    emoji = parts[0]
-                    premium_id = parts[1]
-                    trigger = parts[2]
-                    action_text = parts[3]
-                    stat1 = parts[4]
-                    stat2 = parts[5]
-                else:
-                    while len(parts) < 5:
-                        parts.append("")
-                    emoji = parts[0]
-                    premium_id = ""
-                    trigger = parts[1]
-                    action_text = parts[2]
-                    stat1 = parts[3]
-                    stat2 = parts[4]
-
-                emoji = (emoji or "").strip()
-                premium_id = (premium_id or "").strip()
-                trigger = re.sub(r"\s+", " ", (trigger or "").strip())
-                action_text = re.sub(r"\s+", " ", (action_text or "").strip())
-                stat1 = re.sub(r"\s+", " ", (stat1 or "").strip())
-                stat2 = re.sub(r"\s+", " ", (stat2 or "").strip())
-
-                if not trigger or not action_text:
-                    continue
-
-                key = trigger.lower()
-                out[key] = {
-                    "emoji": emoji,
-                    "premium_id": premium_id,
-                    "trigger": trigger,
-                    "trigger_key": key,
-                    "action_text": action_text,
-                    "stat1": stat1,
-                    "stat2": stat2,
-                }
+                out[row["trigger_key"]] = row
     except Exception:
         out = {}
 
@@ -274,8 +263,123 @@ def load_rp_actions() -> dict:
 def get_rp_action(trigger: str):
     return load_rp_actions().get((trigger or "").strip().lower())
 
+def _rp_action_text_for_output(action: dict, actor_gender: str = "") -> str:
+    g = str(actor_gender or "").strip().lower()
+
+    common = re.sub(r"\s+", " ", str(action.get("action_text_common") or "").strip())
+    female = re.sub(r"\s+", " ", str(action.get("action_text_female") or "").strip())
+    male = re.sub(r"\s+", " ", str(action.get("action_text_male") or "").strip())
+    legacy = re.sub(r"\s+", " ", str(action.get("action_text") or "").strip())
+
+    if common:
+        return common
+
+    if g == "female" and female:
+        return female
+
+    if g == "male" and male:
+        return male
+
+    if male:
+        return male
+    if female:
+        return female
+    return legacy
+
 def _normalize_rp_trigger(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip()).lower()
+
+def _split_rp_action_text_variants(raw_text: str) -> dict:
+    txt = re.sub(r"\s+", " ", (raw_text or "").strip())
+    if not txt:
+        return {
+            "action_text": "",
+            "action_text_common": "",
+            "action_text_female": "",
+            "action_text_male": "",
+        }
+
+    if "/" not in txt:
+        return {
+            "action_text": txt,
+            "action_text_common": txt,
+            "action_text_female": "",
+            "action_text_male": "",
+        }
+
+    female_raw, male_raw = txt.split("/", 1)
+    female = re.sub(r"\s+", " ", (female_raw or "").strip())
+    male = re.sub(r"\s+", " ", (male_raw or "").strip())
+
+    if female and male:
+        default_text = male
+    else:
+        default_text = female or male
+
+    return {
+        "action_text": default_text,
+        "action_text_common": "",
+        "action_text_female": female,
+        "action_text_male": male,
+    }
+
+def _parse_rp_action_file_line(raw_line: str):
+    s = (raw_line or "").strip()
+    if not s or s.startswith("#"):
+        return None
+
+    parts = [p.strip() for p in s.split("|")]
+
+    emoji = ""
+    premium_id = ""
+    trigger = ""
+    action_text_raw = ""
+    stat1 = ""
+    stat2 = ""
+
+    if len(parts) >= 4 and (parts[1].isdigit() or parts[1] == ""):
+        while len(parts) < 6:
+            parts.append("")
+        emoji = parts[0]
+        premium_id = parts[1]
+        trigger = parts[2]
+        action_text_raw = parts[3]
+        stat1 = parts[4]
+        stat2 = parts[5]
+    else:
+        while len(parts) < 5:
+            parts.append("")
+        emoji = parts[0]
+        premium_id = ""
+        trigger = parts[1]
+        action_text_raw = parts[2]
+        stat1 = parts[3]
+        stat2 = parts[4]
+
+    emoji = re.sub(r"\s+", " ", (emoji or "").strip())
+    premium_id = (premium_id or "").strip()
+    trigger = re.sub(r"\s+", " ", (trigger or "").strip())
+    stat1 = re.sub(r"\s+", " ", (stat1 or "").strip())
+    stat2 = re.sub(r"\s+", " ", (stat2 or "").strip())
+
+    if not trigger or not action_text_raw.strip():
+        return None
+
+    text_variants = _split_rp_action_text_variants(action_text_raw)
+    key = trigger.lower()
+
+    return {
+        "emoji": emoji,
+        "premium_id": premium_id,
+        "trigger": trigger,
+        "trigger_key": key,
+        "action_text": text_variants["action_text"],
+        "action_text_common": text_variants["action_text_common"],
+        "action_text_female": text_variants["action_text_female"],
+        "action_text_male": text_variants["action_text_male"],
+        "stat1": stat1,
+        "stat2": stat2,
+    }
 
 def load_personal_rp_actions(user_id: int) -> dict:
     rows = db_all(
@@ -833,8 +937,10 @@ def autoanswer_trigger(defender_id: int, organizer_id: int, chat_id: int, reply_
     )
     org_imm = int(trow["imm"] if trow else 0)
     p_success = infect_success_chance(def_inf, org_imm)
+    fail_stack = _get_infection_fail_stack(defender_id, organizer_id, now)
     roll = random.random() * 100.0
     if roll >= p_success:
+        _add_infection_fail_stack(defender_id, organizer_id, now)
         txt = (
             _auto_header(defender_id, chat_id, "🛡")
             + f"❎ Не удалось заразить {org_q}: иммунитет справился с заражением"
@@ -843,7 +949,7 @@ def autoanswer_trigger(defender_id: int, organizer_id: int, chat_id: int, reply_
         return
 
     texp = int(trow["be"] if trow else 0)
-    gained = max(1, texp // 2)
+    gained = _calc_infection_gain_with_fail_stack(texp, fail_stack)
 
     let_lvl = int(lab_def["lethality"] or 1)
     inf_days = _calc_inf_days(let_lvl)
@@ -908,6 +1014,11 @@ def autoanswer_trigger(defender_id: int, organizer_id: int, chat_id: int, reply_
                 "INSERT INTO infection_cooldowns(attacker_id,target_id,until_ts) VALUES (?,?,?) "
                 "ON CONFLICT(attacker_id,target_id) DO UPDATE SET until_ts=excluded.until_ts",
                 (defender_id, organizer_id, now + REINFECT_CD_SEC)
+            )
+
+            c.execute(
+                "DELETE FROM infection_fail_stacks WHERE attacker_id=? AND target_id=?",
+                (defender_id, organizer_id)
             )
 
             c.execute(
@@ -1388,6 +1499,7 @@ PREMIUM_EMOJI_IDS: Dict[str, str] = {
     "📝": "5334882760735598374",
     "📊": "5431577498364158238",
     "📈": "5332482733010622094",
+    "📉": "5449892166627238763",
     "✅": "5447298551841322535",
     "❎": "5445283164207479914",
     "⭕": "5260416304224936047",
@@ -1404,10 +1516,10 @@ PREMIUM_EMOJI_IDS: Dict[str, str] = {
     "🤧": "5370880659759831851",
     "🤒": "5373262021556967911",
     "🕵️‍♂️": "",
-    "👨‍🔬": "",
+    "👨‍🔬": "5460722519369591542",
     "👮": "",
     "🥷": "5195316351048121745",
-    "👨‍⚕️": "5429363657471434941",
+    "👨‍⚕️": "5408834671574294163",
     "🧑‍✈️": "",
     "🧑‍💼": "",
     "🏥": "5264827875588077689",
@@ -1507,6 +1619,30 @@ def premium_emoji_html(emoji: str) -> str:
     if eid:
         return f'<tg-emoji emoji-id="{h(eid)}">{h(emo)}</tg-emoji>'
     return emo
+
+def _rp_pick_single_fallback_emoji(emoji_text: str) -> str:
+    raw = re.sub(r"\s+", " ", str(emoji_text or "").strip())
+    if not raw:
+        return ""
+
+    parts = [p for p in raw.split(" ") if p]
+    if not parts:
+        return raw
+
+    return parts[0]
+
+def _rp_plain_emoji_html(emoji_text: str) -> str:
+    emo = re.sub(r"\s+", " ", str(emoji_text or "").strip())
+    if not emo:
+        return ""
+
+    out = []
+    for ch in emo:
+        if ch.isspace():
+            out.append(ch)
+        else:
+            out.append(f"&#{ord(ch)};")
+    return "".join(out)
 
 def InlineKeyboardButton(text, *args, **kwargs):
     return _RAW_INLINE_KEYBOARD_BUTTON(text, *args, **kwargs)
@@ -2733,7 +2869,9 @@ def init_db():
         notify_off      INTEGER DEFAULT 0,
         last_seen       INTEGER DEFAULT 0,
         is_placeholder  INTEGER DEFAULT 0,
-        is_bot          INTEGER DEFAULT 0
+        is_bot          INTEGER DEFAULT 0,
+        rp_off          INTEGER DEFAULT 0,
+        gender          TEXT NOT NULL DEFAULT 'male'
     );
     """, commit=True)
 
@@ -3254,6 +3392,8 @@ def init_db():
         "ALTER TABLE users ADD COLUMN notify_off INTEGER DEFAULT 0",
         "ALTER TABLE users ADD COLUMN is_placeholder INTEGER DEFAULT 0",
         "ALTER TABLE users ADD COLUMN is_bot INTEGER DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN rp_off INTEGER DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN gender TEXT NOT NULL DEFAULT 'male'",
     ):
         try:
             db_exec(sql, commit=True)
@@ -3303,6 +3443,16 @@ def init_db():
         attacker_id INTEGER NOT NULL,
         target_id   INTEGER NOT NULL,
         until_ts    INTEGER NOT NULL,
+        PRIMARY KEY(attacker_id, target_id)
+    );
+    """, commit=True)
+
+    db_exec("""
+    CREATE TABLE IF NOT EXISTS infection_fail_stacks (
+        attacker_id  INTEGER NOT NULL,
+        target_id    INTEGER NOT NULL,
+        fail_count   INTEGER NOT NULL DEFAULT 0,
+        last_fail_ts INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY(attacker_id, target_id)
     );
     """, commit=True)
@@ -4668,7 +4818,7 @@ def _corp_remove_member(corp_id: int, user_id: int):
 
 def _corp_notify_leave(corp_id: int, user_id: int):
     user_tag = _corp_actor_tag(int(user_id))
-    text = f"📄 Игрок {user_tag} покинул Корпорацию."
+    text = f"📄 Игрок {user_tag} {_gender_pick(int(user_id), 'corp_leave_notify')}.\nКорпорация осталась без ценного кадра."
 
     for mid in corp_notice_manager_ids(int(corp_id)):
         if int(mid) == int(user_id):
@@ -4682,7 +4832,7 @@ def _corp_notify_kicked(target_id: int, corp_row):
     try:
         bot.send_message(
             int(target_id),
-            f"📄 Вы были исключены из Корпорации {corp_name_display(corp_row['name'])}.",
+            f"📄 {_gender_pick(int(target_id), 'corp_kick_target')} {corp_name_display(corp_row['name'])}.",
             parse_mode="HTML",
             disable_web_page_preview=True
         )
@@ -5145,7 +5295,7 @@ def _corp_join_open(user_id: int, corp_row) -> bool:
 def _send_corp_join_notices(corp_row, joined_user_id: int):
     corp_id = int(corp_row["corp_id"])
     joined_tag = _corp_actor_tag(int(joined_user_id))
-    text = f"📑 Игрок {joined_tag} вступил в Корпорацию."
+    text = f"📑 Игрок {joined_tag} {_gender_pick(int(joined_user_id), 'corp_invite_accept')}."
 
     for mid in corp_notice_manager_ids(corp_id):
         if int(mid) == int(joined_user_id):
@@ -5266,16 +5416,17 @@ def _resolve_request_id_from_message_or_args(message, parsed: "Parsed") -> int:
 def _corp_request_actor_role_word(corp_id: int, actor_id: int) -> str:
     role = corp_role(int(corp_id), int(actor_id))
     if role == "owner":
-        return "владельцем"
+        return _gender_pick(int(actor_id), "corp_request_actor_owner_ins")
     if role == "deputy":
-        return "заместителем"
-    return "участником"
+        return _gender_pick(int(actor_id), "corp_request_actor_deputy_ins")
+    return _gender_pick(int(actor_id), "corp_request_actor_member_ins")
 
 def _corp_request_texts(req_row, actor_id: int, approved: bool) -> tuple[str, str]:
-    user_tag = _corp_actor_tag(int(req_row["user_id"]))
+    user_id = int(req_row["user_id"])
+    user_tag = _corp_actor_tag(user_id)
 
     if approved:
-        manager_text = f"📑 Игрок {user_tag} вступил в Корпорацию"
+        manager_text = f"📑 Игрок {user_tag} {_gender_pick(user_id, 'corp_invite_accept')}"
         user_text = "✅ Вы приняты в Корпорацию."
         return manager_text, user_text
 
@@ -5447,9 +5598,9 @@ def corp_invite_by_id(invite_id: int):
 def _corp_inviter_prefix(corp_id: int, inviter_id: int) -> str:
     role = corp_role(int(corp_id), int(inviter_id))
     if role == "owner":
-        return "Владелец "
+        return _gender_pick(int(inviter_id), "corp_inviter_role_owner")
     if role == "deputy":
-        return "Заместитель "
+        return _gender_pick(int(inviter_id), "corp_inviter_role_deputy")
     return ""
 
 def _corp_invite_chat_text(corp_row, invited_id: int, inviter_id: int) -> str:
@@ -5458,20 +5609,20 @@ def _corp_invite_chat_text(corp_row, invited_id: int, inviter_id: int) -> str:
     prefix = _corp_inviter_prefix(int(corp_row["corp_id"]), int(inviter_id))
     return (
         f"✉️ {invited_tag}, минуточку внимания. "
-        f"{prefix}{inviter_tag} пригласил Вас в Корпорацию {corp_name_display(corp_row['name'])}"
+        f"{prefix}{inviter_tag} {_gender_pick(int(inviter_id), 'corp_invite_chat')} {corp_name_display(corp_row['name'])}"
     )
 
 def _corp_invite_accept_text(corp_row, invited_id: int) -> str:
     invited_tag = _corp_actor_tag(int(invited_id))
     return (
-        f"✅ Игрок {invited_tag} вступил в Корпорацию {corp_name_display(corp_row['name'])}.\n"
+        f"✅ Игрок {invited_tag} {_gender_pick(int(invited_id), 'corp_invite_accept')} {corp_name_display(corp_row['name'])}.\n"
         "Встречайте новичка."
     )
 
 def _corp_invite_reject_text(corp_row, invited_id: int) -> str:
     invited_tag = _corp_actor_tag(int(invited_id))
     return (
-        f"❌ Игрок {invited_tag} отказался вступать в Корпорацию {corp_name_display(corp_row['name'])}."
+        f"❌ Игрок {invited_tag} {_gender_pick(int(invited_id), 'corp_invite_reject')} {corp_name_display(corp_row['name'])}."
     )
 
 def _corp_invite_notify_accept(corp_row, inviter_id: int, invited_id: int):
@@ -5480,7 +5631,7 @@ def _corp_invite_notify_accept(corp_row, inviter_id: int, invited_id: int):
     invited_tag = _corp_actor_tag(int(invited_id))
     prefix = _corp_inviter_prefix(corp_id, int(inviter_id))
     text = (
-        f"📄 {prefix}{inviter_tag} пригласил игрока {invited_tag} "
+        f"📄 {prefix}{inviter_tag} {_gender_pick(int(inviter_id), 'corp_invite_notify_accept')} {invited_tag} "
         f"в Корпорацию {corp_name_display(corp_row['name'])}."
     )
 
@@ -5683,7 +5834,7 @@ def render_corp_info_text(corp_row, viewer_id: int) -> tuple[str, InlineKeyboard
         ou = (owner["username"] or "")
         od = display_name(owner["first_name"] or "", owner["last_name"] or "", ou, int(owner["user_id"]))
         owner_tag = tg_mention(int(owner["user_id"]), od, username=ou)
-        owner_line = f"🧑‍✈️ Владелец: {owner_tag} | {_stats_suffix(int(owner['user_id']))}"
+        owner_line = f"🧑‍✈️ {_gender_pick(int(owner['user_id']), 'corp_role_owner_title')}: {owner_tag} | {_stats_suffix(int(owner['user_id']))}"
     else:
         owner_line = "🧑‍✈️ Владелец: неизвестно"
 
@@ -5699,7 +5850,8 @@ def render_corp_info_text(corp_row, viewer_id: int) -> tuple[str, InlineKeyboard
     lines.append(owner_line)
     if dep_tags:
         if len(dep_tags) == 1:
-            lines.append(f"🧑‍💼 Заместитель: {dep_tags[0]}")
+            dep = deputies[0]
+            lines.append(f"🧑‍💼 {_gender_pick(int(dep['user_id']), 'corp_role_deputy_title')}: {dep_tags[0]}")
         else:
             lines.append("🧑‍💼 Заместители:")
             for dline in dep_tags:
@@ -6298,11 +6450,14 @@ def standard_user_tag(user_id: int) -> str:
     return public_user_tag(int(user_id), force_standard=True)
 
 def rp_premium_emoji_html(emoji: str, premium_id: str) -> str:
-    emo = str(emoji or "")
+    emo = re.sub(r"\s+", " ", str(emoji or "").strip())
     pid = str(premium_id or "").strip()
+
     if PREMIUM_EMOJI_ENABLED and pid:
-        return f'<tg-emoji emoji-id="{h(pid)}">{h(emo)}</tg-emoji>'
-    return h(emo)
+        fallback = _rp_pick_single_fallback_emoji(emo) or "🔹"
+        return f'<tg-emoji emoji-id="{h(pid)}">{h(fallback)}</tg-emoji>'
+
+    return _rp_plain_emoji_html(emo)
 
 def _rp_actor_tag(user_obj) -> str:
     uid = int(user_obj.id)
@@ -6409,12 +6564,22 @@ def _parse_inline_rp_query(text: str, actor_id: int):
 
     return None, "", ""
 
-def _rp_emit_action_text(action: dict, actor_tag: str, target_tag: str, extra_tail: str = "", comment_text: str = "") -> str:
+def _rp_emit_action_text(
+    action: dict,
+    actor_id: int,
+    actor_tag: str,
+    target_tag: str,
+    extra_tail: str = "",
+    comment_text: str = ""
+) -> str:
     emo = rp_premium_emoji_html(action["emoji"], action["premium_id"])
     extra_tail = (extra_tail or "").strip()
     comment_text = (comment_text or "").strip()
-
-    text = f"{emo}| {actor_tag} {h(action['action_text'])} {target_tag}"
+    
+    actor_gender = get_user_gender(int(actor_id))
+    action_text = _rp_action_text_for_output(action, actor_gender=actor_gender)
+    
+    text = f"{emo}| {actor_tag} {h(action_text)} {target_tag}"
     if extra_tail:
         text += f" {h(extra_tail)}"
     if comment_text:
@@ -8683,6 +8848,177 @@ def set_notify_prefs(user_id: int, chat_id: int, off: int):
         commit=True
     )
 
+def rp_commands_enabled(user_id: int) -> int:
+    r = db_one(
+        "SELECT COALESCE(rp_off,0) AS v FROM users WHERE user_id=?",
+        (int(user_id),)
+    )
+    return 0 if (r and int(r["v"] or 0) == 1) else 1
+
+def set_rp_commands_enabled(user_id: int, enabled: int):
+    db_exec(
+        "UPDATE users SET rp_off=? WHERE user_id=?",
+        (0 if int(enabled) == 1 else 1, int(user_id)),
+        commit=True
+    )
+
+# гендеры
+def get_user_gender(user_id: int) -> str:
+    row = db_one(
+        "SELECT COALESCE(gender,'male') AS g FROM users WHERE user_id=? LIMIT 1",
+        (int(user_id),)
+    )
+    g = str(row["g"] or "male").strip().lower() if row else "male"
+    return "female" if g == "female" else "male"
+
+def set_user_gender(user_id: int, gender: str):
+    g = "female" if str(gender or "").strip().lower() == "female" else "male"
+    db_exec(
+        "UPDATE users SET gender=? WHERE user_id=?",
+        (g, int(user_id)),
+        commit=True
+    )
+
+def gender_label(user_id: int) -> str:
+    return "♀" if get_user_gender(int(user_id)) == "female" else "♂"
+
+# гендерный словарь
+GENDER_TEXTS = {
+    # словарь дуэлей
+    "duel_hit": {
+        "male": "попал",
+        "female": "попала",
+    },
+    "duel_miss": {
+        "male": "стреляет, но не попадает",
+        "female": "стреляет, но не попадает",
+    },
+    "duel_aim": {
+        "male": "прицеливается получше",
+        "female": "прицеливается получше",
+    },
+    "duel_break_tail": {
+        "male": "и сбил прицел",
+        "female": "и сбила прицел",
+    },
+    "duel_surrender": {
+        "male": "сдался",
+        "female": "сдалась",
+    },
+    "duel_cancel": {
+        "male": "отменил",
+        "female": "отменила",
+    },
+    "duel_timeout": {
+        "male": "проявил",
+        "female": "проявила",
+    },
+    "duel_ready": {
+        "male": "принял",
+        "female": "приняла",
+    },
+    "duel_refuse": {
+        "male": "отказался",
+        "female": "отказалась",
+    },
+    # словарь ролевых взаимодействий
+    "rp_reject": {
+        "male": "отклонил",
+        "female": "отклонила",
+    },
+    # словарь заражения
+    "infect_exposed": {
+        "male": "подверг заражению",
+        "female": "подвергла заражению",
+    },
+    "infect_first_time_target": {
+        "male": "Вы ещё не подвергались заражению этим патогеном, поэтому каждый день, пока вы заражены, игрок будет получать по {amount}",
+        "female": "Вы ещё не подвергались заражению этим патогеном, поэтому каждый день, пока вы заражены, игрок будет получать по {amount}",
+    },
+    "infect_first_time_actor": {
+        "male": "Объект ещё не подвергался заражению вашим патогеном, поэтому каждый день, пока он заражён, вы будете получать по {amount}",
+        "female": "Объект ещё не подвергался заражению вашим патогеном, поэтому каждый день, пока он заражён, вы будете получать по {amount}",
+    },
+    # словарь корпорации
+    "corp_inviter_role_owner": {
+        "male": "Владелец ",
+        "female": "Владелица ",
+    },
+    "corp_inviter_role_deputy": {
+        "male": "Заместитель ",
+        "female": "Заместительница ",
+    },
+    "corp_role_owner_title": {
+        "male": "Владелец",
+        "female": "Владелица",
+    },
+    "corp_role_deputy_title": {
+        "male": "Заместитель",
+        "female": "Заместительница",
+    },
+    "corp_request_actor_owner_ins": {
+        "male": "владельцем",
+        "female": "владелицей",
+    },
+    "corp_request_actor_deputy_ins": {
+        "male": "заместителем",
+        "female": "заместительницей",
+    },
+    "corp_request_actor_member_ins": {
+        "male": "участником",
+        "female": "участницей",
+    },
+    "corp_invite_chat": {
+        "male": "пригласил Вас в Корпорацию",
+        "female": "пригласила Вас в Корпорацию",
+    },
+    "corp_invite_accept": {
+        "male": "вступил в Корпорацию",
+        "female": "вступила в Корпорацию",
+    },
+    "corp_invite_reject": {
+        "male": "отказался вступать в Корпорацию",
+        "female": "отказалась вступать в Корпорацию",
+    },
+    "corp_invite_notify_accept": {
+        "male": "пригласил игрока",
+        "female": "пригласила игрока",
+    },
+    "corp_leave_notify": {
+        "male": "покинул Корпорацию",
+        "female": "покинула Корпорацию",
+    },
+    "corp_kick_public": {
+        "male": "исключён из корпорации",
+        "female": "исключена из корпорации",
+    },
+    "corp_kick_target": {
+        "male": "Вы были исключены из Корпорации",
+        "female": "Вы были исключены из Корпорации",
+    },
+    "corp_deputy_assign": {
+        "male": "назначен заместителем Корпорации",
+        "female": "назначена заместительницей Корпорации",
+    },
+    "corp_deputy_remove": {
+        "male": "больше не является заместителем Корпорации",
+        "female": "больше не является заместительницей Корпорации",
+    },
+}
+
+def _gender_pick(user_id: int, key: str, **fmt) -> str:
+    g = get_user_gender(int(user_id))
+    bucket = GENDER_TEXTS.get(str(key), {}) or {}
+    text = str(bucket.get("female" if g == "female" else "male", "") or "")
+    if not text:
+        text = str(bucket.get("male", "") or "")
+    if fmt:
+        try:
+            text = text.format(**fmt)
+        except Exception:
+            pass
+    return text
+
 # логика уведомлениий
 def get_pm_opened(user_id: int) -> int:
     r = db_one(
@@ -8901,9 +9237,9 @@ def render_settings_text(user_id: int, current_chat_id: int = 0) -> str:
 
     notify_chat_id, notify_off = get_notify_prefs(uid)
     if int(notify_off) == 1 and int(notify_chat_id) == 0:
-        notify_txt = "❌"
+        notify_txt = "🔇"
     elif int(notify_chat_id) != 0:
-        notify_txt = h(_get_chat_title_cached(int(notify_chat_id)))
+        notify_txt = f"{h(_get_chat_title_cached(int(notify_chat_id)))} 🔊"
     else:
         notify_txt = "личные сообщения 🔊"
 
@@ -8913,23 +9249,34 @@ def render_settings_text(user_id: int, current_chat_id: int = 0) -> str:
     title = "⚙️ Параметры"
     if current_chat_id < 0:
         row = get_user_row(uid)
+        chat_name = get_chat_user_name(int(current_chat_id), int(uid))
+    
         if row:
-            shown_name = get_chat_user_name(int(current_chat_id), int(uid)) or standard_display_name(
+            shown_name = chat_name or standard_display_name(
                 row["first_name"] or "",
                 row["last_name"] or "",
                 row["username"] or "",
                 int(uid)
             )
+            shown_tag = tg_mention(
+                int(uid),
+                shown_name,
+                username=(row["username"] or "")
+            )
         else:
-            shown_name = get_chat_user_name(int(current_chat_id), int(uid)) or str(int(uid))
-        title = f"⚙️ Параметры «{h(shown_name)}»"
+            shown_name = chat_name or str(int(uid))
+            shown_tag = tg_mention(int(uid), shown_name)
+    
+        title = f"⚙️ Параметры <b>«{shown_tag}»</b>"
 
     lines = []
     lines.append(title)
     lines.append("")
     lines.append("ПРИВАТНЫЕ НАСТРОЙКИ:")
+    lines.append(f"👤 Пол: {gender_label(uid)}")
     lines.append(f"💰 Баланс: {bal_txt}")
     lines.append(f"🔬 Досье лаборатории: {lab_txt}")
+    lines.append(f"🗨️ РП-команды: {'⭕' if rp_commands_enabled(uid) == 1 else '❌'}")
     lines.append("")
     lines.append("УВЕДОМЛЕНИЯ:")
     lines.append(f"Уведомления: {notify_txt}")
@@ -8975,20 +9322,55 @@ def kb_settings(
             )
         )
 
+    g = get_user_gender(uid)
+    rp_en = rp_commands_enabled(uid)
+    
+    kb.row(
+        _ikb(
+            f"Пол: {'Мужской' if g == 'male' else 'Женский'}",
+            callback_data=_settings_cb(uid, "G"),
+            style="primary"
+        ),
+        _ikb(
+            "Выключить РП" if rp_en == 1 else "Включить РП",
+            callback_data=_settings_cb(uid, "RP"),
+            style=("danger" if rp_en == 1 else "success")
+        )
+    )
+
     notify_chat_id, notify_off = get_notify_prefs(uid)
+    can_show_chat_notify = (
+        str(current_chat_type or "").lower() in ("group", "supergroup")
+        and int(current_chat_id) != 0
+        and (int(notify_chat_id) != int(current_chat_id) or int(notify_off) == 1)
+    )
+
     if int(notify_off) == 1 and int(notify_chat_id) == 0:
-        kb.add(_ikb("Включить уведомления в ЛС", callback_data=_settings_cb(uid, "NPM"), style="success"))
+        if can_show_chat_notify:
+            kb.row(
+                _ikb("Уведомления в этот чат", callback_data=_settings_cb(uid, "NCHAT"), style="primary"),
+                _ikb("Включить уведомления в ЛС", callback_data=_settings_cb(uid, "NPM"), style="success")
+            )
+        else:
+            kb.add(_ikb("Включить уведомления в ЛС", callback_data=_settings_cb(uid, "NPM"), style="success"))
+
     elif int(notify_chat_id) == 0:
-        kb.add(_ikb("Отключить уведомления", callback_data=_settings_cb(uid, "NOFF"), style="danger"))
+        if can_show_chat_notify:
+            kb.row(
+                _ikb("Уведомления в этот чат", callback_data=_settings_cb(uid, "NCHAT"), style="primary"),
+                _ikb("Отключить уведомления", callback_data=_settings_cb(uid, "NOFF"), style="danger")
+            )
+        else:
+            kb.add(_ikb("Отключить уведомления", callback_data=_settings_cb(uid, "NOFF"), style="danger"))
+
     else:
         kb.row(
-            _ikb("Перевести уведомления в ЛС", callback_data=_settings_cb(uid, "NPM"), style="primary"),
+            _ikb("Уведомления в ЛС", callback_data=_settings_cb(uid, "NPM"), style="primary"),
             _ikb("Отключить уведомления", callback_data=_settings_cb(uid, "NOFF"), style="danger")
         )
 
-    if str(current_chat_type or "").lower() in ("group", "supergroup") and int(current_chat_id) != 0:
-        if int(notify_chat_id) != int(current_chat_id) or int(notify_off) == 1:
-            kb.add(_ikb("Перевести уведомления в этот чат", callback_data=_settings_cb(uid, "NCHAT"), style="primary"))
+        if can_show_chat_notify:
+            kb.add(_ikb("Уведомления в этот чат", callback_data=_settings_cb(uid, "NCHAT"), style="primary"))
 
     _cid, _cname, role = _user_corp_role_soft(uid)
     if int(_cid) > 0:
@@ -9833,6 +10215,8 @@ SIGNED_COMMANDS_ALLOWED = {
     "chat_autodel_set", "chat_autodel_off",
     "balance_show", "balance_hide", "lab_show", "lab_hide",
     "notify_on", "notify_off",
+    "corp_notify_on", "corp_notify_off",
+    "rp_on", "rp_off",
     "mrp_add", "mrp_delete",
     "autoanswer_on", "autoanswer_off",
     "corp_open", "corp_close", "corp_rename",
@@ -10166,26 +10550,28 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
     if low in ("дуэль нет", "дуэль отказ", "дуэль отказаться", "дуэль отказать"):
         return Parsed(raw=raw_multiline, has_prefix_char=False, prefix_char=None, cmd="duel_decline", args="")
 
+    if low == "дуэль":
+        return Parsed(raw=raw_multiline, has_prefix_char=False, prefix_char=None, cmd="duel_call", args="")
+    
     if low.startswith("дуэль ставка "):
         rest = ""
         parts = t.split(" ", 2)
         if len(parts) >= 3:
             rest = parts[2].strip()
-        return Parsed(raw=raw_multiline, has_prefix_char=False, prefix_char=None, cmd="duel_call_stake", args=rest)
-
+        return Parsed(raw=raw_multiline, has_prefix_char=False, prefix_char=None, cmd="duel_bet", args=rest)
+    
     if low.startswith("ставка "):
         rest = ""
         parts = t.split(" ", 1)
         if len(parts) > 1:
             rest = parts[1].strip()
         return Parsed(raw=raw_multiline, has_prefix_char=False, prefix_char=None, cmd="duel_bet", args=rest)
-
-    if low == "дуэль" or low.startswith("дуэль "):
-        rest = ""
-        parts = t.split(" ", 1)
-        if len(parts) > 1:
-            rest = parts[1].strip()
-        return Parsed(raw=raw_multiline, has_prefix_char=False, prefix_char=None, cmd="duel_call", args=rest)
+    
+    if low.startswith("дуэль "):
+        rest = t.split(" ", 1)[1].strip()
+        first_tok = rest.split(None, 1)[0] if rest else ""
+        cmd = "duel_call_stake" if first_tok.isdigit() else "duel_call"
+        return Parsed(raw=raw_multiline, has_prefix_char=False, prefix_char=None, cmd=cmd, args=rest)
 
     # агент команды
     if low == "bot_ban" or low.startswith("bot_ban "):
@@ -10271,6 +10657,8 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
         if ("лаб" in low) or ("лабораторию" in low) or ("лабу" in low):
             return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="lab_show", args="")
 
+
+
     # улучшения навыков
     if sign in ("+", "++"):
         first = low.split(" ", 1)[0]
@@ -10287,6 +10675,15 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
     if sign in ("+", "-") and low in ("уведомления", "уведы"):
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None,
                       cmd=("notify_on" if sign == "+" else "notify_off"), args="")
+
+    if sign in ("+", "-") and low in ("корп уведы", "корп уведомления", "корп уведомление"):
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None,
+                      cmd=("corp_notify_on" if sign == "+" else "corp_notify_off"), args="")
+
+    # рп
+    if sign in ("+", "-") and low == "рп":
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None,
+                      cmd=("rp_on" if sign == "+" else "rp_off"), args="")
 
     # мрп
     if sign == "+" and (low == "мрп" or low.startswith("мрп ")):
@@ -10312,12 +10709,16 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="autoanswer_status", args="")
 
     # калькулятор
-    if low in ("к", "калькулятор", "ку", "кпк", "кш", "кпц"):
+    if low in ("к", "калькулятор", "ку", "кпк", "кш", "кпц", "ко", "кдл"):
         calc_cmd = "calc"
         if low in ("ку", "кпк"):
             calc_cmd = "calc_upg"
         elif low in ("кш", "кпц"):
             calc_cmd = "calc_chance"
+        elif low == "ко":
+            calc_cmd = "calc_exp"
+        elif low == "кдл":
+            calc_cmd = "calc_duel"
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd=calc_cmd, args="")
     if low in ("кс", "кус"):
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="calc_buff", args="")
@@ -10343,6 +10744,10 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="calc_chance", args=t.split(" ", 1)[1].strip())
     if low.startswith("кпц "):
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="calc_chance", args=t.split(" ", 1)[1].strip())
+    if low.startswith("ко "):
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="calc_exp", args=t.split(" ", 1)[1].strip())
+    if low.startswith("кд "):
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="calc_duel", args=t.split(" ", 1)[1].strip())
 
     # заразить
     if low == "заразить" or low.startswith("заразить "):
@@ -10684,6 +11089,14 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
         if len(parts) == 3:
             rest = parts[2].strip()
         return Parsed(raw=raw_multiline, has_prefix_char=False, prefix_char=None, cmd="chatname_show", args=rest)
+
+    # пол
+    if low == "мой пол" or low.startswith("мой пол "):
+        rest = ""
+        parts = t.split(" ", 2)
+        if len(parts) >= 3:
+            rest = parts[2].strip()
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="gender_set", args=rest)
 
     return None
 
@@ -11177,16 +11590,35 @@ def handle_mrp_list_command(message):
     upsert_user(message.from_user)
 
     text = render_personal_rp_list_text(uid)
+    pm_kb = kb_open_bot_pm()
 
     if message.chat.type == "private":
-        bot.reply_to(message, text, parse_mode="HTML", disable_web_page_preview=True)
+        bot.reply_to(
+            message,
+            text,
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
         return
 
     try:
-        _REAL_BOT_SEND_MESSAGE(uid, text, parse_mode="HTML", disable_web_page_preview=True)
-        bot.reply_to(message, "📋 Список личных рп команд отправлен в личные сообщения.")
+        _REAL_BOT_SEND_MESSAGE(
+            uid,
+            text,
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
+        bot.reply_to(
+            message,
+            "📋 Список личных рп команд отправлен в личные сообщения.",
+            reply_markup=pm_kb
+        )
     except Exception:
-        bot.reply_to(message, "📑 Не удалось отправить список в личные сообщения. Напишите боту в л/с.")
+        bot.reply_to(
+            message,
+            "📑 Не удалось отправить список в личные сообщения. Напишите боту в л/с.",
+            reply_markup=pm_kb
+        )
 
 def try_handle_rp_action_message(message) -> bool:
     chat_type = (getattr(message.chat, "type", "") or "").lower()
@@ -11201,17 +11633,24 @@ def try_handle_rp_action_message(message) -> bool:
 
     actor_id = int(actor.id)
     upsert_user(actor)
-
+    
     action, tail, comment_text = _parse_rp_message(message.text or "", actor_id)
     if not action:
         return False
-
+    
+    if rp_commands_enabled(int(actor_id)) != 1:
+        return True
+    
     target_id, target_user_obj = resolve_rp_target(message, actor_id, tail)
     if target_id is None:
         return False
-
+    
     if int(target_id) == int(actor_id):
         return False
+    
+    if rp_commands_enabled(int(target_id)) != 1:
+        bot.reply_to(message, "📑 Этот пользователь отключил РП-команды.")
+        return True
 
     if target_user_obj is not None:
         capture_user_context(message, target_user_obj)
@@ -11225,7 +11664,14 @@ def try_handle_rp_action_message(message) -> bool:
         tail_parts = (tail or "").strip().split(None, 1)
         extra_tail = tail_parts[1].strip() if len(tail_parts) > 1 else ""
 
-    text = _rp_emit_action_text(action, actor_tag, target_tag, extra_tail=extra_tail, comment_text=comment_text)
+    text = _rp_emit_action_text(
+        action,
+        int(actor_id),
+        actor_tag,
+        target_tag,
+        extra_tail=extra_tail,
+        comment_text=comment_text
+    )
 
     try:
         _REAL_BOT_REPLY_TO(
@@ -13628,15 +14074,15 @@ def _promo_apply_to_user(code: str, user_id: int) -> tuple[bool, str]:
     return True, f"🎁 Промокод <code>{h(row['code'])}</code> активирован.\n{pretty}"
 
 # расчёт коэффициентов
-INFECT_BOUND_K = 0.2 # коэффициент масштаба
-INFECT_BOUND_BETA = 1.0 # коэффициент кривизны
+INFECT_BOUND_K = 30 # коэффициент масштаба
+INFECT_BOUND_BETA = 0.7 # коэффициент кривизны
 COFINFUI_TAG = "CI"
 
 def load_infect_formula_settings():
     global INFECT_BOUND_K, INFECT_BOUND_BETA
 
     row = db_one(
-        "SELECT COALESCE(k_value,0.5) AS k_value, COALESCE(beta_value,1.0) AS beta_value "
+        "SELECT COALESCE(k_value,30.0) AS k_value, COALESCE(beta_value,0.7) AS beta_value "
         "FROM infect_formula_settings WHERE settings_id=1 LIMIT 1"
     )
     if not row:
@@ -13645,12 +14091,12 @@ def load_infect_formula_settings():
     try:
         INFECT_BOUND_K = float(row["k_value"])
     except Exception:
-        INFECT_BOUND_K = 0.5
+        INFECT_BOUND_K = 30.0
 
     try:
         INFECT_BOUND_BETA = float(row["beta_value"])
     except Exception:
-        INFECT_BOUND_BETA = 1.0
+        INFECT_BOUND_BETA = 0.7
 
 def save_infect_formula_settings(k_value: float, beta_value: float):
     global INFECT_BOUND_K, INFECT_BOUND_BETA
@@ -13684,11 +14130,24 @@ def kb_cof_inf_stats() -> InlineKeyboardMarkup:
     kb.add(InlineKeyboardButton("Обновить статистику", callback_data=_cof_inf_stats_cb()))
     return kb
 
+HINT_ON_COEFFICIENTS = (
+    "<b>k — коэффициент масштаба</b>\n"
+    "Управляет тем, на каких уровнях начнётся заметное расширение диапазона и усиление разницы.\n"
+    "▸ больше k — всё меняется медленнее\n"
+    "▸ меньше k — всё меняется быстрее\n\n"
+    "<b>β — коэффициент кривизны</b>\n"
+    "Управляет формой роста.\n"
+    "▸ β&lt;1 — изменения начинаются раньше и плавнее\n"
+    "▸ β=1 — умеренный вариант\n"
+    "▸ β&gt;1 — долго плавно, потом резче"
+)
+
 def render_cof_inf_stats_text() -> str:
-    pairs = [(1, 2), (10, 20), (19, 20), (1, 100)]
+    pairs = [(1, 2), (10, 20), (19, 20), (1, 100), (1, 1000)]
 
     lines = []
     lines.append("📋 Изменения формулы заражения")
+    lines.append(f"<blockquote expandable>{HINT_ON_COEFFICIENTS}</blockquote>")
     lines.append("")
     lines.append(f"Коэф. масштаба (k): {str(INFECT_BOUND_K).replace('.', ',')}")
     lines.append(f"Коэф. искривления (β): {str(INFECT_BOUND_BETA).replace('.', ',')}")
@@ -13707,32 +14166,108 @@ def infect_success_chance(att_infect: int, tgt_imm: int) -> float:
     z = max(1.0, float(int(att_infect or 0)))
     i = max(1.0, float(int(tgt_imm or 0)))
 
-    n = max(z, i)
+    M = max(z, i)
     k = float(INFECT_BOUND_K)
     beta = float(INFECT_BOUND_BETA)
 
-    sqrt_n = math.sqrt(n)
-    if sqrt_n <= 0.0:
-        sqrt_n = 1.0
+    if k <= 0.0:
+        k = 0.000001
+    if beta <= 0.0:
+        beta = 0.000001
 
-    p_min = 0.1 + 9.9 / sqrt_n
-    p_max = 99.9 - 9.9 / sqrt_n
+    mk = M / k
+    mk_beta = mk ** beta
 
-    if z > i:
-        expo_arg = -k * (((z - i) * (n ** beta)) / i)
-        p = 50.0 + (1.0 - math.exp(expo_arg)) * (p_max - 50.0)
-    elif z < i:
-        expo_arg = -k * (((i - z) * (n ** beta)) / z)
-        p = 50.0 - (1.0 - math.exp(expo_arg)) * (50.0 - p_min)
-    else:
-        p = 50.0
+    # P_min(M) = 0.001 + 9.999 * e^(- (M / k)^beta)
+    p_min = 0.001 + 9.999 * math.exp(-mk_beta)
 
-    if p < 0.1:
-        p = 0.1
-    elif p > 99.9:
-        p = 99.9
+    # P_max(M) = 100 - P_min(M)
+    p_max = 100.0 - p_min
+
+    # R = (Z - I) / min(Z, I)
+    denom = min(z, i)
+    if denom <= 0.0:
+        denom = 1.0
+    R = (z - i) / denom
+
+    # S = tanh( R * (M / k)^beta )
+    S = math.tanh(R * mk_beta)
+
+    # P_усп = 50 + (50 - P_min(M)) * S
+    p = 50.0 + (50.0 - p_min) * S
+
+    if p < p_min:
+        p = p_min
+    elif p > p_max:
+        p = p_max
+
+    if p < 0.001:
+        p = 0.001
+    elif p > 99.999:
+        p = 99.999
 
     return float(p)
+
+FAIL_STACK_RESET_SEC = 30 * 60  # 30 минут
+
+def _clear_infection_fail_stack(attacker_id: int, target_id: int):
+    db_exec(
+        "DELETE FROM infection_fail_stacks WHERE attacker_id=? AND target_id=?",
+        (int(attacker_id), int(target_id)),
+        commit=True
+    )
+
+def _get_infection_fail_stack(attacker_id: int, target_id: int, now_value: int | None = None) -> int:
+    now_value = int(now_value if now_value is not None else now_ts())
+
+    row = db_one(
+        "SELECT COALESCE(fail_count,0) AS fc, COALESCE(last_fail_ts,0) AS lts "
+        "FROM infection_fail_stacks WHERE attacker_id=? AND target_id=? LIMIT 1",
+        (int(attacker_id), int(target_id))
+    )
+    if not row:
+        return 0
+
+    fail_count = int(row["fc"] or 0)
+    last_fail_ts = int(row["lts"] or 0)
+
+    if fail_count <= 0:
+        return 0
+
+    if last_fail_ts <= 0 or (now_value - last_fail_ts) > FAIL_STACK_RESET_SEC:
+        _clear_infection_fail_stack(int(attacker_id), int(target_id))
+        return 0
+
+    return int(fail_count)
+
+def _add_infection_fail_stack(attacker_id: int, target_id: int, now_value: int | None = None) -> int:
+    now_value = int(now_value if now_value is not None else now_ts())
+    current = _get_infection_fail_stack(int(attacker_id), int(target_id), now_value)
+    new_count = int(current + 1)
+
+    db_exec(
+        "INSERT INTO infection_fail_stacks(attacker_id, target_id, fail_count, last_fail_ts) "
+        "VALUES (?,?,?,?) "
+        "ON CONFLICT(attacker_id, target_id) DO UPDATE SET "
+        "fail_count=excluded.fail_count, last_fail_ts=excluded.last_fail_ts",
+        (int(attacker_id), int(target_id), int(new_count), int(now_value)),
+        commit=True
+    )
+    return int(new_count)
+
+def _calc_infection_gain_with_fail_stack(target_bio_exp: int, fail_stack: int) -> int:
+    base_gain = int(target_bio_exp or 0) // 2
+    if base_gain < 1:
+        base_gain = 1
+
+    gained = float(base_gain)
+    for _ in range(max(0, int(fail_stack or 0))):
+        gained *= 0.9
+
+    out = int(gained)
+    if out < 1:
+        out = 1
+    return int(out)
 
 def _fmt_clock_hms(ts: int) -> str:
     try:
@@ -14204,6 +14739,28 @@ def _recalc_derived(uid: int):
     qual = (int(row["tp"]) + int(row["tv"]) + int(row["a"])) // 3
     db_exec("UPDATE labs SET security=?, qualification=? WHERE user_id=?", (int(sec), int(qual), int(uid)), commit=True)
 
+SABOTAGE_DOWNGRADE_CODES = (
+    "INF", "LET", "HEA", "IMM",
+    "REA", "IDS", "IPS", "SYN", "ACC",
+    "PAT", "VAC",
+)
+
+def _sabotage_reward_from_target(target_res: int, target_mat: int) -> tuple[str, int]:
+    tr = max(0, int(target_res or 0))
+    tm = max(0, int(target_mat or 0))
+
+    if tm > 0:
+        return "mat", max(1, int(math.ceil(tm * 0.10)))
+    if tr > 0:
+        return "res", max(1, int(math.ceil(tr * 0.10)))
+    return "bonus_mat", 1
+
+def _sabotage_reward_text(kind: str, amount: int) -> str:
+    amt = max(1, int(amount or 1))
+    if str(kind or "") == "res":
+        return _fmt_bio_res(amt)
+    return _fmt_bio_mater(amt)
+
 def _pay_cost(uid: int, cost: int):
     cost = int(cost)
     if cost <= 0:
@@ -14671,8 +15228,9 @@ CALC_UPGRADE_MODE_ALIASES = {"улучшение", "улучшения", "улу
                              "прокачка", "прокачки", "прокач", "пк"}
 CALC_CHANCE_MODE_ALIASES = {"шанс", "шанса", "шансы", "шансов", "ш", 
                             "проценты", "процента", "процентов", "процент", "проц", "пц"}
-CALC_BUFF_MODE_ALIASES = {"усиление", "усиления", "усилений", "кс", "кус"
-}
+CALC_BUFF_MODE_ALIASES = {"усиление", "усиления", "усилений", "кс", "кус"}
+CALC_EXP_MODE_ALIASES = {"опыт", "опыта", "о", "ко"}
+CALC_DUEL_MODE_ALIASES = {"дуэль", "дуэли", "д", "кдл"}
 
 CALC_CHANCE_METRIC_ALIASES = {
     "заражения": "INFECT", "заражение": "INFECT", "зар": "INFECT",
@@ -14700,6 +15258,8 @@ STRICT_NO_EXTRA_ARGS_CMDS = {
     "synth",
     "balance_show", "balance_hide", "lab_show", "lab_hide",
     "notify_on", "notify_off",
+    "corp_notify_on", "corp_notify_off",
+    "rp_on", "rp_off",
     "promo_generate", "promo_all",
     "chat_autodel_status", "chat_autodel_off",
     "timer_list", "timer_clear_all",
@@ -14714,6 +15274,8 @@ CALC_MAIN_PUBLIC_VARS = [
     "улучшения",
     "усиления",
     "шансов",
+    "опыта",
+    "дуэли",
 ]
 
 CALC_UPGRADE_PUBLIC_VARS = [
@@ -14741,6 +15303,16 @@ CALC_BUFF_PUBLIC_VARS = [
     "синтез", 
     "ускорение", 
     "летальность",
+]
+
+CALC_EXP_PUBLIC_VARS = [
+    "опыт",
+    "опыта",
+]
+
+CALC_DUEL_PUBLIC_VARS = [
+    "дуэль",
+    "дуэли",
 ]
 
 def _calc_inline_hint_keyboard(prefix: str):
@@ -14829,6 +15401,36 @@ def _calc_buff_levels_hint_text() -> str:
     return _calc_quote_block([
         "1. Укажите начальный и конечный уровни навыка.",
         "2. Соблюдайте условие: конечный уровень > начального уровня.",
+    ])
+
+def _calc_exp_hint_text() -> str:
+    vars_txt = "\n".join([f"<code>{h(x)}</code>" for x in CALC_EXP_PUBLIC_VARS])
+    return (
+        "📋 Доступные переменные для подсчёта био-опыта:\n"
+        "<blockquote expandable>"
+        f"{vars_txt}\n"
+        "</blockquote>"
+    )
+
+def _calc_exp_levels_hint_text() -> str:
+    return _calc_quote_block([
+        "1. Укажите общее число био-опыта цели.",
+        "2. Укажите число иммунных неудачных попыток заражения.",
+    ])
+
+def _calc_duel_hint_text() -> str:
+    vars_txt = "\n".join([f"<code>{h(x)}</code>" for x in CALC_DUEL_PUBLIC_VARS])
+    return (
+        "📋 Доступные переменные для подсчёта дуэли:\n"
+        "<blockquote expandable>"
+        f"{vars_txt}\n"
+        "</blockquote>"
+    )
+
+def _calc_duel_levels_hint_text() -> str:
+    return _calc_quote_block([
+        "1. Укажите число стаков прицеливания.",
+        "2. Значение не может быть отрицательным.",
     ])
 
 def _calc_join_prefix(parts: list[str]) -> str:
@@ -14958,6 +15560,39 @@ def _calc_buff_payload(metric_token: str, lvl1: int, lvl2: int):
 
     return {"text": "\n".join(lines)}
 
+def _calc_exp_payload(total_bio_exp: int, fail_count: int):
+    total = max(0, int(total_bio_exp or 0))
+    fails = max(0, int(fail_count or 0))
+
+    base_gain = max(1, total // 2)
+    final_gain = int(_calc_infection_gain_with_fail_stack(total, fails))
+
+    return {
+        "text": (
+            f"🧮 Калькулятор: ☣️ Био-опыта\n"
+            f"🛡️ {_ru_dots(fails)} ⇆ ☣️ {_ru_dots(total)}\n"
+            f"💰 Итоговая награда: <b>{_ru_dots(final_gain)}</b>"
+        )
+    }
+
+def _calc_duel_payload(stacks: int):
+    st = max(0, int(stacks or 0))
+    aim_bonus = int(st * DUEL_AIM_STEP_PCT)
+    break_chance = int(_duel_break_chance_from_bonus(aim_bonus)) if st > 0 else 0
+
+    lines = [
+        "🧮 Калькулятор: ⚔️ Дуэли",
+        f"🎯 Стаков: <b>{_ru_dots(st)}</b>",
+        f"👁️‍🗨️ Бонус прицеливания: <b>{_fmt_pct_text(float(aim_bonus))}</b>",
+    ]
+
+    if st > 0:
+        lines.append(f"🪃 Шанс сбить прицел: <b>{_fmt_pct_text(float(break_chance))}</b>")
+    else:
+        lines.append("🪃 Шанс сбить прицел: <b>0%</b>")
+
+    return {"text": "\n".join(lines)}
+
 def _inline_plain_target_name(target_id: int) -> str:
     row = get_user_row(int(target_id))
     if not row:
@@ -15049,6 +15684,16 @@ def _inline_calc_req_from_query(query: str):
             prefix_parts.append(rest_raw[0])
             rest_raw = rest_raw[1:]
             rest = rest[1:]
+        elif rest[0] in CALC_EXP_MODE_ALIASES or rest[0] in ("ко"):
+            mode = "EXP"
+            prefix_parts.append(rest_raw[0])
+            rest_raw = rest_raw[1:]
+            rest = rest[1:]
+        elif rest[0] in CALC_DUEL_MODE_ALIASES or rest[0] in ("кдл"):
+            mode = "DUEL"
+            prefix_parts.append(rest_raw[0])
+            rest_raw = rest_raw[1:]
+            rest = rest[1:]
         else:
             return _hint(
                 "MAIN",
@@ -15076,6 +15721,97 @@ def _inline_calc_req_from_query(query: str):
         prefix_parts = [toks_raw[0]]
         rest_raw = toks_raw[1:]
         rest = toks[1:]
+    elif toks[0] in CALC_EXP_MODE_ALIASES or toks[0] in ("ко"):
+        explicit = True
+        mode = "EXP"
+        prefix_parts = [toks_raw[0]]
+        rest_raw = toks_raw[1:]
+        rest = toks[1:]
+    elif toks[0] in CALC_DUEL_MODE_ALIASES or toks[0] in ("кдл"):
+        explicit = True
+        mode = "DUEL"
+        prefix_parts = [toks_raw[0]]
+        rest_raw = toks_raw[1:]
+        rest = toks[1:]
+
+    if mode == "EXP":
+        if not explicit:
+            return None
+
+        if not rest:
+            return _hint(
+                "EXP",
+                "Калькулятор био-опыта",
+                "Введите био-опыт и число неудач",
+                _calc_inline_error_text("опыт", _calc_exp_hint_text()),
+                prefix_parts
+            )
+
+        ok_prefix = list(prefix_parts)
+
+        if len(rest) < 2:
+            if len(rest) >= 1 and rest[0].isdigit():
+                ok_prefix.append(rest_raw[0])
+            return _hint(
+                "EXP",
+                "Калькулятор био-опыта",
+                "Введите био-опыт и число неудач",
+                _calc_inline_error_text("опыт", _calc_exp_levels_hint_text()),
+                ok_prefix
+            )
+
+        if not rest[0].isdigit() or not rest[1].isdigit():
+            if len(rest) >= 1 and rest[0].isdigit():
+                ok_prefix.append(rest_raw[0])
+            return _hint(
+                "EXP",
+                "Калькулятор био-опыта",
+                "Введите био-опыт и число неудач",
+                _calc_inline_error_text("опыт", _calc_exp_levels_hint_text()),
+                ok_prefix
+            )
+
+        payload = _calc_exp_payload(int(rest[0]), int(rest[1]))
+        return {
+            "kind": "EXP",
+            "ready": True,
+            "title": "Калькулятор био-опыта",
+            "desc": "Расчёты выполнены",
+            "text": payload["text"],
+            "reply_markup": None,
+        }
+
+    if mode == "DUEL":
+        if not explicit:
+            return None
+
+        if not rest:
+            return _hint(
+                "DUEL",
+                "Калькулятор дуэлей",
+                "Введите число стаков",
+                _calc_inline_error_text("дуэли", _calc_duel_hint_text()),
+                prefix_parts
+            )
+
+        if not rest[0].isdigit():
+            return _hint(
+                "DUEL",
+                "Калькулятор дуэлей",
+                "Введите число стаков",
+                _calc_inline_error_text("дуэли", _calc_duel_levels_hint_text()),
+                prefix_parts
+            )
+
+        payload = _calc_duel_payload(int(rest[0]))
+        return {
+            "kind": "DUEL",
+            "ready": True,
+            "title": "Калькулятор дуэлей",
+            "desc": "Расчёты выполнены",
+            "text": payload["text"],
+            "reply_markup": None,
+        }
 
     if mode == "BUFF":
         if not explicit:
@@ -15317,6 +16053,9 @@ def _inline_calc_req_from_query(query: str):
     }
 
 def handle_calc_command(message, parsed: Parsed):
+    if not has_explicit_bot_prefix(getattr(message, "text", "") or ""):
+        return
+
     uid = int(message.from_user.id)
     upsert_user(message.from_user)
     ensure_lab_exists(uid)
@@ -15346,6 +16085,12 @@ def handle_calc_command(message, parsed: Parsed):
     elif parsed.cmd == "calc_buff":
         mode = "BUFF"
         explicit = True
+    elif parsed.cmd == "calc_exp":
+        mode = "EXP"
+        explicit = True
+    elif parsed.cmd == "calc_duel":
+        mode = "DUEL"
+        explicit = True
     else:
         if not parts:
             _emit_err(_calc_main_hint_text())
@@ -15362,6 +16107,14 @@ def handle_calc_command(message, parsed: Parsed):
             parts = parts[1:]
         elif first in CALC_BUFF_MODE_ALIASES:
             mode = "BUFF"
+            explicit = True
+            parts = parts[1:]
+        elif first in CALC_EXP_MODE_ALIASES:
+            mode = "EXP"
+            explicit = True
+            parts = parts[1:]
+        elif first in CALC_DUEL_MODE_ALIASES:
+            mode = "DUEL"
             explicit = True
             parts = parts[1:]
         else:
@@ -15398,6 +16151,49 @@ def handle_calc_command(message, parsed: Parsed):
             _emit_err(_calc_buff_levels_hint_text())
             return
 
+        _emit(payload["text"])
+        return
+
+    if mode == "EXP":
+        if not parts:
+            _emit_err(_calc_exp_hint_text())
+            return
+
+        if len(parts) < 2:
+            _emit_err(_calc_exp_levels_hint_text())
+            return
+
+        try:
+            total = int(parts[0])
+            fails = int(parts[1])
+        except Exception:
+            _emit_err(_calc_exp_levels_hint_text())
+            return
+
+        if total < 0 or fails < 0:
+            _emit_err(_calc_exp_levels_hint_text())
+            return
+
+        payload = _calc_exp_payload(total, fails)
+        _emit(payload["text"])
+        return
+
+    if mode == "DUEL":
+        if not parts:
+            _emit_err(_calc_duel_hint_text())
+            return
+
+        try:
+            stacks = int(parts[0])
+        except Exception:
+            _emit_err(_calc_duel_levels_hint_text())
+            return
+
+        if stacks < 0:
+            _emit_err(_calc_duel_levels_hint_text())
+            return
+
+        payload = _calc_duel_payload(stacks)
         _emit(payload["text"])
         return
 
@@ -16960,6 +17756,64 @@ def handle_notify_toggle(message, cmd: str):
     else:
         bot.reply_to(message, "ℹ️ Уведомления уже включены для группового чата.")
 
+def handle_user_pref_command(message, parsed: Parsed):
+    uid = int(message.from_user.id)
+    upsert_user(message.from_user)
+
+    if parsed.cmd == "corp_notify_on":
+        _cid, _cname, role = _user_corp_role_soft(int(uid))
+        if int(_cid) <= 0:
+            bot.reply_to(message, "📑 Вы не состоите в Корпорации.")
+            return
+
+        set_corp_notify_enabled(int(uid), 1)
+        bot.reply_to(message, "✅ Корпоративные уведомления включены.")
+        return
+
+    if parsed.cmd == "corp_notify_off":
+        _cid, _cname, role = _user_corp_role_soft(int(uid))
+        if int(_cid) <= 0:
+            bot.reply_to(message, "📑 Вы не состоите в Корпорации.")
+            return
+
+        set_corp_notify_enabled(int(uid), 0)
+        bot.reply_to(message, "❎ Корпоративные уведомления отключены.")
+        return
+
+    if parsed.cmd == "rp_on":
+        set_rp_commands_enabled(int(uid), 1)
+        bot.reply_to(message, "✅ Использование РП-команд включено.")
+        return
+
+    if parsed.cmd == "rp_off":
+        set_rp_commands_enabled(int(uid), 0)
+        bot.reply_to(message, "❎ Использование РП-команд отключено.")
+        return
+
+    if parsed.cmd == "gender_set":
+        val = (parsed.args or "").strip().lower()
+
+        if val in ("м", "муж", "мужской"):
+            set_user_gender(int(uid), "male")
+            bot.reply_to(message, "✅ Ваш пол изменён на мужской.")
+            return
+
+        if val in ("ж", "жен", "женский"):
+            set_user_gender(int(uid), "female")
+            bot.reply_to(message, "✅ Ваш пол изменён на женский.")
+            return
+
+        bot.reply_to(
+            message,
+            "📑 Используйте:\n"
+            "<code>Мой пол м</code> / <code>Мой пол муж</code> / <code>Мой пол мужской</code>\n"
+            "или\n"
+            "<code>Мой пол ж</code> / <code>Мой пол жен</code> / <code>Мой пол женский</code>",
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
+        return
+
 #             автоответчик
 def handle_autoanswer_toggle(message, cmd: str):
     uid = int(message.from_user.id)
@@ -18271,6 +19125,20 @@ def cb_settings_ui(cq):
                 return
             set_notify_prefs(int(uid), int(cq.message.chat.id), 0)
 
+        elif act == "G":
+            cur_g = get_user_gender(int(uid))
+            set_user_gender(int(uid), "female" if cur_g == "male" else "male")
+
+        elif act == "GM":
+            set_user_gender(int(uid), "male")
+        
+        elif act == "GF":
+            set_user_gender(int(uid), "female")
+
+        elif act == "RP":
+            cur = rp_commands_enabled(int(uid))
+            set_rp_commands_enabled(int(uid), 0 if cur == 1 else 1)
+
         elif act == "CN":
             _cid, _cname, role = _user_corp_role_soft(int(uid))
             if int(_cid) <= 0:
@@ -18789,6 +19657,15 @@ def cb_rp_accept(cq):
             return
 
         actor_id = int(row["actor_id"])
+
+        if rp_commands_enabled(int(actor_id)) != 1:
+            bot.answer_callback_query(cq.id, "📑 У отправителя отключены РП-команды.", show_alert=True)
+            return
+        
+        if rp_commands_enabled(int(cq.from_user.id)) != 1:
+            bot.answer_callback_query(cq.id, "📑 У вас отключены РП-команды.", show_alert=True)
+            return
+
         if int(cq.from_user.id) == actor_id:
             bot.answer_callback_query(cq.id, "Вы не можете нажимать чужие кнопки!")
             return
@@ -18817,11 +19694,13 @@ def cb_rp_accept(cq):
 
         final_text = _rp_emit_action_text(
             action,
+            int(actor_id),
             actor_tag,
             target_tag,
             extra_tail=extra_tail,
             comment_text=comment_text
         )
+
         _rp_insert_event(action["trigger_key"], actor_id, int(cq.from_user.id))
         _inc_personal_rp_use(action)
 
@@ -18887,7 +19766,7 @@ def cb_rp_decline(cq):
         upsert_user(cq.from_user)
         actor_tag = public_user_tag(actor_id)
         target_tag = _rp_actor_tag(cq.from_user)
-        text = f"❌ {target_tag} отклонил(а) предложение {actor_tag}."
+        text = f"❌ {target_tag} {_gender_pick(int(cq.from_user.id), 'rp_reject')} предложение {actor_tag}."
 
         if cq.inline_message_id:
             limited_edit_message_text(
@@ -19095,11 +19974,28 @@ CB_DUEL_RANDOM = "DUEL_RANDOM"
 DUEL_INVITE_TIMEOUT_SEC = 5 * 60
 DUEL_TURN_TIMEOUT_SEC = 5 * 60
 DUEL_BASE_HIT_PCT = 25
-DUEL_MAX_TURNS = 25
+DUEL_MAX_TURNS = 40
+DUEL_AIM_STEP_PCT = 8
+DUEL_BREAK_BASE_PCT = 32
 
 def _duel_stake_text(amount: int) -> str:
     n = int(amount or 0)
     return f"{_fmt_k(n)} {_ru_form(n, 'био-материал', 'био-материала', 'био-материалов')}"
+
+def _duel_break_chance_from_bonus(opponent_bonus: int) -> int:
+    bonus = max(0, int(opponent_bonus or 0))
+    if bonus <= 0:
+        return 0
+
+    stacks = int(math.ceil(float(bonus) / float(DUEL_AIM_STEP_PCT)))
+    chance = int(DUEL_BREAK_BASE_PCT + stacks * DUEL_AIM_STEP_PCT)
+
+    if chance < 0:
+        chance = 0
+    elif chance > 100:
+        chance = 100
+
+    return int(chance)
 
 def _duel_accept_cb(invite_id: int, target_id: int) -> str:
     return f"{CB_DUEL_ACCEPT}:{int(invite_id)}:{int(target_id)}"
@@ -19171,10 +20067,10 @@ def _duel_declined_text(chat_id: int, challenger_id: int, target_id: int) -> str
     with chat_name_context(int(chat_id)):
         challenger_tag = public_user_tag(int(challenger_id))
         target_tag = public_user_tag(int(target_id))
-    return f"🏳️ <b>{target_tag}</b> отказался от дуэли с <b>{challenger_tag}</b>."
+    return f"🏳️ <b>{target_tag}</b> {_gender_pick(int(target_id), 'duel_refuse')} от дуэли с <b>{challenger_tag}</b>."
 
 def _duel_invite_expired_text() -> str:
-    return "📜 Никто из участников дуэли не проявил активности.\nДуэль отменена."
+    return "📜 Никто из участников дуэли не проявили активности.\nДуэль отменена."
 
 def _duel_started_text(chat_id: int, challenger_id: int, target_id: int, stake_amount: int, first_turn_id: int) -> str:
     with chat_name_context(int(chat_id)):
@@ -19183,7 +20079,7 @@ def _duel_started_text(chat_id: int, challenger_id: int, target_id: int, stake_a
         first_tag = public_user_tag(int(first_turn_id))
 
     lines = [
-        f"✅ <b>{target_tag}</b> принял вызов <b>{challenger_tag}</b> на дуэль" + (
+        f"✅ <b>{target_tag}</b> {_gender_pick(int(target_id), 'duel_ready')} вызов <b>{challenger_tag}</b> на дуэль" + (
             f" со ставкой 💊 {_duel_stake_text(int(stake_amount))}" if int(stake_amount or 0) > 0 else ""
         ),
         'На время дуэли другие игроки могут делать свои ставки, команда "<code>Био ставка</code> [кол-во био-материалов] {кандидат}"',
@@ -19209,7 +20105,7 @@ def _duel_superseded_text(chat_id: int, challenger_id: int, target_id: int, acce
 def _duel_inactive_text(chat_id: int, current_turn_user_id: int) -> str:
     with chat_name_context(int(chat_id)):
         cur_tag = public_user_tag(int(current_turn_user_id))
-    return f"📜 <b>{cur_tag}</b> не проявил активности.\nДуэль отменена."
+    return f"📜 <b>{cur_tag}</b> не {_gender_pick(int(current_turn_user_id), 'duel_timeout')} активности.\nДуэль отменена."
 
 def _duel_refund_materials(user_id: int, amount: int):
     amt = int(amount or 0)
@@ -19326,7 +20222,7 @@ def _duel_invite_cancelled_text(chat_id: int, challenger_id: int, target_id: int
         ctag = public_user_tag(int(challenger_id))
         ttag = public_user_tag(int(target_id))
 
-    txt = f"✖️ <b>{ctag}</b> отменил вызов на дуэль для <b>{ttag}</b>."
+    txt = f"✖️ <b>{ctag}</b> {_gender_pick(int(challenger_id), 'duel_cancel')} вызов на дуэль для <b>{ttag}</b>."
     if int(stake_amount or 0) > 0:
         txt += "\n💊 Ставка инициатора возвращена."
     return txt
@@ -19666,7 +20562,7 @@ def _duel_hit_text(chat_id: int, winner_id: int, loser_id: int, stake_amount: in
         ltag = public_user_tag(int(loser_id))
     return (
         f"💀🔫 Попадание!\n"
-        f"<b>{wtag}</b> попал в <b>{ltag}</b>"
+        f"<b>{wtag}</b> {_gender_pick(int(winner_id), 'duel_hit')} в <b>{ltag}</b>"
         f"{_duel_win_extra_line(int(chat_id), int(winner_id), int(stake_amount))}"
     )
 
@@ -19675,7 +20571,7 @@ def _duel_miss_text(chat_id: int, actor_id: int, next_id: int) -> str:
         atag = public_user_tag(int(actor_id))
         ntag = public_user_tag(int(next_id))
     return (
-        f"🔫 <b>{atag}</b> стреляет, но не попадает\n"
+        f"🔫 <b>{atag}</b> {_gender_pick(int(actor_id), 'duel_miss')}\n"
         f"Ход <b>{ntag}</b>:"
     )
 
@@ -19684,7 +20580,7 @@ def _duel_aim_text(chat_id: int, actor_id: int, next_id: int, multiplier: int) -
         atag = public_user_tag(int(actor_id))
         ntag = public_user_tag(int(next_id))
     return (
-        f"👁️‍🗨️ <b>{atag}</b> прицеливается получше (×{int(multiplier)})\n"
+        f"👁️‍🗨️ <b>{atag}</b> {_gender_pick(int(actor_id), 'duel_aim')} (×{int(multiplier)})\n"
         f"Ход <b>{ntag}</b>:"
     )
 
@@ -19692,9 +20588,9 @@ def _duel_break_aim_text(chat_id: int, actor_id: int, next_id: int) -> str:
     with chat_name_context(int(chat_id)):
         atag = public_user_tag(int(actor_id))
         ntag = public_user_tag(int(next_id))
-    action_text = h(pick_duel_misalign_text())
+    action_text = h(pick_duel_misalign_text(int(actor_id)))
     return (
-        f"🪃 <b>{atag}</b> {action_text} и сбил прицел <b>{ntag}</b>.\n"
+        f"🪃 <b>{atag}</b> {action_text} {_gender_pick(int(actor_id), 'duel_break_tail')} <b>{ntag}</b>.\n"
         f"Ход <b>{ntag}</b>:"
     )
 
@@ -19703,7 +20599,7 @@ def _duel_surrender_text(chat_id: int, winner_id: int, loser_id: int, stake_amou
         wtag = public_user_tag(int(winner_id))
         ltag = public_user_tag(int(loser_id))
     return (
-        f"🏳️ <b>{ltag}</b> сдаётся.\n"
+        f"🏳️ <b>{ltag}</b> {_gender_pick(int(loser_id), 'duel_surrender')}.\n"
         f"Победитель дуэли — <b>{wtag}</b>"
         f"{_duel_win_extra_line(int(chat_id), int(winner_id), int(stake_amount))}"
     )
@@ -19713,7 +20609,7 @@ def _duel_cancelled_text(chat_id: int, challenger_id: int, target_id: int, stake
         ctag = public_user_tag(int(challenger_id))
         ttag = public_user_tag(int(target_id))
 
-    txt = f"✖️ <b>{ctag}</b> отменил дуэль с <b>{ttag}</b>."
+    txt = f"✖️ <b>{ctag}</b> {_gender_pick(int(challenger_id), 'duel_cancel')} дуэль с <b>{ttag}</b>."
     if int(stake_amount or 0) > 0:
         txt += "\n💊 Ставки дуэлянтов возвращены."
     return txt
@@ -19974,8 +20870,8 @@ def _duel_perform_action(duel_row, actor_id: int, action: str, *, via_message=No
         return True, ""
 
     if action == "aim":
-        actor_bonus += 10
-        multiplier = max(1, int(actor_bonus // 10))
+        actor_bonus += DUEL_AIM_STEP_PCT
+        multiplier = max(1, int(actor_bonus // DUEL_AIM_STEP_PCT))
 
         if actor_bonus_col == "challenger_aim_bonus":
             challenger_bonus = int(actor_bonus)
@@ -19998,12 +20894,18 @@ def _duel_perform_action(duel_row, actor_id: int, action: str, *, via_message=No
         if int(opponent_bonus) <= 0:
             return False, "📑 У соперника нет активного прицела."
 
-        if opponent_bonus_col == "challenger_aim_bonus":
-            challenger_bonus = 0
-        else:
-            target_bonus = 0
+        break_chance = _duel_break_chance_from_bonus(int(opponent_bonus))
 
-        txt = _duel_break_aim_text(int(duel_row["chat_id"]), int(actor_id), int(opponent_id))
+        if random.randint(1, 100) <= int(break_chance):
+            if opponent_bonus_col == "challenger_aim_bonus":
+                challenger_bonus = 0
+            else:
+                target_bonus = 0
+
+            txt = _duel_break_aim_text(int(duel_row["chat_id"]), int(actor_id), int(opponent_id))
+        else:
+            txt = _duel_miss_text(int(duel_row["chat_id"]), int(actor_id), int(opponent_id))
+
         _duel_finish_pass_turn(
             duel_row,
             actor_id=int(actor_id),
@@ -21552,6 +22454,7 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
         rand_evt_text = ""
         rand_evt_pct = random_event_pct(attacker_qual)
         immune_fail = 0
+        fail_stack = _get_infection_fail_stack(attacker_id, int(target_id), now)
 
         for i in range(1, cnt + 1):
             used = i
@@ -21563,14 +22466,12 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
             roll = random.random() * 100.0
             if roll >= p_success:
                 immune_fail += 1
+                fail_stack = _add_infection_fail_stack(attacker_id, int(target_id), now)
                 continue
             if roll <= p_success:
                 success = True
                 texp = int(trow["be"] if trow else 0)
-                stolen = (texp // 2)
-                if stolen < 1:
-                    stolen = 1
-                gained = int(stolen)
+                gained = _calc_infection_gain_with_fail_stack(texp, fail_stack)
 
                 seen = db_one(
                     "SELECT 1 FROM infection_seen WHERE attacker_id=? AND target_id=? LIMIT 1",
@@ -21659,6 +22560,11 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
                             (attacker_id, int(target_id), now + REINFECT_CD_SEC)
                         )
 
+                        c.execute(
+                            "DELETE FROM infection_fail_stacks WHERE attacker_id=? AND target_id=?",
+                            (attacker_id, int(target_id))
+                        )
+
                         if first_time:
                             c.execute(
                                 "INSERT OR IGNORE INTO infection_seen(attacker_id,target_id,first_ts) VALUES (?,?,?)",
@@ -21691,8 +22597,12 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
                         )
                         if first_time:
                             target_notice += (
-                                "\n\n👨‍🔬 Вы ещё не подвергались заражению этим патогеном, поэтому каждый день, пока вы заражены, "
-                                f"игрок будет получать по {_fmt_bio_res_after_po(int(gained))}"
+                                "\n\n👨‍🔬 "
+                                + _gender_pick(
+                                    int(target_id),
+                                    "infect_first_time_target",
+                                    amount=_fmt_bio_res_after_po(int(gained))
+                                )
                             )
                         
                         att_ids_lvl = int(lab_row["a_ids"] if lab_row else 1) or 1
@@ -21701,15 +22611,19 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
                         if ids_should_fire(att_ids_lvl, tgt_ids_lvl):
                             exp_word = _ru_form(int(gained), "био-опыт", "био-опыта", "био-опыта")
                             result_text = (
-                                f"🦠 {organizer_tag} подверг заражению {_pat_for_text((pathogen_name or '').strip())} {target_tag}\n"
+                                f"🦠 {organizer_tag} {_gender_pick(int(attacker_id), 'infect_exposed')} {_pat_for_text((pathogen_name or '').strip())} {target_tag}\n"
                                 f"☠️ Горячка на {_format_hm_from_seconds(fever_add)}\n"
                                 f"🤒 Заражение на {_format_days(inf_days)}\n"
                                 f"☣️ +{_fmt_k(int(gained))} {exp_word}"
                             )
                             if first_time:
                                 result_text += (
-                                    "\n\n👨‍🔬 Вы ещё не подвергались заражению этим патогеном, поэтому каждый день, пока вы заражены, "
-                                    f"игрок будет получать по {_fmt_bio_res_after_po(int(gained))}"
+                                    "\n\n👨‍🔬 "
+                                    + _gender_pick(
+                                        int(target_id),
+                                        "infect_first_time_target",
+                                        amount=_fmt_bio_res_after_po(int(gained))
+                                    )
                                 )
                         
                             ids_text = render_ids_report(
@@ -21819,7 +22733,7 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
             exp_word = _ru_form(int(gained), "био-опыт", "био-опыта", "био-опыта")
             txt = (
                 header +
-                f"🦠 {attacker_tag} подверг заражению {_pat_for_text((pathogen_name or '').strip())} {target_tag}\n"
+                f"🦠 {attacker_tag} {_gender_pick(int(attacker_id), 'infect_exposed')} {_pat_for_text((pathogen_name or '').strip())} {target_tag}\n"
                 f"☠️ Горячка на {_format_hm_from_seconds(fever_add)}\n"
                 f"🤒 Заражение на {_format_days(inf_days)}\n"
                 f"☣️ +{_fmt_k(int(gained))} {exp_word}"
@@ -21827,8 +22741,12 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
             txt += _pathogens_extra_line()
             if first_time:
                 txt += (
-                    "\n\n👨‍🔬 Объект ещё не подвергался заражению вашим патогеном, поэтому каждый день, пока он заражён, "
-                    f"вы будете получать по {_fmt_bio_res_after_po(int(gained))}"
+                    "\n\n👨‍🔬 "
+                    + _gender_pick(
+                        int(attacker_id),
+                        "infect_first_time_actor",
+                        amount=_fmt_bio_res_after_po(int(gained))
+                    )
                 )
             _emit(txt)
             att_ids_lvl = int(lab_row["a_ids"] if lab_row else 1) or 1
@@ -21988,6 +22906,7 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
         )
         tgt_imm = int(trow["imm"] if trow else 0)
         p_success = infect_success_chance(attacker_inf, tgt_imm)
+        fail_stack = _get_infection_fail_stack(attacker_id, int(tid), now)
         
         if random.random() * 100.0 < rand_evt_pct:
             evt_fail += 1
@@ -22051,6 +22970,7 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
             last_gained = 0
             last_first_time = False
             fail_tags.append(chosen_tag)
+            _add_infection_fail_stack(attacker_id, int(tid), now)           
             db_exec(
                 "UPDATE labs SET ready_pathogens=CASE WHEN COALESCE(ready_pathogens,0)>0 THEN ready_pathogens-1 ELSE 0 END, "
                 "ops_total=COALESCE(ops_total,0)+1 WHERE user_id=?",
@@ -22084,10 +23004,7 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
         succ_tags.append(chosen_tag)
 
         texp = int(trow["be"] if trow else 0)
-        stolen = (texp // 2)
-        if stolen < 1:
-            stolen = 1
-        gained = int(stolen)
+        gained = _calc_infection_gain_with_fail_stack(texp, fail_stack)
         total_gained += gained
         last_tid = int(tid)
         last_success = True
@@ -22159,6 +23076,10 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
                     "ON CONFLICT(attacker_id,target_id) DO UPDATE SET until_ts=excluded.until_ts",
                     (attacker_id, int(tid), now + REINFECT_CD_SEC)
                 )
+                c.execute(
+                    "DELETE FROM infection_fail_stacks WHERE attacker_id=? AND target_id=?",
+                    (attacker_id, int(tid))
+                )
                 if ft:
                     c.execute(
                         "INSERT OR IGNORE INTO infection_seen(attacker_id,target_id,first_ts) VALUES (?,?,?)",
@@ -22189,22 +23110,30 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
                 )
                 if ft:
                     notice += (
-                        "\n\n👨‍🔬 Вы ещё не подвергались заражению этим патогеном, поэтому каждый день, пока вы заражены, "
-                        f"игрок будет получать по {_fmt_bio_res_after_po(int(gained))}"
+                        "\n\n👨‍🔬 "
+                        + _gender_pick(
+                            int(tid),
+                            "infect_first_time_target",
+                            amount=_fmt_bio_res_after_po(int(gained))
+                        )
                     )
                 tgt_ids_lvl = int(trow["t_ids"] if trow else 1) or 1
                 if ids_should_fire(att_ids_lvl, tgt_ids_lvl):
                     exp_word = _ru_form(int(gained), "био-опыт", "био-опыта", "био-опыта")
                     result_text = (
-                        f"🦠 {organizer_tag} подверг заражению {_pat_for_text((pathogen_name or '').strip())} {tgt_tag}\n"
+                        f"🦠 {organizer_tag} {_gender_pick(int(attacker_id), 'infect_exposed')} {_pat_for_text((pathogen_name or '').strip())} {tgt_tag}\n"
                         f"☠️ Горячка на {_format_hm_from_seconds(fever_add)}\n"
                         f"🤒 Заражение на {_format_days(inf_days)}\n"
                         f"☣️ +{_fmt_k(int(gained))} {exp_word}"
                     )
                     if ft:
                         result_text += (
-                            "\n\n👨‍🔬 Объект ещё не подвергался заражению вашим патогеном, поэтому каждый день, пока он заражён, "
-                            f"вы будете получать по {_fmt_bio_res_after_po(int(gained))}"
+                            "\n\n👨‍🔬 "
+                            + _gender_pick(
+                                int(attacker_id),
+                                "infect_first_time_actor",
+                                amount=_fmt_bio_res_after_po(int(gained))
+                            )
                         )
                     ids_text = render_ids_report(
                         target_id=int(tid),
@@ -22269,15 +23198,19 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
         if last_success:
             exp_word = _ru_form(int(last_gained), "био-опыт", "био-опыта", "био-опыта")
             txt = (
-                f"🦠 {attacker_tag} подверг заражению {_pat_for_text((pathogen_name or '').strip())} {single_target_tag}\n"
+                f"🦠 {attacker_tag} {_gender_pick(int(attacker_id), 'infect_exposed')} {_pat_for_text((pathogen_name or '').strip())} {single_target_tag}\n"
                 f"☠️ Горячка на {_format_hm_from_seconds(fever_add)}\n"
                 f"🤒 Заражение на {_format_days(inf_days)}\n"
                 f"☣️ +{_fmt_k(int(last_gained))} {exp_word}"
             )
             if last_first_time or last_dummy:
                 txt += (
-                    "\n\n👨‍🔬 Объект ещё не подвергался заражению вашим патогеном, поэтому каждый день, пока он заражён, "
-                    f"вы будете получать по {_fmt_bio_res_after_po(int(last_gained))}"
+                    "\n\n👨‍🔬 "
+                    + _gender_pick(
+                        int(attacker_id),
+                        "infect_first_time_actor",
+                        amount=_fmt_bio_res_after_po(int(last_gained))
+                    )
                 )
             _emit(txt, reply_markup=_single_random_retry_kb())
             return
@@ -22457,17 +23390,144 @@ def handle_sabotage_command(message, parsed: Parsed, edit_ctx: Optional[dict] = 
         new_npi = npi + add_p
         new_nvi = nvi + add_v
 
-        db_exec(
-            "UPDATE labs SET ready_pathogens=?, ready_vaccines=?, next_pathogen_in=?, next_vaccine_in=? WHERE user_id=?",
-            (new_rp, new_rv, new_npi, new_nvi, int(target_id)),
-            commit=True
+        tgt_ar = int(t["ar"] or 0)
+        tgt_am = int(t["am"] or 0)
+        tgt_br = int(t["br"] or 0)
+
+        reward_kind, reward_amount = _sabotage_reward_from_target(tgt_ar, tgt_am)
+        reward_text = _sabotage_reward_text(reward_kind, reward_amount)
+
+        down_row = db_one(
+            "SELECT "
+            "COALESCE(infectivity,1) AS infectivity, "
+            "COALESCE(lethality,1) AS lethality, "
+            "COALESCE(heaviness,1) AS heaviness, "
+            "COALESCE(immunity,1) AS immunity, "
+            "COALESCE(reaction,1) AS reaction, "
+            "COALESCE(ids,1) AS ids, "
+            "COALESCE(ips,1) AS ips, "
+            "COALESCE(synthesis,1) AS synthesis, "
+            "COALESCE(acceleration,1) AS acceleration, "
+            "COALESCE(total_pathogens,1) AS total_pathogens, "
+            "COALESCE(total_vaccines,1) AS total_vaccines "
+            "FROM labs WHERE user_id=?",
+            (int(target_id),)
         )
+
+        downgrade_candidates = []
+        if down_row:
+            for code in SABOTAGE_DOWNGRADE_CODES:
+                info = SKILLS.get(code) or {}
+                col = str(info.get("col") or "").strip()
+                if not col:
+                    continue
+                cur_lvl = max(1, int(down_row[col] or 1))
+                if cur_lvl > 1:
+                    downgrade_candidates.append(code)
+
+        downgraded_code = random.choice(downgrade_candidates) if downgrade_candidates else ""
+        downgraded_label = ""
+        downgraded_old = 1
+        downgraded_new = 1
+
+        with DB_LOCK:
+            c = conn.cursor()
+            try:
+                c.execute("BEGIN")
+
+                c.execute(
+                    "UPDATE labs SET ready_pathogens=?, ready_vaccines=?, next_pathogen_in=?, next_vaccine_in=? "
+                    "WHERE user_id=?",
+                    (new_rp, new_rv, new_npi, new_nvi, int(target_id))
+                )
+
+                if reward_kind == "mat":
+                    c.execute(
+                        "UPDATE labs SET all_bio_mater=CASE "
+                        "WHEN COALESCE(all_bio_mater,0) >= ? THEN all_bio_mater-? ELSE 0 END "
+                        "WHERE user_id=?",
+                        (int(reward_amount), int(reward_amount), int(target_id))
+                    )
+                    c.execute(
+                        "UPDATE labs SET all_bio_mater=COALESCE(all_bio_mater,0)+? "
+                        "WHERE user_id=?",
+                        (int(reward_amount), int(attacker_id))
+                    )
+
+                elif reward_kind == "res":
+                    c.execute(
+                        "UPDATE labs SET "
+                        "all_bio_res=CASE WHEN COALESCE(all_bio_res,0) >= ? THEN all_bio_res-? ELSE 0 END, "
+                        "bio_res=CASE WHEN COALESCE(bio_res,0) >= ? THEN bio_res-? ELSE 0 END "
+                        "WHERE user_id=?",
+                        (int(reward_amount), int(reward_amount), int(reward_amount), int(reward_amount), int(target_id))
+                    )
+                    c.execute(
+                        "UPDATE labs SET "
+                        "all_bio_res=COALESCE(all_bio_res,0)+?, "
+                        "bio_res=COALESCE(bio_res,0)+? "
+                        "WHERE user_id=?",
+                        (int(reward_amount), int(reward_amount), int(attacker_id))
+                    )
+
+                else:
+                    c.execute(
+                        "UPDATE labs SET all_bio_mater=COALESCE(all_bio_mater,0)+1 "
+                        "WHERE user_id=?",
+                        (int(attacker_id),)
+                    )
+
+                if downgraded_code:
+                    info = SKILLS.get(downgraded_code) or {}
+                    col = str(info.get("col") or "").strip()
+                    downgraded_label = str(info.get("title_2") or col or "параметр").strip()
+                    downgraded_old = max(1, int(down_row[col] or 1))
+                    downgraded_new = max(1, int(downgraded_old - 1))
+
+                    if downgraded_code == "PAT":
+                        c.execute(
+                            "UPDATE labs SET total_pathogens=?, ready_pathogens=? WHERE user_id=?",
+                            (int(downgraded_new), int(min(new_rp, downgraded_new)), int(target_id))
+                        )
+                    elif downgraded_code == "VAC":
+                        c.execute(
+                            "UPDATE labs SET total_vaccines=?, ready_vaccines=? WHERE user_id=?",
+                            (int(downgraded_new), int(min(new_rv, downgraded_new)), int(target_id))
+                        )
+                    else:
+                        c.execute(
+                            f"UPDATE labs SET {col}=? WHERE user_id=?",
+                            (int(downgraded_new), int(target_id))
+                        )
+
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                try:
+                    c.close()
+                except Exception:
+                    pass
+
+        if downgraded_code:
+            _recalc_derived(int(target_id))
+
+        downgrade_line_target = ""
+        downgrade_line_ids = ""
+        downgrade_line_actor = ""
+        if downgraded_code:
+            downgrade_line_target = f"\n📉 Понижен параметр: {downgraded_label} ({downgraded_old} → {downgraded_new})"
+            downgrade_line_ids = f"\n📉 Понижен параметр: {downgraded_label} ({downgraded_old} → {downgraded_new})"
+            downgrade_line_actor = f"\n📉 Понижен параметр цели: {downgraded_label} ({downgraded_old} → {downgraded_new})"
 
         tgt_notice = (
             "💥 В вашу лабораторию совершена диверсия. Марадёры повредили контейнеры с образцами и лабораторное оборудование.\n\n"
             f"🧪 Потеряно патогенов: {lost_p}\n"
             f"💉 Потеряно вакцин: {lost_v}\n"
             f"⏱️ Задержка производства: патоген +{_format_hms(add_p)} | вакцина +{_format_hms(add_v)}\n"
+            f"💰 Похищено диверсантом: {reward_text}"
+            f"{downgrade_line_target}\n"
             "Организатор диверсии остался неизвестен."
         )
         _notify(int(target_id), tgt_notice)
@@ -22481,7 +23541,9 @@ def handle_sabotage_command(message, parsed: Parsed, edit_ctx: Optional[dict] = 
                 result_text=(
                     f"💥 Диверсия нанесла ущерб лаборатории.\n"
                     f"🧪 Потеряно патогенов: {lost_p}\n"
-                    f"💉 Потеряно вакцин: {lost_v}"
+                    f"💉 Потеряно вакцин: {lost_v}\n"
+                    f"💰 Похищено: {reward_text}"
+                    f"{downgrade_line_ids}"
                 )
             )
             ids_msg = _notify(int(target_id), ids_text)
@@ -22494,6 +23556,8 @@ def handle_sabotage_command(message, parsed: Parsed, edit_ctx: Optional[dict] = 
             f"✅ Успех ({_fmt_pct_text(p)})\n"
             f"🧪 Уничтожено патогенов: {lost_p}\n"
             f"💉 Уничтожено вакцин: {lost_v}\n"
+            f"💰 Добыча: {reward_text}"
+            f"{downgrade_line_actor}\n"
             "⏱️ КД на цель: 24 часа"
         )
         return
@@ -22711,12 +23775,13 @@ def handle_lab_commands(message, parsed: Parsed):
             )
             return
 
-        if not (parsed.args or "").strip():
-            target_id = int(uid)
-            target_user_obj = message.from_user
-        else:
-            target_id, target_user_obj = resolve_target_from_reply_or_args(message, parsed)
-            if target_id is None:
+        target_id, target_user_obj = resolve_target_from_reply_or_args(message, parsed)
+
+        if target_id is None:
+            if not (parsed.args or "").strip() and not getattr(message, "reply_to_message", None):
+                target_id = int(uid)
+                target_user_obj = message.from_user
+            else:
                 bot.reply_to(message, "📑 Укажите пользователя через @username, user_id, ссылку или reply.")
                 return
 
@@ -23352,7 +24417,12 @@ def handle_corp_commands(message, parsed: Parsed):
             commit=True
         )
 
-        bot.reply_to(message, f"✅ Игрок {_corp_actor_tag(int(target_id))} назначен заместителем Корпорации {corp_name_display(corp['name'])}.", parse_mode="HTML", disable_web_page_preview=True)
+        bot.reply_to(
+            message,
+            f"✅ Игрок {_corp_actor_tag(int(target_id))} {_gender_pick(int(target_id), 'corp_deputy_assign')} {corp_name_display(corp['name'])}.",
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
         return
 
     if parsed.cmd == "corp_deputy_remove":
@@ -23401,10 +24471,10 @@ def handle_corp_commands(message, parsed: Parsed):
             (int(my_cid), int(target_id)),
             commit=True
         )
-
+        
         bot.reply_to(
             message,
-            f"✅ Игрок {_corp_actor_tag(int(target_id))} больше не является заместителем Корпорации {corp_name_display(corp['name'])}.",
+            f"✅ Игрок {_corp_actor_tag(int(target_id))} {_gender_pick(int(target_id), 'corp_deputy_remove')} {corp_name_display(corp['name'])}.",
             parse_mode="HTML",
             disable_web_page_preview=True
         )
@@ -23462,7 +24532,12 @@ def handle_corp_commands(message, parsed: Parsed):
             bot.reply_to(message, "📑 Не удалось исключить игрока из Корпорации.")
             return
 
-        bot.reply_to(message, f"✅ Игрок {_corp_actor_tag(int(target_id))} исключён из корпорации.", parse_mode="HTML", disable_web_page_preview=True)
+        bot.reply_to(
+            message,
+            f"✅ Игрок {_corp_actor_tag(int(target_id))} {_gender_pick(int(target_id), 'corp_kick_public')}.",
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
         return
 
     if parsed.cmd == "corp_leave":
@@ -24618,6 +25693,11 @@ def text_router(message):
         if parsed.cmd in ("balance_hide", "balance_show", "lab_hide", "lab_show"):
             handle_privacy_toggle(message, parsed.cmd)
             return
+
+        # пользовательские настройки
+        if parsed.cmd in ("corp_notify_on", "corp_notify_off", "gender_set", "rp_on", "rp_off"):
+            handle_user_pref_command(message, parsed)
+            return
         
         # уведомление
         if parsed.cmd in ("notify_on", "notify_off"):
@@ -24635,6 +25715,20 @@ def text_router(message):
             "duel_fire", "duel_aim", "duel_break_aim", "duel_surrender",
             "duel_bets_list", "duel_bet", "duel_stats"
         ):
+            if parsed.cmd == "duel_call":
+                args = (parsed.args or "").strip()
+                if args and not strict_single_target_args_ok(message, parsed, allow_empty=False):
+                    return
+
+            elif parsed.cmd == "duel_call_stake":
+                target_id_chk, _target_user_chk, stake_chk, _err_chk = _duel_parse_call_args(
+                    message,
+                    parsed,
+                    with_stake=True
+                )
+                if target_id_chk is None or int(stake_chk or 0) <= 0:
+                    return
+
             handle_duel_commands(message, parsed)
             return
 
@@ -24664,7 +25758,11 @@ def text_router(message):
             return
 
         # калькулятор
-        if parsed.cmd in ("calc", "calc_upg", "calc_chance", "calc_buff"):
+        if parsed.cmd in ("calc", "calc_upg", 
+                          "calc_chance", "calc_buff", 
+                          "calc_exp", "calc_duel"):
+            if not has_explicit_bot_prefix(getattr(message, "text", "") or ""):
+                return
             handle_calc_command(message, parsed)
             return
 
