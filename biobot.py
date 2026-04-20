@@ -9068,11 +9068,11 @@ GENDER_TEXTS = {
         "male": "и сбил прицел",
         "female": "и сбила прицел",
     },
-    "duell_break_fail": {
+    "duel_break_fail": {
         "male": "попытался сбить прицел",
         "female": "попыталась сбить прицел",
     },
-    "duell_break_fail_2": {
+    "duel_break_fail_2": {
         "male": "но не смог",
         "female": "но не смогла",
     },
@@ -21117,6 +21117,46 @@ def _duel_actor_bonus(duel_row, actor_id: int) -> int:
         return int(duel_row["challenger_aim_bonus"] or 0)
     return int(duel_row["target_aim_bonus"] or 0)
 
+def _duel_forget_message_autodelete(duel_row):
+    try:
+        if not duel_row:
+            return
+
+        chat_id = int(duel_row["msg_chat_id"] or 0)
+        msg_id = int(duel_row["msg_id"] or 0)
+        if chat_id == 0 or msg_id == 0:
+            return
+
+        db_exec(
+            "DELETE FROM bot_sent_messages WHERE chat_id=? AND message_id=?",
+            (int(chat_id), int(msg_id)),
+            commit=True
+        )
+    except Exception:
+        pass
+
+def _duel_remember_message_autodelete(duel_row):
+    try:
+        if not duel_row:
+            return
+
+        chat_id = int(duel_row["msg_chat_id"] or 0)
+        msg_id = int(duel_row["msg_id"] or 0)
+        if chat_id == 0 or msg_id == 0:
+            return
+
+        ttl = int(get_chat_auto_delete_ttl(int(chat_id)) or 0)
+        if ttl <= 0:
+            return
+
+        db_exec(
+            "INSERT OR REPLACE INTO bot_sent_messages(chat_id, message_id, sent_at) VALUES (?,?,?)",
+            (int(chat_id), int(msg_id), int(now_ts())),
+            commit=True
+        )
+    except Exception:
+        pass
+
 def _duel_action_cb(tag: str, duel_id: int, actor_id: int) -> str:
     return f"{str(tag)}:{int(duel_id)}:{int(actor_id)}"
 
@@ -21151,11 +21191,22 @@ def kb_duel_actions(duel_row) -> InlineKeyboardMarkup:
     return kb
 
 def _duel_emit_state(duel_row, text: str, reply_markup=None, *, via_message=None, edit_existing: bool = True):
+    duel_id = int(duel_row["duel_id"])
+
     if edit_existing:
         mch = int(duel_row["msg_chat_id"] or 0)
         mid = int(duel_row["msg_id"] or 0)
         if mch != 0 and mid != 0:
             _duel_edit_duel_message(duel_row, text, reply_markup=reply_markup)
+
+            fresh = _duel_by_id(int(duel_id)) or duel_row
+            st = str(fresh["status"] or "").strip().lower()
+
+            if st == "active":
+                _duel_forget_message_autodelete(fresh)
+            elif st in ("finished", "draw"):
+                _duel_remember_message_autodelete(fresh)
+
             return
 
     if via_message is not None:
@@ -21176,9 +21227,17 @@ def _duel_emit_state(duel_row, text: str, reply_markup=None, *, via_message=None
         )
 
     try:
-        _duel_set_message_ref(int(duel_row["duel_id"]), int(sent.chat.id), int(sent.message_id))
+        _duel_set_message_ref(int(duel_id), int(sent.chat.id), int(sent.message_id))
     except Exception:
         pass
+
+    fresh = _duel_by_id(int(duel_id)) or duel_row
+    st = str(fresh["status"] or "").strip().lower()
+
+    if st == "active":
+        _duel_forget_message_autodelete(fresh)
+    elif st in ("finished", "draw"):
+        _duel_remember_message_autodelete(fresh)
 
 def _duel_win_extra_line(chat_id: int, winner_id: int, stake_amount: int) -> str:
     amt = int(stake_amount or 0)
@@ -22677,13 +22736,20 @@ def cb_duel_surrender(cq):
             return
 
         duel_id = int(parts[1])
-        actor_id = int(parts[2])
-
-        if int(cq.from_user.id) != int(actor_id):
-            bot.answer_callback_query(cq.id, "Вы не можете нажимать чужие кнопки!")
-            return
 
         duel_row = _duel_by_id(int(duel_id))
+        if not duel_row:
+            bot.answer_callback_query(cq.id, "Дуэль не найдена.")
+            return
+
+        actor_id = int(cq.from_user.id)
+        challenger_id = int(duel_row["challenger_id"] or 0)
+        target_id = int(duel_row["target_id"] or 0)
+
+        if actor_id not in (challenger_id, target_id):
+            bot.answer_callback_query(cq.id, "Вы не участвуете в этой дуэли!")
+            return
+
         ok, msg = _duel_perform_action(duel_row, int(actor_id), "surrender", edit_existing=True)
         bot.answer_callback_query(cq.id, msg if (not ok and msg) else "", show_alert=not ok)
     except Exception as e:
@@ -22765,6 +22831,7 @@ def cb_duel_rematch(cq):
             bot.answer_callback_query(cq.id, "Нажать эту кнопку может только проигравший игрок.")
             return
 
+        _duel_forget_message_autodelete(duel_row)
         ok, msg = _duel_start_rematch_from_finished(duel_row, int(actor_id))
         bot.answer_callback_query(cq.id, msg if (not ok and msg) else "Реванш начался.", show_alert=not ok)
     except Exception as e:
