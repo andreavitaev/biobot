@@ -1215,19 +1215,22 @@ def limited_edit_message_text(*, text: str, reply_markup=None, parse_mode: str =
         except Exception:
             pass
 
-# Имя/username бота
+# Имя/username/id бота
 try:
     _me = bot.get_me()
+    BOT_ID = int(getattr(_me, "id", 0) or 0)
     BOT_USERNAME = _me.username or ""
     BOT_TITLE = (_me.first_name or "").strip() or "Bio War bot"
 except Exception:
+    BOT_ID = 0
     BOT_USERNAME = ""
     BOT_TITLE = "Bio War bot"
 
 def refresh_bot_identity():
-    global BOT_USERNAME, BOT_TITLE
+    global BOT_ID, BOT_USERNAME, BOT_TITLE
     try:
         me = bot.get_me()
+        BOT_ID = int(getattr(me, "id", 0) or 0)
         BOT_USERNAME = (getattr(me, "username", "") or "").strip()
         BOT_TITLE = (getattr(me, "first_name", "") or "").strip() or "Bio War bot"
         return True
@@ -2104,7 +2107,7 @@ def _bot_reply_to_premium(message, text, *args, **kwargs):
             *args,
             **send_kwargs
         )
-        remember_bot_message_for_autodelete(msg)
+        remember_reply_pair_for_autodelete(msg, message)
         return msg
 
     except Exception as e:
@@ -2113,6 +2116,7 @@ def _bot_reply_to_premium(message, text, *args, **kwargs):
         if chat_type in ("group", "supergroup") and _is_send_text_forbidden_error(e):
             pm_msg = _try_send_result_to_pm_from_message(message, text, *args, **kwargs)
             if pm_msg is not None:
+                remember_reply_pair_for_autodelete(pm_msg, message)
                 return pm_msg
             return None
 
@@ -2861,17 +2865,18 @@ def _housekeeping_daemon():
 def init_db():
     db_exec("""
     CREATE TABLE IF NOT EXISTS users (
-        user_id         INTEGER PRIMARY KEY,
-        username        TEXT,
-        first_name      TEXT,
-        last_name       TEXT,
-        notify_chat_id  INTEGER DEFAULT 0,
-        notify_off      INTEGER DEFAULT 0,
-        last_seen       INTEGER DEFAULT 0,
-        is_placeholder  INTEGER DEFAULT 0,
-        is_bot          INTEGER DEFAULT 0,
-        rp_off          INTEGER DEFAULT 0,
-        gender          TEXT NOT NULL DEFAULT 'male'
+        user_id            INTEGER PRIMARY KEY,
+        username           TEXT,
+        first_name         TEXT,
+        last_name          TEXT,
+        notify_chat_id     INTEGER DEFAULT 0,
+        notify_off         INTEGER DEFAULT 0,
+        last_seen          INTEGER DEFAULT 0,
+        is_placeholder     INTEGER DEFAULT 0,
+        is_bot             INTEGER DEFAULT 0,
+        bot_status_locked  INTEGER DEFAULT 0,
+        rp_off             INTEGER DEFAULT 0,
+        gender             TEXT NOT NULL DEFAULT 'male'
     );
     """, commit=True)
 
@@ -3366,6 +3371,33 @@ def init_db():
         commit=True
     )
 
+    db_exec("""
+    CREATE TABLE IF NOT EXISTS duel_formula_settings (
+        settings_id      INTEGER PRIMARY KEY CHECK(settings_id=1),
+        rounds_value     INTEGER NOT NULL DEFAULT 40,
+        base_hit_pct     INTEGER NOT NULL DEFAULT 20,
+        aim_step_pct     INTEGER NOT NULL DEFAULT 8,
+        break_base_pct   INTEGER NOT NULL DEFAULT 22,
+        break_step_pct   INTEGER NOT NULL DEFAULT 8,
+        updated_at       INTEGER NOT NULL DEFAULT 0
+    );
+    """, commit=True)
+
+    db_exec(
+        "INSERT OR IGNORE INTO duel_formula_settings("
+        "settings_id, rounds_value, base_hit_pct, aim_step_pct, break_base_pct, break_step_pct, updated_at"
+        ") VALUES (1,?,?,?,?,?,?)",
+        (
+            int(DUEL_MAX_TURNS),
+            int(DUEL_BASE_HIT_PCT),
+            int(DUEL_AIM_STEP_PCT),
+            int(DUEL_BREAK_BASE_PCT),
+            int(DUEL_BREAK_STEP_PCT),
+            int(now_ts())
+        ),
+        commit=True
+    )
+
     # автоудаление
     db_exec("""
     CREATE TABLE IF NOT EXISTS chat_auto_delete (
@@ -3392,6 +3424,7 @@ def init_db():
         "ALTER TABLE users ADD COLUMN notify_off INTEGER DEFAULT 0",
         "ALTER TABLE users ADD COLUMN is_placeholder INTEGER DEFAULT 0",
         "ALTER TABLE users ADD COLUMN is_bot INTEGER DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN bot_status_locked INTEGER DEFAULT 0",
         "ALTER TABLE users ADD COLUMN rp_off INTEGER DEFAULT 0",
         "ALTER TABLE users ADD COLUMN gender TEXT NOT NULL DEFAULT 'male'",
     ):
@@ -3597,6 +3630,7 @@ def init_db():
         pass
 
     load_infect_formula_settings()
+    load_duel_formula_settings()
 
 def init_deleted_db(): # отдельная БД для удалённых лабораторий
     conn2 = sqlite3.connect(DELETED_DB_PATH, check_same_thread=False)
@@ -3923,7 +3957,7 @@ def _start_restore_report_flow_for_user(user_id: int) -> tuple[bool, str]:
             parse_mode="HTML",
             disable_web_page_preview=True
         )
-        return True, "📑 Запрос переведён в личные сообщения бота."
+        return True, "🔁 Запрос переведён в личные сообщения бота."
     except Exception:
         report_clear_state(uid)
         return False, "📑 Не удалось открыть личные сообщения. Сначала откройте личный чат с ботом."
@@ -4240,15 +4274,21 @@ def _restore_deleted_lab(user_id: int, *, support_mode: bool = False) -> tuple[b
 
 def upsert_user(tg_user):
     db_exec("""
-        INSERT INTO users(user_id, username, first_name, last_name, last_seen, is_placeholder, is_bot)
-        VALUES(?,?,?,?,?,?,?)
+        INSERT INTO users(
+            user_id, username, first_name, last_name, last_seen,
+            is_placeholder, is_bot, bot_status_locked
+        )
+        VALUES(?,?,?,?,?,?,?,0)
         ON CONFLICT(user_id) DO UPDATE SET
             username=excluded.username,
             first_name=excluded.first_name,
             last_name=excluded.last_name,
             last_seen=excluded.last_seen,
             is_placeholder=0,
-            is_bot=excluded.is_bot
+            is_bot=CASE
+                WHEN COALESCE(users.bot_status_locked,0)=1 THEN users.is_bot
+                ELSE excluded.is_bot
+            END
     """, (
         int(tg_user.id),
         (tg_user.username or "").lower() if tg_user.username else None,
@@ -6490,8 +6530,7 @@ def resolve_rp_target(message, actor_id: int, args_text: str):
 
         if (
             u
-            and not bool(getattr(u, "is_bot", False))
-            and int(getattr(u, "id", 0) or 0) == int(actor_id)
+            and int(getattr(u, "id", 0) or 0) != int(actor_id)
         ):
             capture_user_context(message, u)
             return int(u.id), u
@@ -7377,6 +7416,15 @@ def build_agents_panel_text(user_id: int) -> str:
         lines.append("/agent — назначить агента техподдержки")
         lines.append("/agent_remove — снять права агента техподдержки")
         lines.append("/its + {ссылка} + {<code>бот</code>|<code>юзер</code>} — ручное редактирование списка")
+        lines.append("")
+        lines.append("⚔️ Раздел боевых переменных")
+        lines.append("/duel_cof_break — изменить 🪃")
+        lines.append("/duel_cof_break_bon — изменить 🪃 бонус")
+        lines.append("/duel_cof_aim — изменить 👁️‍🗨️ бонус")
+        lines.append("/duel_cof_base_pts — изменить шанс попадания")
+        lines.append("/duel_cof_stats — информация по переменным дуэлей")
+        lines.append("")
+        lines.append("🦠 Формула заразности") 
         lines.append("/edit_k — изменить k")
         lines.append("/edit_b — изменить β")
         lines.append("/cof_inf_stats — информация по переменным заражения")
@@ -7524,6 +7572,41 @@ def _purge_user_for_bot_ban(user_id: int):
         _deleted_db_exec("DELETE FROM deleted_labs_log WHERE user_id=?", (uid,), commit=True)
     except Exception:
         pass
+
+def _purge_user_for_delete(user_id: int):
+    uid = int(user_id)
+
+    _purge_user_for_bot_ban(uid)
+
+    db_exec("DELETE FROM users WHERE user_id=?", (uid,), commit=True)
+    db_exec("DELETE FROM bot_bans WHERE user_id=?", (uid,), commit=True)
+    db_exec("DELETE FROM bot_owners WHERE user_id=?", (uid,), commit=True)
+
+    db_exec("DELETE FROM balance_chain_state WHERE user_id=?", (uid,), commit=True)
+    db_exec("DELETE FROM quick_infect_prefs WHERE user_id=?", (uid,), commit=True)
+    db_exec("DELETE FROM user_timers WHERE user_id=?", (uid,), commit=True)
+    db_exec("DELETE FROM db_file_msg_schedule WHERE user_id=?", (uid,), commit=True)
+    db_exec("DELETE FROM db_file_exports WHERE requested_by=?", (uid,), commit=True)
+
+    db_exec("DELETE FROM user_name_restrictions WHERE user_id=?", (uid,), commit=True)
+    db_exec("DELETE FROM chat_user_names WHERE user_id=?", (uid,), commit=True)
+
+    db_exec("DELETE FROM personal_rp_actions WHERE user_id=?", (uid,), commit=True)
+    db_exec("DELETE FROM rp_offers WHERE actor_id=? OR target_id=?", (uid, uid), commit=True)
+    db_exec("DELETE FROM rp_events WHERE actor_id=? OR target_id=?", (uid, uid), commit=True)
+
+    db_exec("DELETE FROM promo_uses WHERE user_id=?", (uid,), commit=True)
+
+    db_exec("DELETE FROM duel_stats WHERE user_id=?", (uid,), commit=True)
+    db_exec("DELETE FROM duel_bets WHERE bettor_id=? OR candidate_id=?", (uid, uid), commit=True)
+    db_exec("DELETE FROM duel_invites WHERE challenger_id=? OR target_id=?", (uid, uid), commit=True)
+    db_exec(
+        "DELETE FROM duels WHERE challenger_id=? OR target_id=? OR winner_id=? OR loser_id=? OR current_turn_user_id=?",
+        (uid, uid, uid, uid, uid),
+        commit=True
+    )
+
+    db_exec("UPDATE bot_group_chats SET owner_id=0 WHERE owner_id=?", (uid,), commit=True)
 
 def handle_admin_service_commands(message, parsed: "Parsed"):
     uid = int(message.from_user.id)
@@ -8694,6 +8777,27 @@ def _parse_its_args(args: str) -> tuple[Optional[int], str]:
 
     return int(tid), ""
 
+def _parse_delete_target(message, parsed: "Parsed"):
+    target_id, target_user_obj = resolve_target_from_reply_or_args(message, parsed)
+    if target_id is not None:
+        return int(target_id), target_user_obj
+
+    if message.reply_to_message:
+        u = getattr(message.reply_to_message, "from_user", None)
+        if u and int(getattr(u, "id", 0) or 0) > 0:
+            actor_id = int(getattr(getattr(message, "from_user", None), "id", 0) or 0)
+            if int(getattr(u, "id", 0) or 0) != actor_id:
+                return int(u.id), u
+
+    tail = (parsed.args or "").strip()
+    if tail:
+        token = tail.split()[0].strip()
+        tid = _resolve_or_create_infect_target(token)
+        if tid is not None:
+            return int(tid), None
+
+    return None, None
+
 def handle_owner_db_commands(message, parsed: "Parsed"):
     uid = int(message.from_user.id)
     upsert_user(message.from_user)
@@ -8772,9 +8876,15 @@ def handle_owner_db_commands(message, parsed: "Parsed"):
         return
 
     db_exec(
-        "INSERT INTO users(user_id, username, first_name, last_name, last_seen, is_placeholder, is_bot) "
-        "VALUES (?,?,?,?,?,?,?) "
-        "ON CONFLICT(user_id) DO UPDATE SET is_bot=excluded.is_bot",
+        "INSERT INTO users("
+        "user_id, username, first_name, last_name, last_seen, "
+        "is_placeholder, is_bot, bot_status_locked"
+        ") "
+        "VALUES (?,?,?,?,?,?,?,1) "
+        "ON CONFLICT(user_id) DO UPDATE SET "
+        "is_bot=excluded.is_bot, "
+        "bot_status_locked=1, "
+        "last_seen=excluded.last_seen",
         (int(target_id), None, None, None, int(now_ts()), 0, 1 if mode == "bot" else 0),
         commit=True
     )
@@ -8784,6 +8894,61 @@ def handle_owner_db_commands(message, parsed: "Parsed"):
         f"✅ Статус пользователя <code>{int(target_id)}</code> принудительно установлен как "
         f"<b>{'бот' if mode == 'bot' else 'юзер'}</b>.",
         parse_mode="HTML"
+    )
+
+def handle_delete_user_db_command(message, parsed: "Parsed"):
+    uid = int(message.from_user.id)
+    upsert_user(message.from_user)
+
+    if message.chat.type != "private":
+        bot.reply_to(message, "📑 Эта команда работает только в личных сообщениях бота.")
+        return
+
+    if not is_support(uid):
+        bot.reply_to(message, "📑 Эта команда доступна только агентам техподдержки.")
+        return
+
+    target_id, target_user_obj = _parse_delete_target(message, parsed)
+    if target_id is None:
+        bot.reply_to(message, "📑 Используйте формат: /delete [ссылка/uid/@username] или reply на пользователя/бота.")
+        return
+
+    if target_user_obj is not None:
+        try:
+            capture_user_context(message, target_user_obj)
+        except Exception:
+            pass
+
+    if int(target_id) == int(uid):
+        bot.reply_to(message, "📑 Нельзя удалить из базы данных самого себя.")
+        return
+
+    if int(target_id) == int(get_current_creator_id()):
+        bot.reply_to(message, "📑 Нельзя удалить из базы данных текущего создателя бота.")
+        return
+
+    if is_owner(int(target_id)):
+        bot.reply_to(message, "📑 Сначала снимите с этой цели статус старшего агента.")
+        return
+
+    if is_agent(int(target_id)):
+        bot.reply_to(message, "📑 Сначала снимите с этой цели статус агента техподдержки.")
+        return
+
+    shown_tag = _corp_actor_tag(int(target_id))
+
+    try:
+        _purge_user_for_delete(int(target_id))
+    except Exception as e:
+        send_error_report("delete_user_db", e)
+        bot.reply_to(message, "📑 Не удалось удалить информацию о пользователе из базы данных.")
+        return
+
+    bot.reply_to(
+        message,
+        f"✅ Информация о цели {shown_tag} удалена из базы данных.",
+        parse_mode="HTML",
+        disable_web_page_preview=True
     )
 
 def get_lab(user_id: int) -> sqlite3.Row:
@@ -8900,6 +9065,14 @@ GENDER_TEXTS = {
     "duel_break_tail": {
         "male": "и сбил прицел",
         "female": "и сбила прицел",
+    },
+    "duell_break_fail": {
+        "male": "попытался сбить прицел",
+        "female": "попыталась сбить прицел",
+    },
+    "duell_break_fail_2": {
+        "male": "но не смог",
+        "female": "но не смогла",
     },
     "duel_surrender": {
         "male": "сдался",
@@ -9796,7 +9969,13 @@ def remember_chat_member(chat_id: int, tg_user):
     if bool(getattr(tg_user, "is_bot", False)):
         try:
             db_exec(
-                "UPDATE users SET is_bot=1, is_placeholder=0 WHERE user_id=?",
+                "UPDATE users "
+                "SET is_bot=CASE "
+                "    WHEN COALESCE(bot_status_locked,0)=1 THEN is_bot "
+                "    ELSE 1 "
+                "END, "
+                "is_placeholder=0 "
+                "WHERE user_id=?",
                 (int(tg_user.id),),
                 commit=True
             )
@@ -10087,6 +10266,33 @@ def resolve_target_from_reply_or_args(message, parsed: Optional["Parsed"]):
 
     return None, None
 
+def _is_game_bot_target(target_id: int, target_user_obj=None) -> bool:
+    try:
+        if target_user_obj is not None:
+            return bool(getattr(target_user_obj, "is_bot", False))
+    except Exception:
+        pass
+
+    row = get_user_row(int(target_id))
+    return bool(row and int(row["is_bot"] or 0) == 1)
+
+def _reply_is_direct_bot_without_targets(message, actor_id: int) -> bool:
+    rm = getattr(message, "reply_to_message", None)
+    if not rm:
+        return False
+    if is_channel_sender_message(rm):
+        return False
+
+    u = getattr(rm, "from_user", None)
+    if not u or not bool(getattr(u, "is_bot", False)):
+        return False
+
+    if int(getattr(u, "id", 0) or 0) == int(actor_id):
+        return False
+
+    ids = _collect_reply_target_ids(message, exclude_user_ids={int(actor_id)})
+    return len(ids) == 0
+
 def _strict_single_target_token(token: str):
     tok = (token or "").strip()
     if not tok:
@@ -10262,7 +10468,7 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
             "agent", "агент", "agent_remove",
             "agents",
             "blacklist", "users", "bot_ban", "bot_unban", "remake_lab",
-            "db_fife", "db_fife_stat", "db_fife_msg", "db_fife_upd", "its"
+            "db_fife", "db_fife_stat", "db_fife_msg", "db_fife_upd", "its", "delete"
         ):
             cmd_map = {
                 "owner": "owner",
@@ -10283,6 +10489,7 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
                 "db_fife_msg": "db_fife_msg",
                 "db_fife_upd": "db_fife_upd",
                 "its": "its",
+                "delete": "delete_user_db",
             }
             return Parsed(raw=raw_multiline, has_prefix_char=True, prefix_char=pch, cmd=cmd_map[c], args=a)
 
@@ -10323,6 +10530,9 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
         if c in ("bot_ban", "bot_unban", "remake_lab",
                  "db_fife", "db_fife_stat", "db_fife_msg", "db_fife_upd", "its"):
             return Parsed(raw=raw, has_prefix_char=True, prefix_char=prefix_char, cmd=c, args=a)
+
+        if c == "delete":
+            return Parsed(raw=raw, has_prefix_char=True, prefix_char=prefix_char, cmd="delete_user_db", args=a)
         return None
 
     t = strip_bio_prefix(t)
@@ -10598,11 +10808,29 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
     if low == "cof_inf_stats":
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="cof_inf_stats", args="")
 
+    if low == "duel_cof_stats":
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="duel_cof_stats", args="")
+
     if low.startswith("edit_k "):
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="edit_k", args=t.split(" ", 1)[1].strip())
 
     if low.startswith("edit_b "):
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="edit_b", args=t.split(" ", 1)[1].strip())
+
+    if low.startswith("duel_cof_break "):
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="duel_cof_break", args=t.split(" ", 1)[1].strip())
+
+    if low.startswith("duel_cof_break_bon "):
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="duel_cof_break_bon", args=t.split(" ", 1)[1].strip())
+
+    if low.startswith("duel_cof_aim "):
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="duel_cof_aim", args=t.split(" ", 1)[1].strip())
+
+    if low.startswith("duel_cof_base_pts "):
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="duel_cof_base_pts", args=t.split(" ", 1)[1].strip())
+
+    if low.startswith("duel_rounds "):
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="duel_rounds", args=t.split(" ", 1)[1].strip())
 
     # удаление лабы
     if t == LAB_DELETE_PHRASE:
@@ -10746,7 +10974,7 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="calc_chance", args=t.split(" ", 1)[1].strip())
     if low.startswith("ко "):
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="calc_exp", args=t.split(" ", 1)[1].strip())
-    if low.startswith("кд "):
+    if low.startswith("кдл "):
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="calc_duel", args=t.split(" ", 1)[1].strip())
 
     # заразить
@@ -11460,12 +11688,13 @@ def handle_rp_stats_command(message):
     upsert_user(message.from_user)
 
     try:
-        _REAL_BOT_REPLY_TO(
+        sent = _REAL_BOT_REPLY_TO(
             message,
             premiumize_html_text(render_rp_stats_text(uid)),
             parse_mode="HTML",
             disable_web_page_preview=True
         )
+        remember_reply_pair_for_autodelete(sent, message)
     except Exception:
         return
 
@@ -11674,12 +11903,13 @@ def try_handle_rp_action_message(message) -> bool:
     )
 
     try:
-        _REAL_BOT_REPLY_TO(
+        sent = _REAL_BOT_REPLY_TO(
             message,
             text,
             parse_mode="HTML",
             disable_web_page_preview=True
         )
+        remember_reply_pair_for_autodelete(sent, message)
         _inc_personal_rp_use(action)
     except Exception:
         return False
@@ -11891,6 +12121,118 @@ def handle_cof_inf_stats_command(message, parsed: Parsed):
         parse_mode="HTML",
         disable_web_page_preview=True,
         reply_markup=kb_cof_inf_stats()
+    )
+
+def handle_duel_cof_stats_command(message, parsed: Parsed):
+    if not parsed.has_prefix_char or not can_manage_support(int(message.from_user.id)):
+        return
+
+    bot.reply_to(
+        message,
+        render_duel_cof_stats_text(),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+        reply_markup=kb_duel_cof_stats()
+    )
+
+def handle_duel_cof_break_command(message, parsed: Parsed):
+    if not parsed.has_prefix_char or not can_manage_support(int(message.from_user.id)):
+        return
+
+    val = _parse_edit_int_arg(parsed.args or "")
+    if val is None:
+        bot.reply_to(message, "📑 Укажите целое число для базового шанса сбивания.")
+        return
+    if val < 0:
+        bot.reply_to(message, "📑 Шанс сбивания не может быть отрицательным.")
+        return
+
+    save_duel_formula_settings(break_base_pct=int(val))
+    bot.reply_to(
+        message,
+        f"✅ Базовый шанс сбивания изменён на <b>{_fmt_pct_text(float(DUEL_BREAK_BASE_PCT))}</b>",
+        parse_mode="HTML",
+        disable_web_page_preview=True
+    )
+
+def handle_duel_cof_break_bon_command(message, parsed: Parsed):
+    if not parsed.has_prefix_char or not can_manage_support(int(message.from_user.id)):
+        return
+
+    val = _parse_edit_int_arg(parsed.args or "")
+    if val is None:
+        bot.reply_to(message, "📑 Укажите целое число для бонуса сбивания.")
+        return
+    if val < 0:
+        bot.reply_to(message, "📑 Бонус сбивания не может быть отрицательным.")
+        return
+
+    save_duel_formula_settings(break_step_pct=int(val))
+    bot.reply_to(
+        message,
+        f"✅ Бонус к сбиванию за 1 стак изменён на <b>{_fmt_pct_text(float(DUEL_BREAK_STEP_PCT))}</b>",
+        parse_mode="HTML",
+        disable_web_page_preview=True
+    )
+
+def handle_duel_cof_aim_command(message, parsed: Parsed):
+    if not parsed.has_prefix_char or not can_manage_support(int(message.from_user.id)):
+        return
+
+    val = _parse_edit_int_arg(parsed.args or "")
+    if val is None:
+        bot.reply_to(message, "📑 Укажите целое число для бонуса прицеливания.")
+        return
+    if val < 0:
+        bot.reply_to(message, "📑 Бонус прицеливания не может быть отрицательным.")
+        return
+
+    save_duel_formula_settings(aim_step_pct=int(val))
+    bot.reply_to(
+        message,
+        f"✅ Бонус прицеливания за 1 стак изменён на <b>{_fmt_pct_text(float(DUEL_AIM_STEP_PCT))}</b>",
+        parse_mode="HTML",
+        disable_web_page_preview=True
+    )
+
+def handle_duel_cof_base_pts_command(message, parsed: Parsed):
+    if not parsed.has_prefix_char or not can_manage_support(int(message.from_user.id)):
+        return
+
+    val = _parse_edit_int_arg(parsed.args or "")
+    if val is None:
+        bot.reply_to(message, "📑 Укажите целое число для базового шанса попадания.")
+        return
+    if val < 0:
+        bot.reply_to(message, "📑 Шанс попадания не может быть отрицательным.")
+        return
+
+    save_duel_formula_settings(base_hit_pct=int(val))
+    bot.reply_to(
+        message,
+        f"✅ Базовый шанс попадания изменён на <b>{_fmt_pct_text(float(DUEL_BASE_HIT_PCT))}</b>",
+        parse_mode="HTML",
+        disable_web_page_preview=True
+    )
+
+def handle_duel_rounds_command(message, parsed: Parsed):
+    if not parsed.has_prefix_char or not can_manage_support(int(message.from_user.id)):
+        return
+
+    val = _parse_edit_int_arg(parsed.args or "")
+    if val is None:
+        bot.reply_to(message, "📑 Укажите целое число количества раундов.")
+        return
+    if val <= 0:
+        bot.reply_to(message, "📑 Количество раундов должно быть больше нуля.")
+        return
+
+    save_duel_formula_settings(rounds_value=int(val))
+    bot.reply_to(
+        message,
+        f"✅ Количество раундов дуэли изменено на <b>{int(DUEL_MAX_TURNS)}</b>",
+        parse_mode="HTML",
+        disable_web_page_preview=True
     )
 
 def handle_admin_name_restriction_command(message, parsed: Parsed):
@@ -12921,6 +13263,47 @@ def _timer_spec_to_text(spec: dict) -> str:
     return " ".join(parts) if parts else "0 минут"
 
 # Автоудаление
+def get_bot_chat_admin_rights(chat_id: int) -> dict:
+    out = {
+        "is_admin": False,
+        "status": "",
+        "can_delete_messages": False,
+        "can_restrict_members": False,
+        "can_pin_messages": False,
+        "can_invite_users": False,
+        "can_manage_chat": False,
+        "can_change_info": False,
+    }
+
+    try:
+        bot_id = int(BOT_ID or 0)
+        if bot_id <= 0:
+            me = bot.get_me()
+            bot_id = int(getattr(me, "id", 0) or 0)
+
+        if bot_id <= 0:
+            return out
+
+        cm = bot.get_chat_member(int(chat_id), int(bot_id))
+        st = (getattr(cm, "status", "") or "").lower()
+        is_admin = st in ("administrator", "creator")
+
+        out["status"] = st
+        out["is_admin"] = is_admin
+        out["can_delete_messages"] = (st == "creator") or bool(getattr(cm, "can_delete_messages", False))
+        out["can_restrict_members"] = (st == "creator") or bool(getattr(cm, "can_restrict_members", False))
+        out["can_pin_messages"] = (st == "creator") or bool(getattr(cm, "can_pin_messages", False))
+        out["can_invite_users"] = (st == "creator") or bool(getattr(cm, "can_invite_users", False))
+        out["can_manage_chat"] = (st == "creator") or bool(getattr(cm, "can_manage_chat", False))
+        out["can_change_info"] = (st == "creator") or bool(getattr(cm, "can_change_info", False))
+    except Exception:
+        pass
+
+    return out
+
+def bot_can_delete_chat_messages(chat_id: int) -> bool:
+    return bool(get_bot_chat_admin_rights(int(chat_id)).get("can_delete_messages", False))
+
 def is_group_admin(user_id: int, chat_id: int) -> bool:
     try:
         cm = bot.get_chat_member(int(chat_id), int(user_id))
@@ -12944,6 +13327,28 @@ def set_chat_auto_delete_ttl(chat_id: int, ttl_seconds: int, by_user_id: int):
 def forget_chat_auto_delete(chat_id: int):
     db_exec("DELETE FROM chat_auto_delete WHERE chat_id=?", (int(chat_id),), commit=True)
 
+def _is_text_command_message_for_autodelete(message) -> bool:
+    txt = ((getattr(message, "text", None) or getattr(message, "caption", None) or "")).strip()
+    if not txt:
+        return False
+
+    try:
+        if parse_message_as_command(txt) is not None:
+            return True
+    except Exception:
+        pass
+
+    try:
+        actor = getattr(message, "from_user", None)
+        actor_id = int(getattr(actor, "id", 0) or 0) if actor else 0
+        action, _tail, _comment = _parse_rp_message(txt, actor_id)
+        if action:
+            return True
+    except Exception:
+        pass
+
+    return False
+
 def remember_bot_message_for_autodelete(msg):
     try:
         if not msg:
@@ -12963,6 +13368,59 @@ def remember_bot_message_for_autodelete(msg):
             (chat_id, int(msg.message_id), int(now_ts())),
             commit=True
         )
+    except Exception:
+        pass
+
+def remember_user_trigger_message_for_autodelete(message):
+    try:
+        if not message:
+            return
+
+        chat = getattr(message, "chat", None)
+        if not chat:
+            return
+
+        chat_type = (getattr(chat, "type", "") or "").lower()
+        if chat_type not in ("group", "supergroup"):
+            return
+
+        chat_id = int(chat.id)
+        ttl = get_chat_auto_delete_ttl(chat_id)
+        if ttl <= 0:
+            return
+
+        if not bot_can_delete_chat_messages(chat_id):
+            return
+
+        if not _is_text_command_message_for_autodelete(message):
+            return
+
+        mid = int(getattr(message, "message_id", 0) or 0)
+        if mid <= 0:
+            return
+
+        db_exec(
+            "INSERT OR REPLACE INTO bot_sent_messages(chat_id, message_id, sent_at) VALUES (?,?,?)",
+            (chat_id, mid, int(now_ts())),
+            commit=True
+        )
+    except Exception:
+        pass
+
+def remember_reply_pair_for_autodelete(sent_msg=None, trigger_message=None):
+    """
+    sent_msg — сообщение, которое отправил бот
+    trigger_message — исходное сообщение пользователя, вызвавшее реакцию бота
+    """
+    try:
+        if sent_msg is not None:
+            remember_bot_message_for_autodelete(sent_msg)
+    except Exception:
+        pass
+
+    try:
+        if trigger_message is not None:
+            remember_user_trigger_message_for_autodelete(trigger_message)
     except Exception:
         pass
 
@@ -13006,10 +13464,19 @@ def render_auto_delete_status(chat_id: int, chat_title: str) -> str:
     else:
         val = "❌ Отключено"
 
+    rights = get_bot_chat_admin_rights(int(chat_id))
+    if rights["can_delete_messages"]:
+        rights_text = "🤖 Бот: администратор, удаление сообщений доступно"
+    elif rights["is_admin"]:
+        rights_text = "🤖 Бот: администратор, но без права удалять сообщения"
+    else:
+        rights_text = "🤖 Бот: не является администратором"
+
     return (
         f"🔏 Авто-удаление сообщений чата <b>{h(chat_title)}</b>\n"
-        f"{val}\n\n"
-        f"💬 Чтобы изменить время, введите \"<code>Био +автоудаление</code> + период\""
+        f"{val}\n"
+        f"{rights_text}\n\n"
+        f"💬 Чтобы изменить время, введите \"<code>Био +автоудаление</code>\" + период"
     )
 
 # Таймеры
@@ -14077,6 +14544,7 @@ def _promo_apply_to_user(code: str, user_id: int) -> tuple[bool, str]:
 INFECT_BOUND_K = 30 # коэффициент масштаба
 INFECT_BOUND_BETA = 0.7 # коэффициент кривизны
 COFINFUI_TAG = "CI"
+COFDUELUI_TAG = "CD"
 
 def load_infect_formula_settings():
     global INFECT_BOUND_K, INFECT_BOUND_BETA
@@ -14122,6 +14590,17 @@ def _parse_edit_float_arg(s: str):
     except Exception:
         return None
 
+def _parse_edit_int_arg(s: str):
+    raw = (s or "").strip().replace(",", ".")
+    if not raw:
+        return None
+    try:
+        if "." in raw:
+            return None
+        return int(raw)
+    except Exception:
+        return None
+
 def _cof_inf_stats_cb() -> str:
     return f"{COFINFUI_TAG}:R"
 
@@ -14158,6 +14637,119 @@ def render_cof_inf_stats_text() -> str:
         p_success = float(infect_success_chance(z, i))
         p_fail = 100.0 - p_success
         lines.append(f"{z} | {i} | {_fmt_pct_text(p_success)} | {_fmt_pct_text(p_fail)}")
+
+    return "\n".join(lines)
+
+# формула дуэли
+def load_duel_formula_settings():
+    global DUEL_MAX_TURNS, DUEL_BASE_HIT_PCT, DUEL_AIM_STEP_PCT, DUEL_BREAK_BASE_PCT, DUEL_BREAK_STEP_PCT
+
+    row = db_one(
+        "SELECT "
+        "COALESCE(rounds_value,40) AS rounds_value, "
+        "COALESCE(base_hit_pct,20) AS base_hit_pct, "
+        "COALESCE(aim_step_pct,8) AS aim_step_pct, "
+        "COALESCE(break_base_pct,22) AS break_base_pct, "
+        "COALESCE(break_step_pct,8) AS break_step_pct "
+        "FROM duel_formula_settings WHERE settings_id=1 LIMIT 1"
+    )
+    if not row:
+        return
+
+    try:
+        DUEL_MAX_TURNS = int(row["rounds_value"])
+    except Exception:
+        DUEL_MAX_TURNS = 40
+
+    try:
+        DUEL_BASE_HIT_PCT = int(row["base_hit_pct"])
+    except Exception:
+        DUEL_BASE_HIT_PCT = 20
+
+    try:
+        DUEL_AIM_STEP_PCT = int(row["aim_step_pct"])
+    except Exception:
+        DUEL_AIM_STEP_PCT = 8
+
+    try:
+        DUEL_BREAK_BASE_PCT = int(row["break_base_pct"])
+    except Exception:
+        DUEL_BREAK_BASE_PCT = 22
+
+    try:
+        DUEL_BREAK_STEP_PCT = int(row["break_step_pct"])
+    except Exception:
+        DUEL_BREAK_STEP_PCT = 8
+
+def save_duel_formula_settings(
+    rounds_value: int | None = None,
+    base_hit_pct: int | None = None,
+    aim_step_pct: int | None = None,
+    break_base_pct: int | None = None,
+    break_step_pct: int | None = None
+):
+    global DUEL_MAX_TURNS, DUEL_BASE_HIT_PCT, DUEL_AIM_STEP_PCT, DUEL_BREAK_BASE_PCT, DUEL_BREAK_STEP_PCT
+
+    if rounds_value is not None:
+        DUEL_MAX_TURNS = int(rounds_value)
+    if base_hit_pct is not None:
+        DUEL_BASE_HIT_PCT = int(base_hit_pct)
+    if aim_step_pct is not None:
+        DUEL_AIM_STEP_PCT = int(aim_step_pct)
+    if break_base_pct is not None:
+        DUEL_BREAK_BASE_PCT = int(break_base_pct)
+    if break_step_pct is not None:
+        DUEL_BREAK_STEP_PCT = int(break_step_pct)
+
+    db_exec(
+        "INSERT INTO duel_formula_settings("
+        "settings_id, rounds_value, base_hit_pct, aim_step_pct, break_base_pct, break_step_pct, updated_at"
+        ") VALUES (1,?,?,?,?,?,?) "
+        "ON CONFLICT(settings_id) DO UPDATE SET "
+        "rounds_value=excluded.rounds_value, "
+        "base_hit_pct=excluded.base_hit_pct, "
+        "aim_step_pct=excluded.aim_step_pct, "
+        "break_base_pct=excluded.break_base_pct, "
+        "break_step_pct=excluded.break_step_pct, "
+        "updated_at=excluded.updated_at",
+        (
+            int(DUEL_MAX_TURNS),
+            int(DUEL_BASE_HIT_PCT),
+            int(DUEL_AIM_STEP_PCT),
+            int(DUEL_BREAK_BASE_PCT),
+            int(DUEL_BREAK_STEP_PCT),
+            int(now_ts())
+        ),
+        commit=True
+    )
+
+def _cof_duel_stats_cb() -> str:
+    return f"{COFDUELUI_TAG}:R"
+
+def kb_duel_cof_stats() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("Обновить статистику", callback_data=_cof_duel_stats_cb()))
+    return kb
+
+def render_duel_cof_stats_text() -> str:
+    stack1_aim = int(DUEL_AIM_STEP_PCT)
+    stack3_aim = int(DUEL_AIM_STEP_PCT * 3)
+
+    stack1_break = int(_duel_break_chance_from_bonus(stack1_aim)) if stack1_aim > 0 else int(DUEL_BREAK_BASE_PCT)
+    stack3_break = int(_duel_break_chance_from_bonus(stack3_aim)) if stack3_aim > 0 else int(DUEL_BREAK_BASE_PCT)
+
+    lines = []
+    lines.append("📋 Изменения формулы дуэли")
+    lines.append("")
+    lines.append(f"Ходов: {int(DUEL_MAX_TURNS)}")
+    lines.append(f"Попадание: {_fmt_pct_text(float(DUEL_BASE_HIT_PCT))}")
+    lines.append(f"Прицел бонус: +{_fmt_pct_text(float(DUEL_AIM_STEP_PCT))}")
+    lines.append(f"Сбивание: {_fmt_pct_text(float(DUEL_BREAK_BASE_PCT))}")
+    lines.append(f"Сбив. бонус: +{_fmt_pct_text(float(DUEL_BREAK_STEP_PCT))}")
+    lines.append("")
+    lines.append("Стак |+👁️‍🗨️|🪃")
+    lines.append(f"ㅤㅤ1|{_fmt_pct_text(float(stack1_aim))}|{_fmt_pct_text(float(stack1_break))}")
+    lines.append(f"ㅤㅤ3|{_fmt_pct_text(float(stack3_aim))}|{_fmt_pct_text(float(stack3_break))}")
 
     return "\n".join(lines)
 
@@ -15569,8 +16161,8 @@ def _calc_exp_payload(total_bio_exp: int, fail_count: int):
 
     return {
         "text": (
-            f"🧮 Калькулятор: ☣️ Био-опыта\n"
-            f"🛡️ {_ru_dots(fails)} ⇆ ☣️ {_ru_dots(total)}\n"
+            f"🧮 Калькулятор: Кол-во био-опыта\n"
+            f"☣️ {_ru_dots(total)} ⇆ 🥽 {_ru_dots(fails)}\n"
             f"💰 Итоговая награда: <b>{_ru_dots(final_gain)}</b>"
         )
     }
@@ -15578,18 +16170,16 @@ def _calc_exp_payload(total_bio_exp: int, fail_count: int):
 def _calc_duel_payload(stacks: int):
     st = max(0, int(stacks or 0))
     aim_bonus = int(st * DUEL_AIM_STEP_PCT)
-    break_chance = int(_duel_break_chance_from_bonus(aim_bonus)) if st > 0 else 0
+
+    base_break = int(DUEL_BREAK_BASE_PCT)
+    total_break = int(_duel_break_chance_from_bonus(aim_bonus)) if st > 0 else int(DUEL_BREAK_BASE_PCT)
 
     lines = [
         "🧮 Калькулятор: ⚔️ Дуэли",
         f"🎯 Стаков: <b>{_ru_dots(st)}</b>",
-        f"👁️‍🗨️ Бонус прицеливания: <b>{_fmt_pct_text(float(aim_bonus))}</b>",
+        f"👁️‍🗨️ Бонус прицеливания: <b>{_fmt_pct_text(float(base_break))} + {_fmt_pct_text(float(aim_bonus))} = {_fmt_pct_text(float(total_break))}</b>",
+        f"🪃 Шанс сбить прицел: <b>{_fmt_pct_text(float(total_break))}</b>",
     ]
-
-    if st > 0:
-        lines.append(f"🪃 Шанс сбить прицел: <b>{_fmt_pct_text(float(break_chance))}</b>")
-    else:
-        lines.append("🪃 Шанс сбить прицел: <b>0%</b>")
 
     return {"text": "\n".join(lines)}
 
@@ -16061,12 +16651,13 @@ def handle_calc_command(message, parsed: Parsed):
     ensure_lab_exists(uid)
 
     def _emit(text: str):
-        _REAL_BOT_REPLY_TO(
+        sent = _REAL_BOT_REPLY_TO(
             message,
             premiumize_html_text(text),
             parse_mode="HTML",
             disable_web_page_preview=True
         )
+        remember_reply_pair_for_autodelete(sent, message)
 
     def _emit_err(hint_text: str):
         _emit(_calc_inline_error_text("calc", hint_text))
@@ -16156,7 +16747,7 @@ def handle_calc_command(message, parsed: Parsed):
 
     if mode == "EXP":
         if not parts:
-            _emit_err(_calc_exp_hint_text())
+            _emit_err(_calc_exp_levels_hint_text())
             return
 
         if len(parts) < 2:
@@ -16180,7 +16771,7 @@ def handle_calc_command(message, parsed: Parsed):
 
     if mode == "DUEL":
         if not parts:
-            _emit_err(_calc_duel_hint_text())
+            _emit_err(_calc_duel_levels_hint_text())
             return
 
         try:
@@ -19351,6 +19942,42 @@ def cb_cof_inf_stats_refresh(cq):
         except Exception:
             pass
 
+@bot.callback_query_handler(func=lambda cq: (cq.data or "") == _cof_duel_stats_cb())
+def cb_duel_cof_stats_refresh(cq):
+    try:
+        if not can_manage_support(int(cq.from_user.id)):
+            bot.answer_callback_query(cq.id)
+            return
+
+        text = render_duel_cof_stats_text()
+        rm = kb_duel_cof_stats()
+
+        if cq.inline_message_id:
+            limited_edit_message_text(
+                text=text,
+                inline_id=cq.inline_message_id,
+                parse_mode="HTML",
+                reply_markup=rm,
+                disable_web_page_preview=True
+            )
+        elif cq.message:
+            limited_edit_message_text(
+                text=text,
+                chat_id=cq.message.chat.id,
+                msg_id=cq.message.message_id,
+                parse_mode="HTML",
+                reply_markup=rm,
+                disable_web_page_preview=True
+            )
+
+        bot.answer_callback_query(cq.id, "Статистика обновлена.")
+    except Exception as e:
+        send_error_report("cb_duel_cof_stats_refresh", e)
+        try:
+            bot.answer_callback_query(cq.id)
+        except Exception:
+            pass
+
 @bot.callback_query_handler(func=lambda cq: (cq.data or "").startswith(f"{DBFILEUI_TAG}:"))
 def cb_db_file_export(cq):
     try:
@@ -19960,6 +20587,7 @@ def cb_lab_restore_req(cq):
             pass
 
 # DUELS
+#        CALLBACKS
 CB_DUEL_ACCEPT = "DUEL_ACCEPT"
 CB_DUEL_DECLINE = "DUEL_DECLINE"
 CB_DUEL_FIRE = "DUEL_FIRE"
@@ -19970,13 +20598,14 @@ CB_DUEL_CANCEL = "DUEL_CANCEL"
 CB_DUEL_INV_CANCEL = "DUEL_INV_CANCEL"
 CB_DUEL_REMATCH = "DUEL_REMATCH"
 CB_DUEL_RANDOM = "DUEL_RANDOM"
-
+#         CONSTANTS
 DUEL_INVITE_TIMEOUT_SEC = 5 * 60
 DUEL_TURN_TIMEOUT_SEC = 5 * 60
-DUEL_BASE_HIT_PCT = 25
+DUEL_BASE_HIT_PCT = 20
 DUEL_MAX_TURNS = 40
 DUEL_AIM_STEP_PCT = 8
-DUEL_BREAK_BASE_PCT = 32
+DUEL_BREAK_BASE_PCT = 22
+DUEL_BREAK_STEP_PCT = 8
 
 def _duel_stake_text(amount: int) -> str:
     n = int(amount or 0)
@@ -19987,8 +20616,9 @@ def _duel_break_chance_from_bonus(opponent_bonus: int) -> int:
     if bonus <= 0:
         return 0
 
-    stacks = int(math.ceil(float(bonus) / float(DUEL_AIM_STEP_PCT)))
-    chance = int(DUEL_BREAK_BASE_PCT + stacks * DUEL_AIM_STEP_PCT)
+    aim_step = max(1, int(DUEL_AIM_STEP_PCT))
+    stacks = int(math.ceil(float(bonus) / float(aim_step)))
+    chance = int(DUEL_BREAK_BASE_PCT + stacks * DUEL_BREAK_STEP_PCT)
 
     if chance < 0:
         chance = 0
@@ -20594,6 +21224,15 @@ def _duel_break_aim_text(chat_id: int, actor_id: int, next_id: int) -> str:
         f"Ход <b>{ntag}</b>:"
     )
 
+def _duel_break_aim_fail_text(chat_id: int, actor_id: int, next_id: int) -> str:
+    with chat_name_context(int(chat_id)):
+        atag = public_user_tag(int(actor_id))
+        ntag = public_user_tag(int(next_id))
+    return (
+        f"🪃 <b>{atag}</b> {_gender_pick(int(actor_id), 'duel_break_fail')} <b>{ntag}</b>, {_gender_pick(int(actor_id), 'duel_break_fail_2')}.\n"
+        f"Ход <b>{ntag}</b>:"
+    )
+
 def _duel_surrender_text(chat_id: int, winner_id: int, loser_id: int, stake_amount: int) -> str:
     with chat_name_context(int(chat_id)):
         wtag = public_user_tag(int(winner_id))
@@ -20904,7 +21543,7 @@ def _duel_perform_action(duel_row, actor_id: int, action: str, *, via_message=No
 
             txt = _duel_break_aim_text(int(duel_row["chat_id"]), int(actor_id), int(opponent_id))
         else:
-            txt = _duel_miss_text(int(duel_row["chat_id"]), int(actor_id), int(opponent_id))
+            txt = _duel_break_aim_fail_text(int(duel_row["chat_id"]), int(actor_id), int(opponent_id))
 
         _duel_finish_pass_turn(
             duel_row,
@@ -24849,12 +25488,26 @@ def handle_corp_commands(message, parsed: Parsed):
                 if target_user_obj is not None:
                     capture_user_context(message, target_user_obj)
 
+                if _is_game_bot_target(int(target_id), target_user_obj):
+                    bot.reply_to(
+                        message,
+                        "📑 Как бы вам и мне не хотелось, но бот не может участвовать в игре. Бот не может состоять в корпорации."
+                    )
+                    return
+
                 rcid, _ = get_user_corp_resolved(int(target_id))
                 if rcid > 0:
                     corp = corp_by_id(int(rcid))
                 else:
                     bot.reply_to(message, "📑 Этот пользователь не состоит в Корпорации.")
                     return
+
+        if corp is None and not name and _reply_is_direct_bot_without_targets(message, uid):
+            bot.reply_to(
+                message,
+                "📑 Как бы вам и мне не хотелось, но бот не может участвовать в игре. Бот не может состоять в корпорации."
+            )
+            return
 
         if corp is None and not name and message.reply_to_message and getattr(message.reply_to_message, "from_user", None):
             ru = message.reply_to_message.from_user
@@ -25572,6 +26225,10 @@ def text_router(message):
             handle_owner_db_commands(message, parsed)
             return
 
+        if parsed.cmd == "delete_user_db":
+            handle_delete_user_db_command(message, parsed)
+            return
+
         # коффициенты заражения
         if parsed.cmd == "edit_k":
             handle_edit_k_command(message, parsed)
@@ -25583,6 +26240,31 @@ def text_router(message):
 
         if parsed.cmd == "cof_inf_stats":
             handle_cof_inf_stats_command(message, parsed)
+            return
+
+        # коэффициенты дуэли
+        if parsed.cmd == "duel_cof_stats":
+            handle_duel_cof_stats_command(message, parsed)
+            return
+
+        if parsed.cmd == "duel_cof_break":
+            handle_duel_cof_break_command(message, parsed)
+            return
+
+        if parsed.cmd == "duel_cof_break_bon":
+            handle_duel_cof_break_bon_command(message, parsed)
+            return
+
+        if parsed.cmd == "duel_cof_aim":
+            handle_duel_cof_aim_command(message, parsed)
+            return
+
+        if parsed.cmd == "duel_cof_base_pts":
+            handle_duel_cof_base_pts_command(message, parsed)
+            return
+
+        if parsed.cmd == "duel_rounds":
+            handle_duel_rounds_command(message, parsed)
             return
 
         # /agents
