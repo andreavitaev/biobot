@@ -1629,10 +1629,44 @@ def _rp_pick_single_fallback_emoji(emoji_text: str) -> str:
         return ""
 
     parts = [p for p in raw.split(" ") if p]
-    if not parts:
-        return raw
+    token = parts[0] if parts else raw
+    if not token:
+        return ""
 
-    return parts[0]
+    out = token[0]
+    i = 1
+
+    while i < len(token):
+        ch = token[i]
+        cp = ord(ch)
+
+        if cp in (0xFE0E, 0xFE0F):  # VS15/VS16
+            out += ch
+            i += 1
+            continue
+
+        if 0x1F3FB <= cp <= 0x1F3FF:  # skin tone modifiers
+            out += ch
+            i += 1
+            continue
+
+        if unicodedata.combining(ch):
+            out += ch
+            i += 1
+            continue
+
+        if ch == "\u200d":  # ZWJ
+            out += ch
+            i += 1
+            if i < len(token):
+                out += token[i]
+                i += 1
+                continue
+            break
+
+        break
+
+    return out
 
 def _rp_plain_emoji_html(emoji_text: str) -> str:
     emo = re.sub(r"\s+", " ", str(emoji_text or "").strip())
@@ -2083,6 +2117,45 @@ def _try_send_result_to_pm_from_message(message, text, *args, **kwargs):
         return msg
     except Exception:
         return None
+
+def _try_send_rp_result_to_pm_users(
+    actor_id: int,
+    target_id: int,
+    text: str,
+    *,
+    target_is_bot: bool = False
+) -> bool:
+    delivered = False
+
+    recipients = []
+    if int(actor_id) > 0:
+        recipients.append(int(actor_id))
+
+    if (not bool(target_is_bot)) and int(target_id) > 0 and int(target_id) != int(actor_id):
+        recipients.append(int(target_id))
+
+    seen = set()
+    for uid in recipients:
+        if uid in seen:
+            continue
+        seen.add(uid)
+
+        if int(get_pm_opened(uid)) != 1:
+            continue
+
+        try:
+            msg = _REAL_BOT_SEND_MESSAGE(
+                int(uid),
+                _premium_text_payload(text),
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
+            remember_bot_message_for_autodelete(msg)
+            delivered = True
+        except Exception:
+            pass
+
+    return delivered
 
 def _bot_send_message_premium(chat_id, text, *args, **kwargs):
     msg = _REAL_BOT_SEND_MESSAGE(chat_id, _premium_text_payload(text), *args, **kwargs)
@@ -11904,6 +11977,15 @@ def try_handle_rp_action_message(message) -> bool:
         comment_text=comment_text
     )
 
+    target_is_bot = bool(target_user_obj and bool(getattr(target_user_obj, "is_bot", False)))
+    if not target_is_bot:
+        try:
+            trow = get_user_row(int(target_id))
+            if trow and int(trow["is_bot"] or 0) == 1:
+                target_is_bot = True
+        except Exception:
+            pass
+
     try:
         sent = _REAL_BOT_REPLY_TO(
             message,
@@ -11913,7 +11995,20 @@ def try_handle_rp_action_message(message) -> bool:
         )
         remember_reply_pair_for_autodelete(sent, message)
         _inc_personal_rp_use(action)
-    except Exception:
+    except Exception as e:
+        chat_type = (getattr(message.chat, "type", "") or "").lower()
+
+        if chat_type in ("group", "supergroup") and _is_send_text_forbidden_error(e):
+            delivered = _try_send_rp_result_to_pm_users(
+                int(actor_id),
+                int(target_id),
+                text,
+                target_is_bot=bool(target_is_bot)
+            )
+            if delivered:
+                _inc_personal_rp_use(action)
+            return True
+
         return False
 
     _rp_insert_event(action["trigger_key"], int(actor_id), int(target_id))
