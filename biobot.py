@@ -7423,6 +7423,7 @@ def build_agents_panel_text(user_id: int) -> str:
         lines.append("/duel_cof_break_bon — изменить 🪃 бонус")
         lines.append("/duel_cof_aim — изменить 👁️‍🗨️ бонус")
         lines.append("/duel_cof_base_pts — изменить шанс попадания")
+        lines.append("/duel_rounds — изменить кол-во раундов")
         lines.append("/duel_cof_stats — информация по переменным дуэлей")
         lines.append("")
         lines.append("🦠 Формула заразности") 
