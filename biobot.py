@@ -2073,8 +2073,16 @@ def _is_send_text_forbidden_error(exc: Exception) -> bool:
     s = str(exc or "").lower()
     return (
         "not enough rights to send text messages to the chat" in s
+        or "not enough rights to send messages to the chat" in s
+        or "not enough rights to send a message" in s
         or "have no rights to send a message" in s
+        or "have no rights to send messages" in s
         or "chat_write_forbidden" in s
+        or "bot is not allowed to send messages to this chat" in s
+        or "bot is not allowed to send messages in the chat" in s
+        or "bot is not allowed to send messages in the supergroup chat" in s
+        or "need administrator rights in the channel chat" in s
+        or "bot can't send messages to bots" in s
     )
 
 def _is_chat_not_found_error(exc: Exception) -> bool:
@@ -7687,9 +7695,6 @@ def handle_admin_service_commands(message, parsed: "Parsed"):
     uid = int(message.from_user.id)
     upsert_user(message.from_user)
 
-    if message.chat.type != "private":
-        return
-
     if not is_support(uid):
         return
 
@@ -8974,10 +8979,6 @@ def handle_owner_db_commands(message, parsed: "Parsed"):
 def handle_delete_user_db_command(message, parsed: "Parsed"):
     uid = int(message.from_user.id)
     upsert_user(message.from_user)
-
-    if message.chat.type != "private":
-        bot.reply_to(message, "📑 Эта команда работает только в личных сообщениях бота.")
-        return
 
     if not is_support(uid):
         bot.reply_to(message, "📑 Эта команда доступна только агентам техподдержки.")
@@ -12333,10 +12334,6 @@ def handle_duel_rounds_command(message, parsed: Parsed):
     )
 
 def handle_admin_name_restriction_command(message, parsed: Parsed):
-    if message.chat.type != "private":
-        bot.reply_to(message, "📑 Эта команда работает только в личных сообщениях бота.")
-        return
-
     uid = int(message.from_user.id)
     if not is_support(uid):
         bot.reply_to(message, "📑 Эта команда доступна только агентам техподдержки")
@@ -12394,10 +12391,6 @@ def handle_admin_name_restriction_command(message, parsed: Parsed):
     )
 
 def handle_blacklist_command(message):
-    if message.chat.type != "private":
-        bot.reply_to(message, "📑 Эта команда работает только в личных сообщениях бота.")
-        return
-
     uid = int(message.from_user.id)
     if not is_support(uid):
         bot.reply_to(message, "📑 Эта команда доступна только агентам техподдержки")
@@ -20724,6 +20717,10 @@ def _duel_break_chance_from_bonus(opponent_bonus: int) -> int:
 
     return int(chance)
 
+def _duel_drop_one_stack_bonus(bonus: int) -> int:
+    step = max(1, int(DUEL_AIM_STEP_PCT))
+    return max(0, int(bonus or 0) - step)
+
 def _duel_accept_cb(invite_id: int, target_id: int) -> str:
     return f"{CB_DUEL_ACCEPT}:{int(invite_id)}:{int(target_id)}"
 
@@ -21346,9 +21343,13 @@ def _duel_hit_text(chat_id: int, winner_id: int, loser_id: int, stake_amount: in
     with chat_name_context(int(chat_id)):
         wtag = public_user_tag(int(winner_id))
         ltag = public_user_tag(int(loser_id))
+
+    streak_label = _duel_next_win_streak_label(int(winner_id))
+    streak_text = f" {h(streak_label)}" if streak_label else ""
+
     return (
         f"💀🔫 Попадание!\n"
-        f"<b>{wtag}</b> {_gender_pick(int(winner_id), 'duel_hit')} в <b>{ltag}</b>"
+        f"<b>{wtag}</b> {_gender_pick(int(winner_id), 'duel_hit')} в <b>{ltag}</b>{streak_text}"
         f"{_duel_win_extra_line(int(chat_id), int(winner_id), int(stake_amount))}"
     )
 
@@ -21384,8 +21385,12 @@ def _duel_break_aim_fail_text(chat_id: int, actor_id: int, next_id: int) -> str:
     with chat_name_context(int(chat_id)):
         atag = public_user_tag(int(actor_id))
         ntag = public_user_tag(int(next_id))
+
+    fail_1 = _gender_pick(int(actor_id), "duel_break_fail") or "попытался сбить прицел"
+    fail_2 = _gender_pick(int(actor_id), "duel_break_fail_2") or "но не смог"
+
     return (
-        f"🪃 <b>{atag}</b> {_gender_pick(int(actor_id), 'duel_break_fail')} <b>{ntag}</b>, {_gender_pick(int(actor_id), 'duel_break_fail_2')}.\n"
+        f"🪃 <b>{atag}</b> {fail_1} <b>{ntag}</b>, {fail_2}.\n"
         f"Ход <b>{ntag}</b>:"
     )
 
@@ -21504,6 +21509,14 @@ def _duel_stats_add_draw(user_id: int):
         (int(user_id),),
         commit=True
     )
+
+def _duel_next_win_streak_label(user_id: int) -> str:
+    row = db_one(
+        "SELECT COALESCE(win_streak,0) AS win_streak FROM duel_stats WHERE user_id=? LIMIT 1",
+        (int(user_id),)
+    )
+    cur = int(row["win_streak"] or 0) if row else 0
+    return _duel_streak_label(cur + 1)
 
 def _duel_finish_victory(duel_row, winner_id: int, loser_id: int, text: str, *, via_message=None, edit_existing: bool = True):
     duel_id = int(duel_row["duel_id"])
@@ -21652,6 +21665,12 @@ def _duel_perform_action(duel_row, actor_id: int, action: str, *, via_message=No
             )
             return True, ""
 
+        actor_bonus = _duel_drop_one_stack_bonus(actor_bonus)
+        if actor_bonus_col == "challenger_aim_bonus":
+            challenger_bonus = int(actor_bonus)
+        else:
+            target_bonus = int(actor_bonus)
+
         txt = _duel_miss_text(int(duel_row["chat_id"]), int(actor_id), int(opponent_id))
         _duel_finish_pass_turn(
             duel_row,
@@ -21688,6 +21707,12 @@ def _duel_perform_action(duel_row, actor_id: int, action: str, *, via_message=No
     if action == "break":
         if int(opponent_bonus) <= 0:
             return False, "📑 У соперника нет активного прицела."
+
+        actor_bonus = _duel_drop_one_stack_bonus(actor_bonus)
+        if actor_bonus_col == "challenger_aim_bonus":
+            challenger_bonus = int(actor_bonus)
+        else:
+            target_bonus = int(actor_bonus)
 
         break_chance = _duel_break_chance_from_bonus(int(opponent_bonus))
 
@@ -26339,6 +26364,20 @@ def text_router(message):
         if parsed.cmd in ("promo_delete", "promo_use", "bot_ban", "bot_unban", "remake_lab", "edit_k", "edit_b"):
             if not strict_single_word_arg_ok(parsed):
                 return
+        
+        senior_creator_private_only_cmds = (
+            "my_owner", "my_owner_remove", "users_list",
+            "owner", "owner_remove",
+            "agent", "agent_remove",
+            "db_fife", "db_fife_stat", "db_fife_msg", "db_fife_upd", "its",
+            "edit_k", "edit_b", "cof_inf_stats",
+            "duel_cof_stats", "duel_cof_break", "duel_cof_break_bon",
+            "duel_cof_aim", "duel_cof_base_pts", "duel_rounds",
+            "promo_generate", "promo_create", "promo_all", "promo_delete",
+        )
+
+        if message.chat.type != "private" and parsed.cmd in senior_creator_private_only_cmds:
+            return
 
         if parsed.cmd in (
             "top_users", "top_users_chat",
