@@ -2173,6 +2173,7 @@ def _bot_send_message_premium(chat_id, text, *args, **kwargs):
 def _bot_reply_to_premium(message, text, *args, **kwargs):
     try:
         send_kwargs = dict(kwargs)
+        no_pm_fallback = bool(send_kwargs.pop("_no_pm_fallback", False))
 
         if "reply_parameters" in send_kwargs:
             send_kwargs.pop("reply_parameters", None)
@@ -2195,7 +2196,13 @@ def _bot_reply_to_premium(message, text, *args, **kwargs):
         chat_type = (getattr(getattr(message, "chat", None), "type", "") or "").lower()
 
         if chat_type in ("group", "supergroup") and _is_send_text_forbidden_error(e):
-            pm_msg = _try_send_result_to_pm_from_message(message, text, *args, **kwargs)
+            if no_pm_fallback:
+                return None
+
+            pm_kwargs = dict(kwargs)
+            pm_kwargs.pop("_no_pm_fallback", None)
+
+            pm_msg = _try_send_result_to_pm_from_message(message, text, *args, **pm_kwargs)
             if pm_msg is not None:
                 remember_reply_pair_for_autodelete(pm_msg, message)
                 return pm_msg
@@ -9920,7 +9927,8 @@ def handle_report_command(message):
         bot.reply_to(
             message,
             "📑 Эта команда работает только в личных сообщениях бота.",
-            reply_markup=kb_open_bot_pm()
+            reply_markup=kb_open_bot_pm(),
+            _no_pm_fallback=True
         )
         return
 
@@ -11527,6 +11535,7 @@ def build_start_text(user) -> str:
     lines.append("Что вас интересует?")
     lines.append(f'1. <code>Био настройки</code> — более гибкая настройка параметров уведомлений и прочего.')
     lines.append(f'2. <code>Био репорт</code> — если заметили, что в моей работе что-то не так, уведомите тех.поддержку.\n')
+    lines.append(f'⚠️ Если у вас произошла ошибка в работе бота, пожалуйста, сообщите об этом в тех.поддержку.\n')
 
     lines.append('👨‍⚕️ <b>Агенты поддержки</b>, которые могут ответить на ваши вопросы')
 
@@ -11557,12 +11566,30 @@ def add_to_chat_keyboard() -> InlineKeyboardMarkup:
     kb.add(InlineKeyboardButton("Добавить в свой чат", url=url, style="success"))
     return kb
 
-def send_welcome_message(chat_id: int, user):
+def send_welcome_message(chat_id: int, user, source_message=None):
     text = build_start_text(user)
+
+    is_private_context = False
+    if source_message is not None:
+        is_private_context = ((getattr(getattr(source_message, "chat", None), "type", "") or "").lower() == "private")
+    else:
+        is_private_context = (int(chat_id) == int(getattr(user, "id", 0) or 0))
+
+    rm = add_to_chat_keyboard() if is_private_context else None
+
+    if source_message is not None:
+        bot.reply_to(
+            source_message,
+            text,
+            reply_markup=rm,
+            disable_web_page_preview=True,
+        )
+        return
+
     bot.send_message(
         chat_id,
         text,
-        reply_markup=add_to_chat_keyboard(),
+        reply_markup=rm,
         disable_web_page_preview=True,
     )
 
@@ -11571,7 +11598,7 @@ def handle_help_command(message):
     ensure_creator_is_support()
     if message.chat.type == "private":
         ensure_lab_exists(int(message.from_user.id))
-    send_welcome_message(int(message.chat.id), message.from_user)
+    send_welcome_message(int(message.chat.id), message.from_user, source_message=message)
 
 def _format_ping_seconds_ms(delta_ms: int) -> str:
     delta_ms = max(0, int(delta_ms or 0))
@@ -11916,13 +11943,15 @@ def handle_mrp_list_command(message):
         bot.reply_to(
             message,
             "📋 Список личных рп команд отправлен в личные сообщения.",
-            reply_markup=pm_kb
+            reply_markup=pm_kb,
+            _no_pm_fallback=True
         )
     except Exception:
         bot.reply_to(
             message,
             "📑 Не удалось отправить список в личные сообщения. Напишите боту в л/с.",
-            reply_markup=pm_kb
+            reply_markup=pm_kb,
+            _no_pm_fallback=True
         )
 
 def try_handle_rp_action_message(message) -> bool:
@@ -17132,13 +17161,15 @@ def handle_balance_command(message, parsed: Optional[Parsed] = None):
                 bot.reply_to(
                     message,
                     "📋 Информация о вашем балансе отправлена в личные сообщения.",
-                    reply_markup=kb_open_bot_pm()
+                    reply_markup=kb_open_bot_pm(),
+                    _no_pm_fallback=True
                 )
             else:
                 bot.reply_to(
                     message,
                     "📑 Не удалось отправить информацию в личные сообщения. Сначала откройте личный чат с ботом.",
-                    reply_markup=kb_open_bot_pm()
+                    reply_markup=kb_open_bot_pm(),
+                    _no_pm_fallback=True
                 )
             return
 
@@ -24838,13 +24869,15 @@ def handle_lab_commands(message, parsed: Parsed):
                     bot.reply_to(
                         message,
                         "📋 Информация о вашей лаборатории отправлена в личные сообщения.",
-                        reply_markup=kb_open_bot_pm()
+                        reply_markup=kb_open_bot_pm(),
+                        _no_pm_fallback=True
                     )
                 else:
                     bot.reply_to(
                         message,
                         "📑 Не удалось отправить информацию в личные сообщения. Сначала откройте личный чат с ботом.",
-                        reply_markup=kb_open_bot_pm()
+                        reply_markup=kb_open_bot_pm(),
+                        _no_pm_fallback=True    
                     )
                 return
 
