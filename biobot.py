@@ -357,7 +357,7 @@ def _parse_rp_action_file_line(raw_line: str):
         stat2 = parts[4]
 
     emoji = re.sub(r"\s+", " ", (emoji or "").strip())
-    premium_id = (premium_id or "").strip()
+    premium_id = _normalize_custom_emoji_id(premium_id, verify_live=True)
     trigger = re.sub(r"\s+", " ", (trigger or "").strip())
     stat1 = re.sub(r"\s+", " ", (stat1 or "").strip())
     stat2 = re.sub(r"\s+", " ", (stat2 or "").strip())
@@ -382,6 +382,8 @@ def _parse_rp_action_file_line(raw_line: str):
     }
 
 def load_personal_rp_actions(user_id: int) -> dict:
+    _cleanup_invalid_personal_rp_premium_ids(int(user_id))
+
     rows = db_all(
         "SELECT action_id, user_id, trigger, trigger_key, emoji, premium_id, action_text, uses_count, created_at "
         "FROM personal_rp_actions WHERE user_id=? ORDER BY action_id ASC",
@@ -398,7 +400,7 @@ def load_personal_rp_actions(user_id: int) -> dict:
             "action_id": int(r["action_id"]),
             "user_id": int(r["user_id"]),
             "emoji": (r["emoji"] or "").strip(),
-            "premium_id": (r["premium_id"] or "").strip() if str(r["premium_id"] or "").strip().isdigit() else "",
+            "premium_id": _normalize_custom_emoji_id(r["premium_id"], verify_live=True),
             "trigger": (r["trigger"] or "").strip(),
             "trigger_key": key,
             "action_text": (r["action_text"] or "").strip(),
@@ -443,7 +445,7 @@ def _resolve_rp_action_ref(action_ref: str, actor_id: int):
             "action_id": int(row["action_id"]),
             "user_id": int(row["user_id"]),
             "emoji": (row["emoji"] or "").strip(),
-            "premium_id": (row["premium_id"] or "").strip() if str(row["premium_id"] or "").strip().isdigit() else "",
+            "premium_id": _normalize_custom_emoji_id(row["premium_id"], verify_live=True),
             "trigger": (row["trigger"] or "").strip(),
             "trigger_key": (row["trigger_key"] or "").strip(),
             "action_text": (row["action_text"] or "").strip(),
@@ -513,18 +515,21 @@ def _parse_mrp_create_from_text(text: str):
     if len(ep) >= 2:
         premium_id = ep[1].strip()
 
-    if premium_id and not premium_id.isdigit():
-        premium_id = ""
+    premium_id_raw = str(premium_id or "").strip()
+    premium_id = _normalize_custom_emoji_id(premium_id_raw)
 
     return {
         "trigger": trigger,
         "trigger_key": _normalize_rp_trigger(trigger),
         "emoji": emoji,
         "premium_id": premium_id,
+        "premium_id_raw": premium_id_raw,
         "action_text": action_text,
     }
 
 def render_personal_rp_list_text(user_id: int) -> str:
+    _cleanup_invalid_personal_rp_premium_ids(int(user_id))
+
     rows = db_all(
         "SELECT action_id, trigger, emoji, premium_id, uses_count "
         "FROM personal_rp_actions WHERE user_id=? ORDER BY action_id ASC",
@@ -6628,11 +6633,100 @@ def public_user_tag(user_id: int, force_standard: bool = False) -> str:
 def standard_user_tag(user_id: int) -> str:
     return public_user_tag(int(user_id), force_standard=True)
 
+_CUSTOM_EMOJI_VALIDITY_CACHE = {}
+_CUSTOM_EMOJI_VALIDITY_TTL = 6 * 60 * 60  # 6 часов
+
+def _is_probably_valid_custom_emoji_id(value: str) -> bool:
+    pid = str(value or "").strip()
+    if not pid or not pid.isdigit():
+        return False
+
+    if len(pid) < 15 or len(pid) > 40:
+        return False
+
+    if pid.startswith("0"):
+        return False
+
+    return True
+
+def _check_custom_emoji_id_live(value: str):
+    """
+    Возвращает:
+      True  -> id подтверждён Telegram API
+      False -> id подтверждённо нерабочий
+      None  -> не удалось проверить
+    """
+    pid = str(value or "").strip()
+    if not _is_probably_valid_custom_emoji_id(pid):
+        return False
+
+    now = int(now_ts())
+    cached = _CUSTOM_EMOJI_VALIDITY_CACHE.get(pid)
+    if cached:
+        cached_ts, cached_ok = cached
+        if int(now - int(cached_ts)) <= int(_CUSTOM_EMOJI_VALIDITY_TTL):
+            return bool(cached_ok)
+
+    getter = getattr(bot, "get_custom_emoji_stickers", None)
+    if not callable(getter):
+        return None
+
+    try:
+        items = getter([pid]) or []
+        ok = False
+        for st in items:
+            ceid = str(getattr(st, "custom_emoji_id", "") or "").strip()
+            if ceid == pid:
+                ok = True
+                break
+
+        _CUSTOM_EMOJI_VALIDITY_CACHE[pid] = (now, bool(ok))
+        return bool(ok)
+    except Exception:
+        return None
+
+def _normalize_custom_emoji_id(value: str, *, verify_live: bool = False) -> str:
+    pid = str(value or "").strip()
+    if not _is_probably_valid_custom_emoji_id(pid):
+        return ""
+
+    if verify_live:
+        live = _check_custom_emoji_id_live(pid)
+        if live is not True:
+            return ""
+
+    return pid
+
+def _cleanup_invalid_personal_rp_premium_ids(user_id: int):
+    uid = int(user_id)
+
+    rows = db_all(
+        "SELECT action_id, premium_id FROM personal_rp_actions WHERE user_id=?",
+        (uid,)
+    ) or []
+
+    bad_action_ids = []
+    for r in rows:
+        pid = str(r["premium_id"] or "").strip()
+        if not pid:
+            continue
+
+        live = _check_custom_emoji_id_live(pid)
+        if live is False:
+            bad_action_ids.append(int(r["action_id"]))
+
+    for action_id in bad_action_ids:
+        db_exec(
+            "UPDATE personal_rp_actions SET premium_id='' WHERE user_id=? AND action_id=?",
+            (uid, int(action_id)),
+            commit=True
+        )
+
 def rp_premium_emoji_html(emoji: str, premium_id: str) -> str:
     emo = re.sub(r"\s+", " ", str(emoji or "").strip())
-    pid = str(premium_id or "").strip()
+    pid = _normalize_custom_emoji_id(premium_id, verify_live=True)
 
-    if not pid or not pid.isdigit():
+    if not pid:
         return _rp_plain_emoji_html(emo)
 
     if PREMIUM_EMOJI_ENABLED:
@@ -11917,7 +12011,20 @@ def handle_mrp_add_command(message):
     trigger_key = parsed_payload["trigger_key"]
     emoji = parsed_payload["emoji"]
     premium_id = parsed_payload["premium_id"]
+    premium_id_raw = str(parsed_payload.get("premium_id_raw") or "").strip()
     action_text = parsed_payload["action_text"]
+
+    if premium_id_raw:
+        live = _check_custom_emoji_id_live(premium_id_raw)
+        if live is not True:
+            bot.reply_to(
+                message,
+                "📑 Указан нерабочий или неподтверждённый айди премиум эмодзи.\n"
+                "Укажите рабочий айди или создайте команду без него."
+            )
+            return
+
+        premium_id = premium_id_raw
 
     emoji_count = _rp_count_emoji_clusters(emoji)
     if emoji_count > 4:
