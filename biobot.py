@@ -511,7 +511,9 @@ def _parse_mrp_create_from_text(text: str):
     if ep:
         emoji = ep[0].strip()
     if len(ep) >= 2:
-        premium_id = ep[1].strip()
+        maybe_pid = ep[1].strip()
+        if maybe_pid.isdigit():
+            premium_id = maybe_pid
 
     return {
         "trigger": trigger,
@@ -6580,6 +6582,9 @@ def standard_user_tag(user_id: int) -> str:
 def rp_premium_emoji_html(emoji: str, premium_id: str) -> str:
     emo = re.sub(r"\s+", " ", str(emoji or "").strip())
     pid = str(premium_id or "").strip()
+
+    if not pid.isdigit():
+        pid = ""
 
     if PREMIUM_EMOJI_ENABLED and pid:
         fallback = _rp_pick_single_fallback_emoji(emo) or "🔹"
