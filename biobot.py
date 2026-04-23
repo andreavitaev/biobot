@@ -398,7 +398,7 @@ def load_personal_rp_actions(user_id: int) -> dict:
             "action_id": int(r["action_id"]),
             "user_id": int(r["user_id"]),
             "emoji": (r["emoji"] or "").strip(),
-            "premium_id": (r["premium_id"] or "").strip(),
+            "premium_id": (r["premium_id"] or "").strip() if str(r["premium_id"] or "").strip().isdigit() else "",
             "trigger": (r["trigger"] or "").strip(),
             "trigger_key": key,
             "action_text": (r["action_text"] or "").strip(),
@@ -443,7 +443,7 @@ def _resolve_rp_action_ref(action_ref: str, actor_id: int):
             "action_id": int(row["action_id"]),
             "user_id": int(row["user_id"]),
             "emoji": (row["emoji"] or "").strip(),
-            "premium_id": (row["premium_id"] or "").strip(),
+            "premium_id": (row["premium_id"] or "").strip() if str(row["premium_id"] or "").strip().isdigit() else "",
             "trigger": (row["trigger"] or "").strip(),
             "trigger_key": (row["trigger_key"] or "").strip(),
             "action_text": (row["action_text"] or "").strip(),
@@ -511,9 +511,10 @@ def _parse_mrp_create_from_text(text: str):
     if ep:
         emoji = ep[0].strip()
     if len(ep) >= 2:
-        maybe_pid = ep[1].strip()
-        if maybe_pid.isdigit():
-            premium_id = maybe_pid
+        premium_id = ep[1].strip()
+
+    if premium_id and not premium_id.isdigit():
+        premium_id = ""
 
     return {
         "trigger": trigger,
@@ -1669,6 +1670,54 @@ def _rp_pick_single_fallback_emoji(emoji_text: str) -> str:
         break
 
     return out
+
+def _rp_count_emoji_clusters(emoji_text: str) -> int:
+    raw = re.sub(r"\s+", " ", str(emoji_text or "").strip())
+    if not raw:
+        return 0
+
+    count = 0
+    i = 0
+    n = len(raw)
+
+    while i < n:
+        ch = raw[i]
+
+        if ch.isspace():
+            i += 1
+            continue
+
+        count += 1
+        i += 1
+
+        while i < n:
+            ch2 = raw[i]
+            cp2 = ord(ch2)
+
+            if ch2.isspace():
+                break
+
+            if cp2 in (0xFE0E, 0xFE0F):  # VS15/VS16
+                i += 1
+                continue
+
+            if 0x1F3FB <= cp2 <= 0x1F3FF:  # skin tone modifiers
+                i += 1
+                continue
+
+            if unicodedata.combining(ch2):
+                i += 1
+                continue
+
+            if ch2 == "\u200d":  # ZWJ
+                i += 1
+                if i < n:
+                    i += 1
+                continue
+
+            break
+
+    return count
 
 def _rp_plain_emoji_html(emoji_text: str) -> str:
     emo = re.sub(r"\s+", " ", str(emoji_text or "").strip())
@@ -6583,10 +6632,10 @@ def rp_premium_emoji_html(emoji: str, premium_id: str) -> str:
     emo = re.sub(r"\s+", " ", str(emoji or "").strip())
     pid = str(premium_id or "").strip()
 
-    if not pid.isdigit():
-        pid = ""
+    if not pid or not pid.isdigit():
+        return _rp_plain_emoji_html(emo)
 
-    if PREMIUM_EMOJI_ENABLED and pid:
+    if PREMIUM_EMOJI_ENABLED:
         fallback = _rp_pick_single_fallback_emoji(emo) or "🔹"
         return f'<tg-emoji emoji-id="{h(pid)}">{h(fallback)}</tg-emoji>'
 
@@ -11869,6 +11918,14 @@ def handle_mrp_add_command(message):
     emoji = parsed_payload["emoji"]
     premium_id = parsed_payload["premium_id"]
     action_text = parsed_payload["action_text"]
+
+    emoji_count = _rp_count_emoji_clusters(emoji)
+    if emoji_count > 4:
+        bot.reply_to(
+            message,
+            "📑 В личной рп команде можно указать не более 4 эмодзи."
+        )
+        return
 
     cnt_row = db_one("SELECT COUNT(*) AS c FROM personal_rp_actions WHERE user_id=?", (uid,))
     cnt = int(cnt_row["c"] or 0) if cnt_row else 0
