@@ -291,54 +291,71 @@ def _rp_action_text_for_output(action: dict, actor_gender: str = "") -> str:
 def _normalize_rp_trigger(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip()).lower()
 
-def _normalize_mrp_target_mode(value: str) -> str:
-    s = re.sub(r"\s+", " ", str(value or "").strip()).lower()
-
-    if s in ("self", "other"):
-        return s
-
-    if s == "я":
-        return "self"
-
-    if s in ("другой", "другая", "д"):
-        return "other"
-
-    return ""
-
-def _mrp_extract_target_mode_from_text(text: str) -> str:
-    raw = strip_bio_prefix((text or "").strip())
-    if not raw:
-        return ""
-
-    lines = raw.splitlines()[1:]
-    out = ""
-    for line in lines:
-        s = str(line or "").strip()
-        if not s:
-            continue
-        m = re.match(r"(?i)^цель\s*:\s*(.+?)\s*$", s)
-        if not m:
-            continue
-        out = _normalize_mrp_target_mode(m.group(1))
-    return out
-
 def _mrp_has_layout_markers(action_text: str) -> bool:
     txt = str(action_text or "")
     return ("{я}" in txt) or ("{цель}" in txt)
 
-def _mrp_modifiers_icons(target_mode: str, action_text: str) -> str:
-    mods = []
-    mode = _normalize_mrp_target_mode(target_mode)
+def _mrp_marker_mode(action_text: str) -> str:
+    txt = str(action_text or "")
+    has_actor = "{я}" in txt
+    has_target = "{цель}" in txt
 
-    if mode == "self":
-        mods.append("🅰️")
-    elif mode == "other":
-        mods.append("🅱️")
+    if has_actor and has_target:
+        return "both"
+    if has_actor:
+        return "actor"
+    if has_target:
+        return "target"
+    return ""
 
-    if _mrp_has_layout_markers(action_text):
-        mods.append("🔤")
+def _mrp_modifiers_icons(_unused_target_mode: str, action_text: str) -> str:
+    mode = _mrp_marker_mode(action_text)
 
-    return " ".join(mods)
+    if mode == "actor":
+        return "🅰️"
+    if mode == "target":
+        return "🅱️"
+    if mode == "both":
+        return "🆎"
+    return ""
+
+def _split_personal_mrp_action_text_variants(raw_text: str) -> dict:
+    txt = re.sub(r"\s+", " ", str(raw_text or "").strip())
+    if not txt:
+        return {
+            "action_text": "",
+            "action_text_common": "",
+            "action_text_female": "",
+            "action_text_male": "",
+        }
+
+    if "/" not in txt:
+        return {
+            "action_text": txt,
+            "action_text_common": txt,
+            "action_text_female": "",
+            "action_text_male": "",
+        }
+
+    male_raw, female_raw = txt.split("/", 1)
+    male = re.sub(r"\s+", " ", str(male_raw or "").strip())
+    female = re.sub(r"\s+", " ", str(female_raw or "").strip())
+
+    if not male or not female:
+        common = male or female
+        return {
+            "action_text": common,
+            "action_text_common": common,
+            "action_text_female": "",
+            "action_text_male": "",
+        }
+
+    return {
+        "action_text": male,
+        "action_text_common": "",
+        "action_text_female": female,
+        "action_text_male": male,
+    }
 
 def _rp_render_action_template(action_text: str, actor_tag: str, target_tag: str, *, include_actor: bool, include_target: bool) -> str:
     marker_actor = "\uFFF0ACTOR\uFFF0"
@@ -469,6 +486,10 @@ def load_personal_rp_actions(user_id: int) -> dict:
         key = (r["trigger_key"] or "").strip().lower()
         if not key:
             continue
+
+        raw_action_text = (r["action_text"] or "").strip()
+        text_variants = _split_personal_mrp_action_text_variants(raw_action_text)
+
         out[key] = {
             "source": "personal",
             "action_id": int(r["action_id"]),
@@ -477,8 +498,11 @@ def load_personal_rp_actions(user_id: int) -> dict:
             "premium_id": _normalize_custom_emoji_id(r["premium_id"], verify_live=True),
             "trigger": (r["trigger"] or "").strip(),
             "trigger_key": key,
-            "action_text": (r["action_text"] or "").strip(),
-            "target_mode": _normalize_mrp_target_mode(r["target_mode"]),
+            "action_text": raw_action_text,
+            "action_text_common": text_variants["action_text_common"],
+            "action_text_female": text_variants["action_text_female"],
+            "action_text_male": text_variants["action_text_male"],
+            "target_mode": "",
             "stat1": "",
             "stat2": "",
             "uses_count": int(r["uses_count"] or 0),
@@ -515,6 +539,9 @@ def _resolve_rp_action_ref(action_ref: str, actor_id: int):
         )
         if not row:
             return None
+        raw_action_text = (row["action_text"] or "").strip()
+        text_variants = _split_personal_mrp_action_text_variants(raw_action_text)
+
         return {
             "source": "personal",
             "action_id": int(row["action_id"]),
@@ -523,8 +550,11 @@ def _resolve_rp_action_ref(action_ref: str, actor_id: int):
             "premium_id": _normalize_custom_emoji_id(row["premium_id"], verify_live=True),
             "trigger": (row["trigger"] or "").strip(),
             "trigger_key": (row["trigger_key"] or "").strip(),
-            "action_text": (row["action_text"] or "").strip(),
-            "target_mode": _normalize_mrp_target_mode(row["target_mode"]),
+            "action_text": raw_action_text,
+            "action_text_common": text_variants["action_text_common"],
+            "action_text_female": text_variants["action_text_female"],
+            "action_text_male": text_variants["action_text_male"],
+            "target_mode": "",
             "stat1": "",
             "stat2": "",
             "uses_count": int(row["uses_count"] or 0),
@@ -571,14 +601,13 @@ def _parse_mrp_create_from_text(text: str):
         return None
 
     body = first[4:].strip()
-    parts = [p.strip() for p in body.split("/")]
+    parts = [p.strip() for p in body.split("/", 2)]
     if len(parts) != 3:
         return None
 
     trigger = re.sub(r"\s+", " ", parts[0].strip())
     emoji_part = re.sub(r"\s+", " ", parts[1].strip())
-    action_text = re.sub(r"\s+", " ", parts[2].strip())
-    target_mode = _mrp_extract_target_mode_from_text(raw)
+    action_text = parts[2].strip()
 
     if not trigger or not action_text:
         return None
@@ -602,7 +631,6 @@ def _parse_mrp_create_from_text(text: str):
         "premium_id": premium_id,
         "premium_id_raw": premium_id_raw,
         "action_text": action_text,
-        "target_mode": target_mode,
     }
 
 def render_personal_rp_list_text(user_id: int) -> str:
@@ -626,7 +654,7 @@ def render_personal_rp_list_text(user_id: int) -> str:
                 f"{idx}.{emo}| <code>{h((r['trigger'] or '').strip())}</code> → {int(r['uses_count'] or 0)}"
             )
 
-            mods = _mrp_modifiers_icons((r["target_mode"] or "").strip(), (r["action_text"] or "").strip())
+            mods = _mrp_modifiers_icons("", (r["action_text"] or "").strip())
             if mods:
                 lines.append(f"модификаторы: {mods}")
 
@@ -6798,6 +6826,54 @@ def public_user_tag(user_id: int, force_standard: bool = False) -> str:
 def standard_user_tag(user_id: int) -> str:
     return public_user_tag(int(user_id), force_standard=True)
 
+def _visually_underlined_text(text: str) -> str:
+    s = str(text or "")
+    out = []
+    for ch in s:
+        if ch.isspace():
+            out.append(ch)
+        else:
+            out.append(ch + "\u0332")
+    return "".join(out)
+
+def underlined_public_user_tag(user_id: int) -> str:
+    uid = int(user_id)
+    row = get_user_row(uid)
+
+    alias = ""
+    if not _chat_name_ctx_force_standard():
+        alias = get_chat_user_name(_chat_name_ctx_chat_id(), uid)
+
+    if row:
+        un = _normalize_username_for_link((row["username"] or ""))
+        if alias:
+            return tg_mention(uid, _visually_underlined_text(alias), username=un)
+
+        if int(row["is_placeholder"] or 0) == 1:
+            if un:
+                return tg_mention(uid, _visually_underlined_text(un), username=un)
+            if uid > 0:
+                return tg_mention(uid, _visually_underlined_text(str(uid)))
+            return "неизвестный пользователь"
+
+        disp = display_name(row["first_name"] or "", row["last_name"] or "", row["username"] or "", uid)
+        label = _safe_clickable_name_or_uid(disp, uid)
+        return tg_mention(uid, _visually_underlined_text(label), username=un)
+
+    disp, un, real_uid = _best_known_display_by_uid(uid)
+
+    if alias and uid > 0:
+        return tg_mention(uid, _visually_underlined_text(alias), username=un)
+
+    if real_uid > 0:
+        label = _safe_clickable_name_or_uid(disp, real_uid)
+        return tg_mention(real_uid, _visually_underlined_text(label), username=un)
+
+    if un:
+        return tg_mention(real_uid, _visually_underlined_text(un), username=un)
+
+    return "неизвестный пользователь"
+
 _CUSTOM_EMOJI_VALIDITY_CACHE = {}
 _CUSTOM_EMOJI_VALIDITY_TTL = 6 * 60 * 60  # 6 часов
 
@@ -7004,32 +7080,46 @@ def _rp_emit_action_text(
     actor_tag: str,
     target_tag: str,
     extra_tail: str = "",
-    comment_text: str = ""
+    comment_text: str = "",
+    target_id: int = 0
 ) -> str:
     emo = rp_premium_emoji_html(action["emoji"], action["premium_id"])
     extra_tail = (extra_tail or "").strip()
     comment_text = (comment_text or "").strip()
 
-    actor_gender = get_user_gender(int(actor_id))
-    action_text = _rp_action_text_for_output(action, actor_gender=actor_gender)
-    target_mode = _normalize_mrp_target_mode(action.get("target_mode"))
+    if str(action.get("source") or "") == "personal":
+        target_gender = get_user_gender(int(target_id)) if int(target_id or 0) > 0 else ""
+        common = re.sub(r"\s+", " ", str(action.get("action_text_common") or "").strip())
+        female = re.sub(r"\s+", " ", str(action.get("action_text_female") or "").strip())
+        male = re.sub(r"\s+", " ", str(action.get("action_text_male") or "").strip())
+        legacy = re.sub(r"\s+", " ", str(action.get("action_text") or "").strip())
+
+        if common:
+            action_text = common
+        elif target_gender == "female" and female:
+            action_text = female
+        elif target_gender == "male" and male:
+            action_text = male
+        else:
+            action_text = male or female or legacy
+    else:
+        actor_gender = get_user_gender(int(actor_id))
+        action_text = _rp_action_text_for_output(action, actor_gender=actor_gender)
+
+    marker_mode = _mrp_marker_mode(action_text)
 
     if _mrp_has_layout_markers(action_text):
         body = _rp_render_action_template(
             action_text,
             actor_tag,
             target_tag,
-            include_actor=(target_mode != "other"),
-            include_target=(target_mode != "self"),
+            include_actor=(marker_mode in ("actor", "both")),
+            include_target=(marker_mode in ("target", "both")),
         )
     else:
-        if target_mode == "self":
-            body = f"{actor_tag} {h(action_text)}"
-        elif target_mode == "other":
-            body = f"{target_tag} {h(action_text)}"
-        else:
-            body = f"{actor_tag} {h(action_text)} {target_tag}"
+        body = f"{actor_tag} {h(action_text)} {target_tag}".strip()
 
+    body = re.sub(r"\s+", " ", body).strip()
     text = f"{emo}| {body}"
     if extra_tail:
         text += f" {h(extra_tail)}"
@@ -12539,7 +12629,6 @@ def handle_mrp_add_command(message):
     premium_id = parsed_payload["premium_id"]
     premium_id_raw = str(parsed_payload.get("premium_id_raw") or "").strip()
     action_text = parsed_payload["action_text"]
-    target_mode = _normalize_mrp_target_mode(parsed_payload.get("target_mode"))
 
     if premium_id_raw:
         live = _check_custom_emoji_id_live(premium_id_raw)
@@ -12573,8 +12662,8 @@ def handle_mrp_add_command(message):
 
     db_exec(
         "INSERT INTO personal_rp_actions(user_id, trigger, trigger_key, emoji, premium_id, action_text, target_mode, uses_count, created_at) "
-        "VALUES (?,?,?,?,?,?,?,0,?)",
-        (uid, trigger, trigger_key, emoji, premium_id, action_text, target_mode, int(now_ts())),
+        "VALUES (?,?,?,?,?,?, '', 0, ?)",
+        (uid, trigger, trigger_key, emoji, premium_id, action_text, int(now_ts())),
         commit=True
     )
 
@@ -12688,19 +12777,16 @@ def try_handle_rp_action_message(message) -> bool:
     if rp_commands_enabled(int(actor_id)) != 1:
         return True
     
-    target_mode = _normalize_mrp_target_mode(action.get("target_mode"))
+    marker_mode = _mrp_marker_mode(str(action.get("action_text") or ""))
 
     target_id = None
     target_user_obj = None
     target_tag = ""
     extra_tail = ""
 
-    if target_mode == "self":
-        target_id = int(actor_id)
-        target_user_obj = actor
-        target_tag = ""
-        extra_tail = (tail or "").strip()
-    else:
+    target_required = (marker_mode in ("target", "both")) or (marker_mode == "")
+
+    if target_required:
         target_id, target_user_obj = resolve_rp_target(message, actor_id, tail)
         if target_id is None:
             return False
@@ -12722,6 +12808,25 @@ def try_handle_rp_action_message(message) -> bool:
         else:
             tail_parts = (tail or "").strip().split(None, 1)
             extra_tail = tail_parts[1].strip() if len(tail_parts) > 1 else ""
+    else:
+        target_id, target_user_obj = resolve_rp_target(message, actor_id, tail)
+        if target_id is not None and int(target_id) != int(actor_id):
+            if rp_commands_enabled(int(target_id)) != 1:
+                bot.reply_to(message, "🔒 Этот пользователь запретил РП-команды.")
+                return True
+
+            if target_user_obj is not None:
+                capture_user_context(message, target_user_obj)
+
+            if getattr(message, "reply_to_message", None):
+                extra_tail = (tail or "").strip()
+            else:
+                tail_parts = (tail or "").strip().split(None, 1)
+                extra_tail = tail_parts[1].strip() if len(tail_parts) > 1 else ""
+        else:
+            target_id = 0
+            target_user_obj = None
+            extra_tail = (tail or "").strip()
 
     actor_tag = _rp_actor_tag(actor)
 
@@ -12731,11 +12836,12 @@ def try_handle_rp_action_message(message) -> bool:
         actor_tag,
         target_tag,
         extra_tail=extra_tail,
-        comment_text=comment_text
+        comment_text=comment_text,
+        target_id=int(target_id or 0)
     )
 
     target_is_bot = False
-    if target_mode != "self":
+    if int(target_id or 0) > 0:
         target_is_bot = bool(target_user_obj and bool(getattr(target_user_obj, "is_bot", False)))
         if not target_is_bot:
             try:
@@ -12770,7 +12876,7 @@ def try_handle_rp_action_message(message) -> bool:
 
         return False
 
-    _rp_insert_event(action["trigger_key"], int(actor_id), int(target_id))
+    _rp_insert_event(action["trigger_key"], int(actor_id), int(target_id or 0))
     return True
 
 def handle_agents_panel_command(message):
@@ -23273,19 +23379,21 @@ def _duel_collect_inline_stats() -> list[dict]:
     return out
 
 def _duel_stats_row_text(row: dict, place: int, *, highlighted: bool = False) -> str:
-    tag = public_user_tag(int(row["user_id"]))
     pct_text = _fmt_pct_text(float(row["pct"]))
     extra = _duel_streak_label(int(row["streak"]))
     extra = f" {extra}" if extra else ""
 
-    name_html = f"<u><b>{tag}</b></u>" if highlighted else f"<b>{tag}</b>"
+    if highlighted:
+        name_html = underlined_public_user_tag(int(row["user_id"]))
+    else:
+        name_html = f"<b>{public_user_tag(int(row['user_id']))}</b>"
 
     return (
         f"{place}. {name_html}: "
         f"<b>{int(row['wins'])}</b> | "
         f"<b>{int(row['draws'])}</b> | "
         f"<b>{int(row['losses'])}</b> | "
-        f"({_fmt_pct_text(float(row['pct']))}) | "
+        f"({pct_text}) | "
         f"💊 {_fmt_k(int(row['max_win_materials']))} / {_fmt_k(int(row['max_lose_materials']))}{extra}"
     )
 
