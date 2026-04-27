@@ -11268,7 +11268,8 @@ SIGNED_COMMANDS_ALLOWED = {
     "autoanswer_on", "autoanswer_off",
     "corp_open", "corp_close", "corp_rename",
     "corp_deputy", "corp_deputy_remove",
-    "labname_clear", "pathogenname_clear",
+    "labname_set", "labname_clear",
+    "pathogenname_set", "pathogenname_clear",
     "chatname_set", "chatname_clear",
     "name_lock_user", "name_lock_lab", "name_lock_pat", "name_lock_corp",
     "upgrade_preview", "upgrade_buy",
@@ -12128,38 +12129,58 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
             rest = spl[2].strip()
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="pathogenname_clear", args=rest)
 
+    # "+имя лабы" / "+имя лаборатории"
+    if sign == "+" and (
+        low.startswith("имя лабы") or low.startswith("имя лаборатории")
+    ):
+        rest = ""
+        spl = t.split(" ", 2)
+        if len(spl) == 3:
+            rest = spl[2].strip()
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="labname_set", args=rest)
+
+    # "+имя пата" / "+имя патогена" / "+имя болезни"
+    if sign == "+" and (
+        low.startswith("имя пата") or low.startswith("имя патогена") or low.startswith("имя болезни")
+    ):
+        rest = ""
+        spl = t.split(" ", 2)
+        if len(spl) == 3:
+            rest = spl[2].strip()
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="pathogenname_set", args=rest)
+
     # "имя лабы" / "имя лаборатории"
     if low.startswith("имя лабы") or low.startswith("имя лаборатории"):
-        rest = ""
-        spl = t.split(" ", 2)
-        if len(spl) == 3:
-            rest = spl[2].strip()
-        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="labname", args=rest)
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="labname", args="")
 
-    # "имя пата" / "имя патогена"
+    # "имя пата" / "имя патогена" / "имя болезни"
     if low.startswith("имя пата") or low.startswith("имя патогена") or low.startswith("имя болезни"):
-        rest = ""
-        spl = t.split(" ", 2)
-        if len(spl) == 3:
-            rest = spl[2].strip()
-        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="pathogenname", args=rest)
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="pathogenname", args="")
 
-    # "+имя" / "-имя" / "имя" / "текущее имя"
-    if sign == "+" and (low == "имя" or low.startswith("имя ")):
+    # "+имя" / "-имя" / "имя" / "текущее имя" / "моё имя" 
+    is_lab_or_pat_name_cmd = (
+        low.startswith("имя лабы")
+        or low.startswith("имя лаборатории")
+        or low.startswith("имя пата")
+        or low.startswith("имя патогена")
+        or low.startswith("имя болезни")
+    )
+
+    if sign == "+" and not is_lab_or_pat_name_cmd and (low == "имя" or low.startswith("имя ")):
         rest = ""
         parts = t.split(" ", 1)
         if len(parts) > 1:
             rest = parts[1].strip()
         return Parsed(raw=raw_multiline, has_prefix_char=False, prefix_char=None, cmd="chatname_set", args=rest)
 
-    if sign == "-" and (low == "имя" or low.startswith("имя ")):
+    if sign == "-" and not is_lab_or_pat_name_cmd and (low == "имя" or low.startswith("имя ")):
         rest = ""
         parts = t.split(" ", 1)
         if len(parts) > 1:
             rest = parts[1].strip()
         return Parsed(raw=raw_multiline, has_prefix_char=False, prefix_char=None, cmd="chatname_clear", args=rest)
 
-    if low == "имя" or low.startswith("имя "):
+    if not is_lab_or_pat_name_cmd and (low == "имя" or low.startswith("имя ")):
         rest = ""
         parts = t.split(" ", 1)
         if len(parts) > 1:
@@ -26370,16 +26391,20 @@ def handle_lab_commands(message, parsed: Parsed):
             )
         return
 
-    if parsed.cmd == "labname":
-        if not parsed.args:
+    if parsed.cmd in ("labname", "labname_set"):
+        if parsed.cmd == "labname":
             lab = get_lab(uid)
             current = (lab["lab_name"] or "").strip()
             if not current:
                 current = default_lab_name(get_user_row(uid), uid)
-            bot.reply_to(message, f"🏢 Текущее имя лаборатории: <b>{h(current)}</b>\nЧтобы изменить его, введите:\n <code>Био имя имя лаборатории Название</code>")
+            bot.reply_to(message, f"📋 Текущее имя лаборатории: <b>{h(current)}</b>\nЧтобы изменить его, введите:\n <code>Био +имя лаборатории Название</code>")
             return
 
         new_name = re.sub(r"\s+", " ", parsed.args.strip())
+        if not new_name:
+            bot.reply_to(message, "📑 Укажите новое имя лаборатории.")
+            return
+
         lock_row = get_name_restriction_row(int(uid))
         if lock_row and int(lock_row["lab_locked"] or 0) == 1:
             bot.reply_to(message, "⛔ Возможность менять имя лаборатории ограничена. Обратитесь к агенту тех.поддержки.")
@@ -26395,14 +26420,18 @@ def handle_lab_commands(message, parsed: Parsed):
         bot.reply_to(message, f"✅ Имя лаборатории успешно изменено на {h(new_name)}!")
         return
 
-    if parsed.cmd == "pathogenname":
-        if not parsed.args:
+    if parsed.cmd in ("pathogenname", "pathogenname_set"):
+        if parsed.cmd == "pathogenname":
             lab = get_lab(uid)
             current = (lab["pathogen_name"] or "").strip() or "неизвестный патоген"
-            bot.reply_to(message, f"🦠 Текущее имя патогена: <b>{h(current)}</b>\nЧтобы изменить его, введите:\n <code>Био имя патогена Название</code>")
+            bot.reply_to(message, f"📋 Текущее имя патогена: <b>{h(current)}</b>\nЧтобы изменить его, введите:\n <code>Био +имя патогена Название</code>")
             return
 
         new_name = re.sub(r"\s+", " ", parsed.args.strip())
+        if not new_name:
+            bot.reply_to(message, "📑 Укажите новое имя патогена.")
+            return
+
         lock_row = get_name_restriction_row(int(uid))
         if lock_row and int(lock_row["pat_locked"] or 0) == 1:
             bot.reply_to(message, "⛔ Возможность менять имя патогена ограничена. Обратитесь к агенту тех.поддержки.")
@@ -28682,7 +28711,7 @@ def text_router(message):
         # лаборатория
         if parsed.cmd in (
             "lab", "mylab", "my_victims", "my_diseases",
-            "labname", "pathogenname",
+            "labname", "labname_set", "pathogenname", "pathogenname_set",
             "labname_clear", "pathogenname_clear",
             "chatname_set", "chatname_show", "my_chatname_show", "chatname_clear",
             "lab_delete", "lab_delete_now", "restore_lab", "lab_delete_confirm_phrase",
