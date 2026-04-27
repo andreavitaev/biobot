@@ -10650,12 +10650,6 @@ def set_balance_chain_state_from_message(
         source_message_id=int(getattr(message, "message_id", 0) or 0),
     )
 
-def get_balance_chain_button_text(user_id: int) -> str:
-    state = get_balance_chain_state(int(user_id))
-    if not state:
-        return ""
-    return str(state.get("button_text") or "").strip()
-
 # chat member
 def remember_chat_member(chat_id: int, tg_user):
     upsert_user(tg_user)
@@ -13514,10 +13508,6 @@ def _resolve_known_target_token(token: str) -> Optional[int]:
         return find_user_id_by_username("@" + m.group(1))
 
     return None
-
-def resolve_target_id(token: str) -> Optional[int]:
-    """/owner target: @username | tg://user?id=... | tg://openmessage?user_id=... | user_id | текст с упоминанием."""
-    return _resolve_single_target_from_text(token or "", _resolve_known_target_token)
 
 # LAB TEXT
 def default_lab_name(user_row: Optional[sqlite3.Row], user_id: int) -> str:
