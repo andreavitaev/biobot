@@ -11519,7 +11519,7 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
                "кинг", "конг", 
                "пиу", "пау", 
                "окак", 
-               "сыгой", "гой", 
+               "сыгой", "гой", "сосал?",
                "бот"):
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="ping", args=low)
 
