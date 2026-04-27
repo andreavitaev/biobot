@@ -12276,6 +12276,7 @@ PING_REPLY_MAP = {
     "окак": "ОТАК",
     "сыгой": "СЫГГОЙ",
     "гой": "ДА",
+    "сосал?": "ДАААА",
     "бот": "Я тут",
 }
 
@@ -21769,6 +21770,12 @@ def _parse_inline_duel_query(query: str, iq_chat_type: str):
         "comment_text": str(comment_text or "").strip(),
     }
 
+def _parse_inline_duel_stats_query(query: str):
+    raw = str(query or "").strip().lower()
+    if raw in ("дуэли", "дуэли стата", "дуэль стата", "дуэли стат", "дуэль стат"):
+        return {"kind": "DUEL_STATS"}
+    return None
+
 def _remember_duel_callback_user(cq):
     try:
         u = getattr(cq, "from_user", None)
@@ -22910,6 +22917,14 @@ def _duel_bet_count_text(cnt: int, highlighted: bool) -> str:
     s = str(int(cnt))
     return f"<u>{s}</u>" if highlighted else s
 
+def render_inline_duel_stats_text(viewer_id: int) -> str:
+    rows = _duel_collect_inline_stats()
+    return _render_duel_stats_from_rows(
+        rows,
+        "⚔️ Рейтинг дуэлянтов inline-режима",
+        int(viewer_id or 0)
+    )
+
 def render_duel_bets_text(chat_id: int, viewer_id: int, chat_title: str) -> str:
     rows = _duel_active_rows_in_chat(int(chat_id))
     title = (chat_title or "").strip() or f"Чат {int(chat_id)}"
@@ -23177,12 +23192,106 @@ def _duel_collect_chat_stats(chat_id: int) -> list[dict]:
     )
     return out
 
-def render_duel_stats_text(chat_id: int, chat_title: str) -> str:
-    title = (chat_title or "").strip() or f"Чат {int(chat_id)}"
-    rows = _duel_collect_chat_stats(int(chat_id))
+DUEL_STATS_TOP_LIMIT = 50
 
+def _duel_collect_inline_stats() -> list[dict]:
+    rows = db_all(
+        "SELECT duel_id, challenger_id, target_id, stake_amount, status, winner_id, loser_id, ended_at "
+        "FROM duels "
+        "WHERE COALESCE(msg_inline_id,'')<>'' AND status IN ('finished','draw') "
+        "ORDER BY COALESCE(ended_at,0) ASC, duel_id ASC"
+    ) or []
+
+    stats: dict[int, dict] = {}
+
+    def _ensure(uid: int) -> dict:
+        uid = int(uid)
+        if uid not in stats:
+            stats[uid] = {
+                "user_id": uid,
+                "wins": 0,
+                "draws": 0,
+                "losses": 0,
+                "max_win_materials": 0,
+                "max_lose_materials": 0,
+                "history": [],
+            }
+        return stats[uid]
+
+    for r in rows:
+        challenger_id = int(r["challenger_id"] or 0)
+        target_id = int(r["target_id"] or 0)
+        stake_amount = int(r["stake_amount"] or 0)
+        status = (r["status"] or "").strip()
+
+        if challenger_id > 0:
+            _ensure(challenger_id)
+        if target_id > 0:
+            _ensure(target_id)
+
+        if status == "finished":
+            winner_id = int(r["winner_id"] or 0)
+            loser_id = int(r["loser_id"] or 0)
+
+            if winner_id > 0:
+                w = _ensure(winner_id)
+                w["wins"] = int(w["wins"]) + 1
+                w["max_win_materials"] = max(int(w["max_win_materials"]), int(stake_amount))
+                w["history"].append("W")
+
+            if loser_id > 0:
+                l = _ensure(loser_id)
+                l["losses"] = int(l["losses"]) + 1
+                l["max_lose_materials"] = max(int(l["max_lose_materials"]), int(stake_amount))
+                l["history"].append("L")
+
+        elif status == "draw":
+            for uid in (challenger_id, target_id):
+                if int(uid) <= 0:
+                    continue
+                d = _ensure(uid)
+                d["draws"] = int(d["draws"]) + 1
+                d["history"].append("D")
+
+    out = list(stats.values())
+    for row in out:
+        row["pct"] = float(_duel_rating_pct_value(
+            int(row["wins"]),
+            int(row["draws"]),
+            int(row["losses"])
+        ))
+        row["streak"] = int(_duel_current_win_streak_from_history(row["history"]))
+
+    out.sort(
+        key=lambda x: (
+            -int(x["wins"]),
+            -float(x["pct"]),
+            int(x["losses"]),
+            int(x["user_id"]),
+        )
+    )
+    return out
+
+def _duel_stats_row_text(row: dict, place: int, *, highlighted: bool = False) -> str:
+    tag = public_user_tag(int(row["user_id"]))
+    pct_text = _fmt_pct_text(float(row["pct"]))
+    extra = _duel_streak_label(int(row["streak"]))
+    extra = f" {extra}" if extra else ""
+
+    name_html = f"<u><b>{tag}</b></u>" if highlighted else f"<b>{tag}</b>"
+
+    return (
+        f"{place}. {name_html}: "
+        f"<b>{int(row['wins'])}</b> | "
+        f"<b>{int(row['draws'])}</b> | "
+        f"<b>{int(row['losses'])}</b> | "
+        f"({_fmt_pct_text(float(row['pct']))}) | "
+        f"💊 {_fmt_k(int(row['max_win_materials']))} / {_fmt_k(int(row['max_lose_materials']))}{extra}"
+    )
+
+def _render_duel_stats_from_rows(rows: list[dict], title: str, viewer_id: int = 0) -> str:
     lines = [
-        f"⚔️ Рейтинг дуэлянтов беседы <b>{h(title)}</b>",
+        title,
         "№|имя|в|н|п|выигр/проигр",
     ]
 
@@ -23190,23 +23299,52 @@ def render_duel_stats_text(chat_id: int, chat_title: str) -> str:
         lines.append("Нет данных.")
         return "\n".join(lines)
 
-    with chat_name_context(int(chat_id)):
-        for i, row in enumerate(rows, 1):
-            tag = public_user_tag(int(row["user_id"]))
-            pct_text = _fmt_pct_text(float(row["pct"]))
-            extra = _duel_streak_label(int(row["streak"]))
-            extra = f" {extra}" if extra else ""
+    top_rows = rows[:DUEL_STATS_TOP_LIMIT]
+    lines.append("")
+    lines.append("<blockquote expandable>")
 
-            lines.append(
-                f"{i}. <b>{tag}</b>: "
-                f"<b>{int(row['wins'])}</b> | "
-                f"<b>{int(row['draws'])}</b> | "
-                f"<b>{int(row['losses'])}</b> | "
-                f"({pct_text}) | "
-                f"💊 {_fmt_k(int(row['max_win_materials']))} / {_fmt_k(int(row['max_lose_materials']))} {extra}"
+    viewer_place = 0
+    viewer_row = None
+
+    for i, row in enumerate(rows, 1):
+        if int(row["user_id"]) == int(viewer_id):
+            viewer_place = int(i)
+            viewer_row = row
+            break
+
+    for i, row in enumerate(top_rows, 1):
+        lines.append(
+            _duel_stats_row_text(
+                row,
+                i,
+                highlighted=(int(row["user_id"]) == int(viewer_id))
             )
+        )
+
+    lines.append("</blockquote>")
+
+    if viewer_row is not None and int(viewer_place) > int(DUEL_STATS_TOP_LIMIT):
+        lines.append("")
+        lines.append(
+            _duel_stats_row_text(
+                viewer_row,
+                int(viewer_place),
+                highlighted=True
+            )
+        )
 
     return "\n".join(lines)
+
+def render_duel_stats_text(chat_id: int, chat_title: str, viewer_id: int = 0) -> str:
+    title = (chat_title or "").strip() or f"Чат {int(chat_id)}"
+    rows = _duel_collect_chat_stats(int(chat_id))
+
+    with chat_name_context(int(chat_id)):
+        return _render_duel_stats_from_rows(
+            rows,
+            f"⚔️ Рейтинг дуэлянтов беседы <b>{h(title)}</b>",
+            int(viewer_id or 0)
+        )
 
 def _duel_settle_bets_victory(duel_row, winner_id: int):
     duel_id = int(duel_row["duel_id"])
@@ -23347,7 +23485,7 @@ def _duel_create_invite(chat_id: int, challenger_id: int, target_id: int, stake_
 
             c.execute(
                 "INSERT INTO duel_invites(chat_id, challenger_id, target_id, stake_amount, created_at, expires_at, status, comment_text, msg_chat_id, msg_id, msg_inline_id) "
-                "VALUES (?,?,?,?,?,?, 'pending', ?, 0, 0)",
+                "VALUES (?,?,?,?,?,?, 'pending', ?, 0, 0, '')",
                 (int(chat_id), int(challenger_id), int(target_id), int(stake_amount), int(now), int(expires_at), str(comment_text or "").strip())
             )
             invite_id = int(c.lastrowid)
@@ -23370,8 +23508,8 @@ def _duel_create_inline_invite(challenger_id: int, stake_amount: int = 0, commen
         try:
             c.execute("BEGIN")
             c.execute(
-                "INSERT INTO duel_invites(chat_id, challenger_id, target_id, stake_amount, created_at, expires_at, status, comment_text, msg_chat_id, msg_id) "
-                "VALUES (0, ?, 0, ?, ?, 0, 'pending', ?, 0, 0)",
+                "INSERT INTO duel_invites(chat_id, challenger_id, target_id, stake_amount, created_at, expires_at, status, comment_text, msg_chat_id, msg_id, msg_inline_id) "
+                "VALUES (0, ?, 0, ?, ?, 0, 'pending', ?, 0, 0, '')",
                 (int(challenger_id), int(stake_amount), int(now), str(comment_text or "").strip())
             )
             invite_id = int(c.lastrowid)
@@ -23608,7 +23746,8 @@ def handle_duel_commands(message, parsed: Parsed):
     if parsed.cmd == "duel_stats":
         text = render_duel_stats_text(
             int(chat_id),
-            (getattr(message.chat, "title", None) or "").strip()
+            (getattr(message.chat, "title", None) or "").strip(),
+            int(uid)
         )
         bot.reply_to(message, text, parse_mode="HTML", disable_web_page_preview=True)
         return
@@ -27678,6 +27817,19 @@ def inline_query_handler(inline_query):
                         reply_markup=None,
                         thumb_url=INLINE_THUMB_DUEL_URL
                     ))
+
+        # inline-статистика дуэлей
+        if not inline_target_token:
+            duel_stats_req = _parse_inline_duel_stats_query(q_raw)
+            if duel_stats_req and duel_stats_req["kind"] == "DUEL_STATS":
+                results.append(_inline_article(
+                    article_id=f"duel_stats_inline_{uid}",
+                    title="Дуэли",
+                    desc="Отправить в чат рейтинг дуэлянтов inline-режима",
+                    text=render_inline_duel_stats_text(int(uid)),
+                    reply_markup=None,
+                    thumb_url=INLINE_THUMB_DUEL_URL
+                ))
 
         # калькулятор
         if not inline_target_token:
