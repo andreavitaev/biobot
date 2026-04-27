@@ -663,6 +663,10 @@ def render_personal_rp_list_text(user_id: int) -> str:
     lines.append("💬 Чтобы создать личную рп команду, введите\n\"<code>+Мрп</code>\" <b>[название] / [эмодзи] [айди премиум эмодзи (не обязятельно)] / [текст рп действия]</b>")
     lines.append("Чтобы удалить личную рп команду — \"<code>-Мрп</code>\" <b>[название / номер]</b>")
     lines.append("Чтобы удалить все личные рп команды — \"<code>!удалить все мрп</code>\"")
+    lines.append("")
+    lines.append("<blockquote expandable>Подробнее про теги:\n🅰️ — используется только метка {я}\n🅱️ — используется только метка {цель}\n🆎 — используются обе метки: {я} и {цель}\n")
+    lines.append("Подробнее про метки:\n<code>{я}</code> — метка автора (вас).\n<code>{цель}</code> — метка цели (другого пользователя).\n")
+    lines.append("Если используется только метка <code>{я}</code> - цель мрп можно не указывать, мрп команда сможет работать без цели.\nЕсли используется только <code>{цель}</code> или обе метки <code>{цель}</code> и <code>{я}</code> – цель обязательна, иначе мрп команда не сработает.\nЕсли метки <code>{цель}</code> и <code>{я}</code> не указывать или не указывались ранее – работает стандартная логика.</blockquote>")
 
     return "\n".join(lines)
 
@@ -2105,9 +2109,10 @@ class chat_name_context:
 def _normalize_chat_user_name(name: str) -> str:
     return str(name or "").replace("\r", " ").replace("\n", " ").strip()
 
-def get_chat_user_name(chat_id: int, user_id: int) -> str:
-    if int(chat_id or 0) == 0 or int(user_id or 0) == 0:
+def get_exact_chat_user_name(chat_id: int, user_id: int) -> str:
+    if int(user_id or 0) == 0:
         return ""
+
     row = db_one(
         "SELECT display_name FROM chat_user_names WHERE chat_id=? AND user_id=? LIMIT 1",
         (int(chat_id), int(user_id))
@@ -2115,6 +2120,27 @@ def get_chat_user_name(chat_id: int, user_id: int) -> str:
     if not row:
         return ""
     return (row["display_name"] or "").strip()
+
+def get_global_user_name(user_id: int) -> str:
+    return get_exact_chat_user_name(0, int(user_id))
+
+def get_chat_user_name(chat_id: int, user_id: int) -> str:
+    """
+    Возвращает эффективное кастомное имя:
+    1) имя текущего чата
+    2) если его нет — глобальное имя (chat_id=0)
+    """
+    if int(user_id or 0) == 0:
+        return ""
+
+    exact = get_exact_chat_user_name(int(chat_id), int(user_id))
+    if exact:
+        return exact
+
+    if int(chat_id or 0) != 0:
+        return get_global_user_name(int(user_id))
+
+    return ""
 
 def set_chat_user_name(chat_id: int, user_id: int, name: str):
     nm = _normalize_chat_user_name(name)
@@ -2168,10 +2194,9 @@ def display_name(first_name: str, last_name: str, username: str, user_id: int) -
         return base
 
     chat_id = _chat_name_ctx_chat_id()
-    if chat_id != 0:
-        alias = get_chat_user_name(chat_id, int(user_id))
-        if alias:
-            return alias
+    alias = get_chat_user_name(chat_id, int(user_id))
+    if alias:
+        return alias
 
     return base
 
@@ -6846,6 +6871,7 @@ def underlined_public_user_tag(user_id: int) -> str:
 
     if row:
         un = _normalize_username_for_link((row["username"] or ""))
+
         if alias:
             return tg_mention(uid, _visually_underlined_text(alias), username=un)
 
@@ -12146,6 +12172,9 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
         if len(parts) == 3:
             rest = parts[2].strip()
         return Parsed(raw=raw_multiline, has_prefix_char=False, prefix_char=None, cmd="chatname_show", args=rest)
+
+    if low == "моё имя" or low == "мое имя":
+        return Parsed(raw=raw_multiline, has_prefix_char=False, prefix_char=None, cmd="my_chatname_show", args="")
 
     # пол
     if low == "мой пол" or low.startswith("мой пол "):
@@ -19424,6 +19453,12 @@ def handle_user_pref_command(message, parsed: Parsed):
     if parsed.cmd == "gender_set":
         val = (parsed.args or "").strip().lower()
 
+        if not val:
+            cur = get_user_gender(int(uid))
+            human = "мужской" if cur == "male" else "женский"
+            bot.reply_to(message, f"📋 Ваш текущий пол: <b>{human}</b>", parse_mode="HTML", disable_web_page_preview=True)
+            return
+
         if val in ("м", "муж", "мужской"):
             set_user_gender(int(uid), "male")
             bot.reply_to(message, "✅ Ваш пол изменён на мужской.")
@@ -19437,6 +19472,7 @@ def handle_user_pref_command(message, parsed: Parsed):
         bot.reply_to(
             message,
             "📑 Используйте:\n"
+            "<code>Мой пол</code> — показать текущий пол\n\n"
             "<code>Мой пол м</code> / <code>Мой пол муж</code> / <code>Мой пол мужской</code>\n"
             "или\n"
             "<code>Мой пол ж</code> / <code>Мой пол жен</code> / <code>Мой пол женский</code>",
@@ -21721,7 +21757,7 @@ def _duel_comment_line(comment_text: str) -> str:
     txt = str(comment_text or "").strip()
     if not txt:
         return ""
-    return f"💬 Комантарий: {h(txt)}"
+    return f"🗨️ Комантарий: {h(txt)}"
 
 def _duel_extract_comment_text_from_message(message) -> str:
     raw = str(getattr(message, "text", "") or "").strip()
@@ -26059,7 +26095,7 @@ def handle_lab_commands(message, parsed: Parsed):
     if parsed.cmd not in (
         "lab_delete", "lab_delete_now", "restore_lab", "lab_delete_confirm_phrase",
         "labname_clear", "pathogenname_clear",
-        "chatname_set", "chatname_show", "chatname_clear"
+        "chatname_set", "chatname_show", "my_chatname_show", "chatname_clear"
     ):
         ensure_lab_exists(uid)
 
@@ -26164,8 +26200,11 @@ def handle_lab_commands(message, parsed: Parsed):
         )
         return
 
-    if parsed.cmd in ("chatname_set", "chatname_show", "chatname_clear"):
+    if parsed.cmd in ("chatname_set", "chatname_show", "my_chatname_show", "chatname_clear"):
         chat_id = int(message.chat.id)
+        is_private_scope = ((getattr(getattr(message, "chat", None), "type", "") or "").lower() == "private")
+        name_scope_chat_id = 0 if is_private_scope else int(chat_id)
+
         me_row = get_user_row(int(uid))
         me_un = (
             (me_row["username"] or "").strip()
@@ -26177,7 +26216,7 @@ def handle_lab_commands(message, parsed: Parsed):
             new_name = _normalize_chat_user_name(parsed.args or "")
             lock_row = get_name_restriction_row(int(uid))
             if lock_row and int(lock_row["user_locked"] or 0) == 1:
-                bot.reply_to(message, "📑 Возможность менять имя пользователя в чатах ограничена. Обратитесь к агенту тех.поддержки.")
+                bot.reply_to(message, "⛔ Возможность менять имя пользователя ограничена. Обратитесь к агенту тех.поддержки.")
                 return
             if not new_name:
                 return
@@ -26188,44 +26227,69 @@ def handle_lab_commands(message, parsed: Parsed):
                 bot.reply_to(message, "📑 Найдены недопустимые символы. Повторите попытку.")
                 return
 
-            set_chat_user_name(chat_id, int(uid), new_name)
-            bot.reply_to(
-                message,
-                f"✅ Ник {standard_user_tag(int(uid))} изменён на «{tg_mention(int(uid), new_name, username=me_un)}»",
-                parse_mode="HTML",
-                disable_web_page_preview=True
-            )
+            set_chat_user_name(int(name_scope_chat_id), int(uid), new_name)
+
+            if is_private_scope:
+                bot.reply_to(
+                    message,
+                    f"✅ Глобальный ник {standard_user_tag(int(uid))} изменён на «{tg_mention(int(uid), new_name, username=me_un)}»",
+                    parse_mode="HTML",
+                    disable_web_page_preview=True
+                )
+            else:
+                bot.reply_to(
+                    message,
+                    f"✅ Ник {standard_user_tag(int(uid))} изменён на «{tg_mention(int(uid), new_name, username=me_un)}»",
+                    parse_mode="HTML",
+                    disable_web_page_preview=True
+                )
             return
 
         if parsed.cmd == "chatname_clear":
-            clear_chat_user_name(chat_id, int(uid))
-            bot.reply_to(
-                message,
-                f"❎ Ник {standard_user_tag(int(uid))} удалён.",
-                parse_mode="HTML",
-                disable_web_page_preview=True
-            )
+            clear_chat_user_name(int(name_scope_chat_id), int(uid))
+            if is_private_scope:
+                bot.reply_to(
+                    message,
+                    f"❎ Глобальный ник {standard_user_tag(int(uid))} удалеён.",
+                    parse_mode="HTML",
+                    disable_web_page_preview=True
+                )
+            else:
+                bot.reply_to(
+                    message,
+                    f"❎ Ник {standard_user_tag(int(uid))} удалён.",
+                    parse_mode="HTML",
+                    disable_web_page_preview=True
+                )
             return
 
-        target_id, target_user_obj = resolve_target_from_reply_or_args(message, parsed)
+        if parsed.cmd == "my_chatname_show":
+            target_id = int(uid)
+            target_user_obj = message.from_user
+        else:
+            target_id, target_user_obj = resolve_target_from_reply_or_args(message, parsed)
 
-        if target_id is None:
-            if not (parsed.args or "").strip() and not getattr(message, "reply_to_message", None):
-                target_id = int(uid)
-                target_user_obj = message.from_user
-            else:
-                bot.reply_to(message, "📑 Укажите пользователя.")
-                return
+            if target_id is None:
+                if not (parsed.args or "").strip() and not getattr(message, "reply_to_message", None):
+                    target_id = int(uid)
+                    target_user_obj = message.from_user
+                else:
+                    bot.reply_to(message, "📑 Укажите пользователя.")
+                    return
 
         if target_user_obj is not None:
             capture_user_context(message, target_user_obj)
 
         row = get_user_row(int(target_id))
         un = (row["username"] or "").strip() if row else ""
-        current_chat_name = get_chat_user_name(chat_id, int(target_id))
 
-        if current_chat_name:
-            shown_name = current_chat_name
+        if is_private_scope:
+            current_name = get_global_user_name(int(target_id))
+        else:
+            current_name = get_chat_user_name(int(chat_id), int(target_id))
+
+        if current_name:
+            shown_name = current_name
         elif row:
             shown_name = standard_display_name(
                 row["first_name"] or "",
@@ -26238,9 +26302,11 @@ def handle_lab_commands(message, parsed: Parsed):
             shown_name = disp
 
         shown_tag = tg_mention(int(target_id), shown_name, username=un)
+        title = "Глобальный ник" if is_private_scope else "Ник"
+
         bot.reply_to(
             message,
-            f"📋 Ник {standard_user_tag(int(target_id))}: «{shown_tag}»",
+            f"📋 {title} {standard_user_tag(int(target_id))}: «{shown_tag}»",
             parse_mode="HTML",
             disable_web_page_preview=True
         )
@@ -26316,7 +26382,7 @@ def handle_lab_commands(message, parsed: Parsed):
         new_name = re.sub(r"\s+", " ", parsed.args.strip())
         lock_row = get_name_restriction_row(int(uid))
         if lock_row and int(lock_row["lab_locked"] or 0) == 1:
-            bot.reply_to(message, "📑 Возможность менять имя лаборатории ограничена. Обратитесь к агенту тех.поддержки.")
+            bot.reply_to(message, "⛔ Возможность менять имя лаборатории ограничена. Обратитесь к агенту тех.поддержки.")
             return
         if len(new_name) > 40:
             bot.reply_to(message, "📑 Название вашей лаборатории превышает максимальные 40 символов.")
@@ -26339,7 +26405,7 @@ def handle_lab_commands(message, parsed: Parsed):
         new_name = re.sub(r"\s+", " ", parsed.args.strip())
         lock_row = get_name_restriction_row(int(uid))
         if lock_row and int(lock_row["pat_locked"] or 0) == 1:
-            bot.reply_to(message, "📑 Возможность менять имя патогена ограничена. Обратитесь к агенту тех.поддержки.")
+            bot.reply_to(message, "⛔ Возможность менять имя патогена ограничена. Обратитесь к агенту тех.поддержки.")
             return
         if len(new_name) > 40:
             bot.reply_to(message, "📑 Название вашего патогена превышает максимальные 40 символов.")
@@ -26525,7 +26591,7 @@ def handle_corp_commands(message, parsed: Parsed):
 
         lock_row = get_name_restriction_row(int(uid))
         if lock_row and int(lock_row["corp_locked"] or 0) == 1:
-            bot.reply_to(message, "📑 Возможность менять название Корпорации ограничена. Обратитесь к агенту тех.поддержки.")
+            bot.reply_to(message, "⛔ Возможность менять название Корпорации ограничена. Обратитесь к агенту тех.поддержки.")
             return
 
         new_name = re.sub(r"\s+", " ", (parsed.args or "").strip())
@@ -26582,7 +26648,7 @@ def handle_corp_commands(message, parsed: Parsed):
         raw_name = (parsed.args or "").strip()
         lock_row = get_name_restriction_row(int(uid))
         if lock_row and int(lock_row["corp_locked"] or 0) == 1 and raw_name:
-            bot.reply_to(message, "📑 Возможность менять название Корпорации ограничена. Обратитесь к агенту тех.поддержки.")
+            bot.reply_to(message, "⛔ Возможность менять название Корпорации ограничена. Обратитесь к агенту тех.поддержки.")
             return
 
         name = raw_name
@@ -27707,6 +27773,8 @@ def _safe_answer_callback_query(callback_query_id: str, *args, **kwargs) -> bool
 @bot.inline_handler(func=lambda q: True)
 def inline_query_handler(inline_query):
     try:
+        set_chat_name_context(0, force_standard=False)
+
         uid = int(inline_query.from_user.id)
 
         if is_bot_banned(uid):
@@ -27969,6 +28037,8 @@ def inline_query_handler(inline_query):
             _safe_answer_inline_query(inline_query.id, [], cache_time=2, is_personal=True)
         except Exception:
             pass
+    finally:
+        clear_chat_name_context()
 
 @bot.message_handler(
     content_types=["photo", "video"],
@@ -28614,7 +28684,7 @@ def text_router(message):
             "lab", "mylab", "my_victims", "my_diseases",
             "labname", "pathogenname",
             "labname_clear", "pathogenname_clear",
-            "chatname_set", "chatname_show", "chatname_clear",
+            "chatname_set", "chatname_show", "my_chatname_show", "chatname_clear",
             "lab_delete", "lab_delete_now", "restore_lab", "lab_delete_confirm_phrase",
             "pathogens_info", "pathogen_info"
         ):
