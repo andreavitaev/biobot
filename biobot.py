@@ -13277,45 +13277,63 @@ def handle_admin_name_restriction_command(message, parsed: Parsed):
     if target_id is None:
         return
 
+    target_id = int(target_id)
+
     if parsed.cmd == "name_lock_user":
         locked = 1 if fl.startswith("-") or fl.lower().startswith("-user_name") else 0
-        set_name_restriction(int(target_id), "user", locked, int(uid), reason)
+        set_name_restriction(target_id, "user", locked, int(uid), reason)
+
         if locked == 1:
-            clear_all_chat_user_names_for_user(int(target_id))
+            clear_all_chat_user_names_for_user(target_id)
+
+        extra = " Текущее кастомное имя сброшено до стандартного." if locked == 1 else ""
         bot.reply_to(
             message,
-            f"✅ Пользователю <code>{int(target_id)}</code> {'запрещено' if locked == 1 else 'разрешено'} менять имя пользователя в чатах.",
+            f"✅ Пользователю <code>{target_id}</code> {'запрещено' if locked == 1 else 'разрешено'} менять имя пользователя в чатах.{extra}",
             parse_mode="HTML"
         )
         return
 
     if parsed.cmd == "name_lock_lab":
         locked = 1 if fl.startswith("-") or fl.lower().startswith("-lab_name") else 0
-        set_name_restriction(int(target_id), "lab", locked, int(uid), reason)
+        set_name_restriction(target_id, "lab", locked, int(uid), reason)
+
+        if locked == 1:
+            set_lab_name(target_id, None)
+
+        extra = " Текущее название лаборатории сброшено до стандартного." if locked == 1 else ""
         bot.reply_to(
             message,
-            f"✅ Пользователю <code>{int(target_id)}</code> {'запрещено' if locked == 1 else 'разрешено'} менять имя лаборатории.",
+            f"✅ Пользователю <code>{target_id}</code> {'запрещено' if locked == 1 else 'разрешено'} менять имя лаборатории.{extra}",
             parse_mode="HTML"
         )
         return
 
     if parsed.cmd == "name_lock_pat":
         locked = 1 if fl.startswith("-") or fl.lower().startswith("-pat_name") else 0
-        set_name_restriction(int(target_id), "pat", locked, int(uid), reason)
+        set_name_restriction(target_id, "pat", locked, int(uid), reason)
+
+        if locked == 1:
+            set_pathogen_name(target_id, None)
+
+        extra = " Текущее имя патогена сброшено до стандартного." if locked == 1 else ""
         bot.reply_to(
             message,
-            f"✅ Пользователю <code>{int(target_id)}</code> {'запрещено' if locked == 1 else 'разрешено'} менять имя патогена.",
+            f"✅ Пользователю <code>{target_id}</code> {'запрещено' if locked == 1 else 'разрешено'} менять имя патогена.{extra}",
             parse_mode="HTML"
         )
         return
 
     locked = 1 if fl.startswith("-") or fl.lower().startswith("-corp_name") else 0
-    set_name_restriction(int(target_id), "corp", locked, int(uid), reason)
+    set_name_restriction(target_id, "corp", locked, int(uid), reason)
+
     if locked == 1:
-        _reset_owned_corp_name_to_default(int(target_id))
+        _reset_owned_corp_name_to_default(target_id)
+
+    extra = " Текущее название корпорации сброшено до стандартного, если пользователь является её владельцем." if locked == 1 else ""
     bot.reply_to(
         message,
-        f"✅ Пользователю <code>{int(target_id)}</code> {'запрещено' if locked == 1 else 'разрешено'} менять название корпорации.",
+        f"✅ Пользователю <code>{target_id}</code> {'запрещено' if locked == 1 else 'разрешено'} менять название корпорации.{extra}",
         parse_mode="HTML"
     )
 
