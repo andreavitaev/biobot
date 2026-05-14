@@ -23,7 +23,12 @@ from typing import Optional, Tuple, List, Dict
 
 import telebot
 from telebot.handler_backends import ContinueHandling
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, InlineQueryResultArticle, InputTextMessageContent
+from telebot.types import (
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    InlineQueryResultArticle, InputTextMessageContent,
+    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove,
+    InputMediaPhoto, InputMediaVideo
+)
 
 # CONFIGS
 def load_bot_token() -> str:
@@ -1452,7 +1457,13 @@ def _report_notify_user_ids() -> List[int]:
 
     return ids
 
-def _send_message_to_report_recipients(text: str, *, parse_mode: str = "HTML", disable_web_page_preview: bool = True) -> bool:
+def _send_message_to_report_recipients(
+    text: str,
+    *,
+    parse_mode: str = "HTML",
+    disable_web_page_preview: bool = True,
+    reply_markup=None
+) -> bool:
     ok = False
     for uid in _report_notify_user_ids():
         try:
@@ -1460,14 +1471,22 @@ def _send_message_to_report_recipients(text: str, *, parse_mode: str = "HTML", d
                 int(uid),
                 text,
                 parse_mode=parse_mode,
-                disable_web_page_preview=disable_web_page_preview
+                disable_web_page_preview=disable_web_page_preview,
+                reply_markup=reply_markup
             )
             ok = True
         except Exception:
             pass
     return ok
 
-def _send_media_to_report_recipients(media_type: str, media_file_id: str, *, caption: str = "", parse_mode: Optional[str] = "HTML") -> bool:
+def _send_media_to_report_recipients(
+    media_type: str,
+    media_file_id: str,
+    *,
+    caption: str = "",
+    parse_mode: Optional[str] = "HTML",
+    reply_markup=None
+) -> bool:
     ok = False
     mtype = str(media_type or "").strip().lower()
     fid = str(media_file_id or "").strip()
@@ -1478,14 +1497,26 @@ def _send_media_to_report_recipients(media_type: str, media_file_id: str, *, cap
         try:
             if mtype == "photo":
                 if caption:
-                    bot.send_photo(int(uid), fid, caption=caption, parse_mode=parse_mode)
+                    bot.send_photo(
+                        int(uid),
+                        fid,
+                        caption=caption,
+                        parse_mode=parse_mode,
+                        reply_markup=reply_markup
+                    )
                 else:
-                    bot.send_photo(int(uid), fid)
+                    bot.send_photo(int(uid), fid, reply_markup=reply_markup)
             else:
                 if caption:
-                    bot.send_video(int(uid), fid, caption=caption, parse_mode=parse_mode)
+                    bot.send_video(
+                        int(uid),
+                        fid,
+                        caption=caption,
+                        parse_mode=parse_mode,
+                        reply_markup=reply_markup
+                    )
                 else:
-                    bot.send_video(int(uid), fid)
+                    bot.send_video(int(uid), fid, reply_markup=reply_markup)
             ok = True
         except Exception:
             pass
@@ -3128,6 +3159,11 @@ def _housekeeping_daemon():
                     send_error_report("_corp_invite_expire", e)
 
             try:
+                _promo_delete_expired_temp_codes()
+            except Exception as e:
+                send_error_report("_promo_delete_expired_temp_codes", e)
+
+            try:
                 _duel_housekeeping_once(int(now))
             except Exception as e:
                 send_error_report("_duel_housekeeping_once", e)
@@ -3436,6 +3472,23 @@ def init_db():
         category    TEXT NOT NULL DEFAULT '',
         stage       TEXT NOT NULL DEFAULT '',
         created_ts  INTEGER NOT NULL DEFAULT 0
+    );
+    """, commit=True)
+
+    db_exec("""
+    CREATE TABLE IF NOT EXISTS report_drafts (
+        user_id      INTEGER PRIMARY KEY,
+        text         TEXT NOT NULL DEFAULT '',
+        media_json   TEXT NOT NULL DEFAULT '[]',
+        updated_at   INTEGER NOT NULL DEFAULT 0
+    );
+    """, commit=True)
+
+    db_exec("""
+    CREATE TABLE IF NOT EXISTS post_channel_prefs (
+        user_id      INTEGER PRIMARY KEY,
+        channel_id   INTEGER NOT NULL DEFAULT 0,
+        updated_at   INTEGER NOT NULL DEFAULT 0
     );
     """, commit=True)
 
@@ -4284,7 +4337,8 @@ def _start_restore_report_flow_for_user(user_id: int) -> tuple[bool, str]:
             uid,
             prompt,
             parse_mode="HTML",
-            disable_web_page_preview=True
+            disable_web_page_preview=True,
+            reply_markup=kb_report_cancel()
         )
         return True, "🔁 Запрос переведён в личные сообщения бота."
     except Exception:
@@ -8254,7 +8308,12 @@ def build_agents_panel_text(user_id: int) -> str:
         lines.append("/promocode_create — создание промокода")
         lines.append("/promocode_all — список всех промокодов")
         lines.append("/promocode_delete — удалить промокод")
+        lines.append("/promocode_delete_all — удалить все промокоды")
         lines.append("")
+
+    post_lines = render_post_channel_agents_section(int(uid))
+    if post_lines:
+        lines.extend(post_lines)
 
     if is_creator(uid):
         lines.append("📒 Раздел создателя")
@@ -10180,9 +10239,9 @@ def _settings_restore_timer_text(user_id: int) -> str:
     self_until = int(deleted_at + 3 * 86400)
 
     if now <= self_until:
-        return f"до самовосстановления: {_format_settings_left(self_until - now)}"
+        return f"До конца ручного восстановления: {_format_settings_left(self_until - now)}"
     if now <= purge_at:
-        return f"через поддержку: {_format_settings_left(purge_at - now)}"
+        return f"До полного удаления: {_format_settings_left(purge_at - now)}"
     return "❌"
 
 def _settings_cb(uid: int, act: str) -> str:
@@ -10275,7 +10334,9 @@ def render_settings_text(user_id: int, current_chat_id: int = 0) -> str:
         lines.append(f"Корпоративные уведомления: {corp_notify_txt}")
 
     if deleted_row:
-        lines.append(f"⏳ Таймер удаления лабы {_settings_restore_timer_text(uid)}")
+        lines.append("")
+        lines.append("⌛ Восстановление лаборатории:")
+        lines.append(f"{_settings_restore_timer_text(uid)}")
 
     return "\n".join(lines)
 
@@ -10401,7 +10462,422 @@ def report_get_state(user_id: int) -> tuple[str, str]:
     return (str(r["stage"] or ""), str(r["category"] or ""))
 
 def report_clear_state(user_id: int):
+    report_draft_clear(int(user_id))
     db_exec("DELETE FROM report_state WHERE user_id=?", (int(user_id),), commit=True)
+
+def _report_media_item_clean(item: dict) -> Optional[dict]:
+    if not isinstance(item, dict):
+        return None
+
+    mtype = str(item.get("type") or "").strip().lower()
+    fid = str(item.get("file_id") or "").strip()
+    if mtype not in ("photo", "video") or not fid:
+        return None
+
+    out = {
+        "type": mtype,
+        "file_id": fid,
+        "media_group_id": str(item.get("media_group_id") or "").strip(),
+        "message_id": int(item.get("message_id") or 0),
+        "added_at": int(item.get("added_at") or 0),
+    }
+    return out
+
+def _report_draft_load_media(raw_json: str) -> list[dict]:
+    try:
+        data = json.loads((raw_json or "") or "[]")
+    except Exception:
+        data = []
+
+    out = []
+    if not isinstance(data, list):
+        return out
+
+    seen = set()
+    for item in data:
+        clean = _report_media_item_clean(item)
+        if not clean:
+            continue
+
+        key = (clean["type"], clean["file_id"])
+        if key in seen:
+            continue
+        seen.add(key)
+
+        out.append(clean)
+
+    out.sort(
+        key=lambda x: (
+            int(x.get("message_id") or 0) if int(x.get("message_id") or 0) > 0 else 10**18,
+            int(x.get("added_at") or 0)
+        )
+    )
+    return out[:REPORT_MAX_MEDIA]
+
+def _report_draft_save(user_id: int, text: str, media_items: list[dict]):
+    safe_items = []
+    seen = set()
+
+    for item in (media_items or [])[:REPORT_MAX_MEDIA]:
+        clean = _report_media_item_clean(item)
+        if not clean:
+            continue
+
+        key = (clean["type"], clean["file_id"])
+        if key in seen:
+            continue
+        seen.add(key)
+
+        safe_items.append(clean)
+
+    safe_items.sort(
+        key=lambda x: (
+            int(x.get("message_id") or 0) if int(x.get("message_id") or 0) > 0 else 10**18,
+            int(x.get("added_at") or 0)
+        )
+    )
+
+    db_exec(
+        "INSERT INTO report_drafts(user_id, text, media_json, updated_at) VALUES (?,?,?,?) "
+        "ON CONFLICT(user_id) DO UPDATE SET "
+        "text=excluded.text, media_json=excluded.media_json, updated_at=excluded.updated_at",
+        (
+            int(user_id),
+            str(text or "").strip(),
+            json.dumps(safe_items[:REPORT_MAX_MEDIA], ensure_ascii=False),
+            int(now_ts())
+        ),
+        commit=True
+    )
+
+def report_draft_clear(user_id: int):
+    db_exec("DELETE FROM report_drafts WHERE user_id=?", (int(user_id),), commit=True)
+
+def report_draft_get(user_id: int) -> dict:
+    row = db_one(
+        "SELECT text, media_json, updated_at FROM report_drafts WHERE user_id=? LIMIT 1",
+        (int(user_id),)
+    )
+    if not row:
+        return {"text": "", "media": [], "updated_at": 0}
+
+    return {
+        "text": str(row["text"] or "").strip(),
+        "media": _report_draft_load_media(row["media_json"] or "[]"),
+        "updated_at": int(row["updated_at"] or 0),
+    }
+
+def _report_join_draft_text(old_text: str, new_text: str) -> str:
+    old = str(old_text or "").strip()
+    new = str(new_text or "").strip()
+
+    if not old:
+        return new
+    if not new:
+        return old
+
+    return f"{old} {new}"
+
+def report_draft_append_text(user_id: int, text: str):
+    add_text = str(text or "").strip()
+    if not add_text:
+        return
+
+    with DB_LOCK:
+        c = conn.cursor()
+        try:
+            c.execute("BEGIN")
+
+            row = c.execute(
+                "SELECT text, media_json FROM report_drafts WHERE user_id=? LIMIT 1",
+                (int(user_id),)
+            ).fetchone()
+
+            current_text = str(row["text"] or "").strip() if row else ""
+            media = _report_draft_load_media(row["media_json"] or "[]") if row else []
+
+            new_text = _report_join_draft_text(current_text, add_text)
+            ts = int(now_ts())
+
+            c.execute(
+                "INSERT INTO report_drafts(user_id, text, media_json, updated_at) VALUES (?,?,?,?) "
+                "ON CONFLICT(user_id) DO UPDATE SET "
+                "text=excluded.text, media_json=excluded.media_json, updated_at=excluded.updated_at",
+                (
+                    int(user_id),
+                    new_text,
+                    json.dumps(media[:REPORT_MAX_MEDIA], ensure_ascii=False),
+                    ts
+                )
+            )
+
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            try:
+                c.close()
+            except Exception:
+                pass
+
+def report_draft_set_text(user_id: int, text: str):
+    report_draft_append_text(int(user_id), text)
+
+def report_draft_set_text_if_empty(user_id: int, text: str):
+    report_draft_append_text(int(user_id), text)
+
+def report_draft_add_media(
+    user_id: int,
+    media_type: str,
+    media_file_id: str,
+    *,
+    media_group_id: str = "",
+    message_id: int = 0
+) -> tuple[bool, int]:
+    mtype = str(media_type or "").strip().lower()
+    fid = str(media_file_id or "").strip()
+    group_id = str(media_group_id or "").strip()
+    msg_id = int(message_id or 0)
+
+    if mtype not in ("photo", "video") or not fid:
+        draft = report_draft_get(int(user_id))
+        return False, len(draft.get("media") or [])
+
+    with DB_LOCK:
+        c = conn.cursor()
+        try:
+            c.execute("BEGIN")
+
+            row = c.execute(
+                "SELECT text, media_json FROM report_drafts WHERE user_id=? LIMIT 1",
+                (int(user_id),)
+            ).fetchone()
+
+            text = str(row["text"] or "").strip() if row else ""
+            media = _report_draft_load_media(row["media_json"] or "[]") if row else []
+
+            for item in media:
+                if str(item.get("type") or "") == mtype and str(item.get("file_id") or "") == fid:
+                    conn.commit()
+                    return True, len(media)
+
+            if len(media) >= REPORT_MAX_MEDIA:
+                conn.commit()
+                return False, len(media)
+
+            media.append({
+                "type": mtype,
+                "file_id": fid,
+                "media_group_id": group_id,
+                "message_id": msg_id,
+                "added_at": int(now_ts()),
+            })
+
+            media = _report_draft_load_media(json.dumps(media, ensure_ascii=False))
+            ts = int(now_ts())
+
+            c.execute(
+                "INSERT INTO report_drafts(user_id, text, media_json, updated_at) VALUES (?,?,?,?) "
+                "ON CONFLICT(user_id) DO UPDATE SET "
+                "text=excluded.text, media_json=excluded.media_json, updated_at=excluded.updated_at",
+                (
+                    int(user_id),
+                    text,
+                    json.dumps(media[:REPORT_MAX_MEDIA], ensure_ascii=False),
+                    ts
+                )
+            )
+
+            conn.commit()
+            return True, len(media[:REPORT_MAX_MEDIA])
+
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            try:
+                c.close()
+            except Exception:
+                pass
+
+def _report_answer_cb(target_uid: int, report_ts: int) -> str:
+    return f"{REPORTANSUI_TAG}:{int(target_uid)}:{int(report_ts)}"
+
+def _report_answer_parse_cb(data: str):
+    try:
+        p = (data or "").split(":")
+        if len(p) != 3 or p[0] != REPORTANSUI_TAG:
+            return None, None
+        return int(p[1]), int(p[2])
+    except Exception:
+        return None, None
+
+def _report_answer_state_cat(target_uid: int, report_ts: int) -> str:
+    return f"ANSWER:{int(target_uid)}:{int(report_ts)}"
+
+def _report_answer_state_parse(cat: str):
+    try:
+        s = str(cat or "").strip()
+        p = s.split(":")
+        if len(p) != 3 or str(p[0] or "").upper() != "ANSWER":
+            return None, None
+        return int(p[1]), int(p[2])
+    except Exception:
+        return None, None
+
+def _report_can_answer(user_id: int) -> bool:
+    uid = int(user_id)
+    return bool(is_creator(uid) or is_support(uid))
+
+def kb_report_cancel() -> ReplyKeyboardMarkup:
+    kb = ReplyKeyboardMarkup(resize_keyboard=True, selective=True)
+    kb.row(
+        KeyboardButton(REPORT_SUBMIT_TEXT),
+        KeyboardButton(REPORT_CANCEL_TEXT)
+    )
+    return kb
+
+def report_reply_remove_markup():
+    return ReplyKeyboardRemove()
+
+def _report_media_group_ack_key(user_id: int, media_group_id: str) -> str:
+    return f"{int(user_id)}:{str(media_group_id or '').strip()}"
+
+def _report_schedule_media_group_ack(user_id: int, media_group_id: str, message):
+    gid = str(media_group_id or "").strip()
+    if not gid:
+        return
+
+    key = _report_media_group_ack_key(int(user_id), gid)
+    token = int(now_ts() * 1000) + random.randint(1, 999)
+
+    with _REPORT_MEDIA_GROUP_ACK_LOCK:
+        _REPORT_MEDIA_GROUP_ACK_STATE[key] = token
+
+    def _job():
+        try:
+            time.sleep(float(REPORT_MEDIA_GROUP_ACK_DELAY_SEC))
+
+            with _REPORT_MEDIA_GROUP_ACK_LOCK:
+                if int(_REPORT_MEDIA_GROUP_ACK_STATE.get(key, 0) or 0) != int(token):
+                    return
+                _REPORT_MEDIA_GROUP_ACK_STATE.pop(key, None)
+
+            draft = report_draft_get(int(user_id))
+            media_count = len(draft.get("media") or [])
+
+            if media_count >= REPORT_MAX_MEDIA:
+                ack_text = (
+                    "✅ Группа вложений обработана.\n"
+                    f"Вложений: {media_count}/{REPORT_MAX_MEDIA}\n"
+                    "⚠️ Достигнут лимит вложений. Новые вложения больше не добавятся.\n"
+                    f"Теперь нажмите «{REPORT_SUBMIT_TEXT}» или отправьте дополнительный текст."
+                )
+            else:
+                ack_text = (
+                    "✅ Группа вложений добавлена.\n"
+                    f"Вложений: {media_count}/{REPORT_MAX_MEDIA}\n"
+                    f"Теперь нажмите «{REPORT_SUBMIT_TEXT}» или добавьте ещё вложения."
+                )
+
+            bot.reply_to(
+                message,
+                _report_text_for_user(int(user_id), ack_text),
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
+        except Exception:
+            pass
+
+    threading.Thread(target=_job, daemon=True).start()
+
+def kb_report_answer(target_uid: int, report_ts: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup()
+    kb.add(
+        _ikb(
+            "Ответить",
+            callback_data=_report_answer_cb(int(target_uid), int(report_ts)),
+            style="primary"
+        )
+    )
+    return kb
+
+def _report_target_title(user_id: int) -> str:
+    row = get_user_row(int(user_id))
+    if not row:
+        return f"<code>{int(user_id)}</code>"
+
+    un = (row["username"] or "")
+    disp = display_name(
+        row["first_name"] or "",
+        row["last_name"] or "",
+        un,
+        int(user_id)
+    )
+    return tg_mention(int(user_id), disp, username=un)
+
+def _report_answer_prompt(target_uid: int, report_ts: int) -> str:
+    return (
+        "Подготовьте ответ пользователю "
+        f"{_report_target_title(int(target_uid))}\n"
+        f"По запросу от: <code>{h(_fmt_ts(int(report_ts)))}</code>\n\n"
+        "Сначала отправьте текст ответа отдельным сообщением.\n"
+        f"После этого можно добавить до {REPORT_MAX_MEDIA} фото или видео отдельными сообщениями.\n"
+        f"Когда всё будет готово, нажмите «{REPORT_SUBMIT_TEXT}»."
+    )
+
+def _send_report_answer_to_user(
+    target_user_id: int,
+    answer_text: str,
+    media_type: str = "",
+    media_file_id: str = "",
+    *,
+    media_items: Optional[list[dict]] = None
+) -> bool:
+    try:
+        items = _report_normalize_media_items(
+            media_items,
+            media_type=media_type,
+            media_file_id=media_file_id
+        )
+
+        if not items:
+            bot.send_message(
+                int(target_user_id),
+                answer_text,
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
+            return True
+
+        caption = answer_text if len(answer_text or "") <= 1000 else ""
+
+        ok_media = _report_send_media_group_to_chat(
+            int(target_user_id),
+            items,
+            caption=caption,
+            parse_mode="HTML"
+        )
+
+        if caption:
+            return bool(ok_media)
+
+        ok_text = False
+        try:
+            bot.send_message(
+                int(target_user_id),
+                answer_text,
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
+            ok_text = True
+        except Exception:
+            pass
+
+        return bool(ok_text or ok_media)
+    except Exception:
+        return False
 
 # report
 def _report_cb(uid: int, act: str) -> str:
@@ -10454,10 +10930,11 @@ def _report_prompt(uid: int, cat: str) -> str:
 
     if cat == "USER":
         text = (
-            "Отправьте одним сообщением:\n"
-            "・ 1-я строка @username нарушителя\n"
-            "・ со 2-й строки описание проблемы\n\n"
-            "Можно прикрепить фото или видео к этому сообщению."
+            "Сначала отправьте текст репорта отдельным сообщением:\n"
+            "・ 1-я строка — @username нарушителя\n"
+            "・ со 2-й строки — описание проблемы\n\n"
+            f"После этого можно добавить до {REPORT_MAX_MEDIA} фото или видео отдельными сообщениями.\n"
+            f"Когда всё будет готово, нажмите «{REPORT_SUBMIT_TEXT}»."
         )
         return _report_text_for_user(int(uid), text)
 
@@ -10472,50 +10949,227 @@ def _report_prompt(uid: int, cat: str) -> str:
                 f"🧾 Крайний срок восстановления через поддержку: <code>{h(_fmt_ts(purge_at))}</code>"
             )
         text = (
-            "Опишите Ваш запрос на восстановление лаборатории одним сообщением.\n"
-            "Можно приложить фото или видео.\n"
-            "Подробнее опишите причину."
+            "Сначала отправьте текст запроса на восстановление лаборатории.\n"
+            f"После этого можно добавить до {REPORT_MAX_MEDIA} фото или видео отдельными сообщениями.\n"
+            f"Когда всё будет готово, нажмите «{REPORT_SUBMIT_TEXT}»."
             f"{extra}"
         )
         return _report_text_for_user(int(uid), text)
 
     if cat == "APPEAL":
         text = (
-            "Отправьте описание апелляции одним сообщением.\n\n"
-            "Можно прикрепить фото или видео к этому сообщению."
+            "Сначала отправьте текст апелляции.\n"
+            f"После этого можно добавить до {REPORT_MAX_MEDIA} фото или видео отдельными сообщениями.\n"
+            f"Когда всё будет готово, нажмите «{REPORT_SUBMIT_TEXT}»."
         )
         return _report_text_for_user(int(uid), text)
 
     text = (
-        "Отправьте описание проблемы одним сообщением.\n\n"
-        "Можно прикрепить фото или видео к этому сообщению."
+        "Сначала отправьте текст описания проблемы.\n"
+        f"После этого можно добавить до {REPORT_MAX_MEDIA} фото или видео отдельными сообщениями.\n"
+        f"Когда всё будет готово, нажмите «{REPORT_SUBMIT_TEXT}»."
     )
     return _report_text_for_user(int(uid), text)
 
-def _send_report_to_service_team(admin_text: str, media_type: str = "", media_file_id: str = "") -> bool:
-    try:
-        if media_type and media_file_id:
-            if len(admin_text) <= 900:
-                return _send_media_to_report_recipients(
-                    media_type,
-                    media_file_id,
-                    caption=admin_text,
-                    parse_mode="HTML"
-                )
+def _report_input_media_item(item: dict, *, caption: str = "", parse_mode: Optional[str] = "HTML"):
+    clean = _report_media_item_clean(item)
+    if not clean:
+        return None
 
+    kwargs = {"media": clean["file_id"]}
+    if caption:
+        kwargs["caption"] = caption
+        kwargs["parse_mode"] = parse_mode
+
+    if clean["type"] == "photo":
+        return InputMediaPhoto(**kwargs)
+    return InputMediaVideo(**kwargs)
+
+def _report_send_media_group_to_chat(
+    chat_id: int,
+    media_items: list[dict],
+    *,
+    caption: str = "",
+    parse_mode: Optional[str] = "HTML"
+) -> bool:
+    items = _report_normalize_media_items(media_items)
+    if not items:
+        return False
+
+    if len(items) == 1:
+        first = items[0]
+        try:
+            if first["type"] == "photo":
+                bot.send_photo(
+                    int(chat_id),
+                    first["file_id"],
+                    caption=caption or None,
+                    parse_mode=parse_mode if caption else None
+                )
+            else:
+                bot.send_video(
+                    int(chat_id),
+                    first["file_id"],
+                    caption=caption or None,
+                    parse_mode=parse_mode if caption else None
+                )
+            return True
+        except Exception:
+            return False
+
+    media_payload = []
+    for i, item in enumerate(items[:REPORT_MAX_MEDIA]):
+        media_obj = _report_input_media_item(
+            item,
+            caption=caption if i == 0 else "",
+            parse_mode=parse_mode
+        )
+        if media_obj:
+            media_payload.append(media_obj)
+
+    if not media_payload:
+        return False
+
+    try:
+        bot.send_media_group(int(chat_id), media_payload)
+        return True
+    except Exception:
+        return False
+
+def _send_media_group_to_report_recipients(
+    media_items: list[dict],
+    *,
+    caption: str = "",
+    parse_mode: Optional[str] = "HTML"
+) -> bool:
+    ok = False
+    items = _report_normalize_media_items(media_items)
+    if not items:
+        return False
+
+    for uid in _report_notify_user_ids():
+        if _report_send_media_group_to_chat(
+            int(uid),
+            items,
+            caption=caption,
+            parse_mode=parse_mode
+        ):
+            ok = True
+
+    return ok
+
+def _report_answer_button_notice_text(report_ts: int) -> str:
+    txt = "↩️ Ответить на этот репорт"
+    if int(report_ts or 0) > 0:
+        txt += f"\nЗапрос от: <code>{h(_fmt_ts(int(report_ts)))}</code>"
+    return txt
+
+def _report_normalize_media_items(
+    media_items: Optional[list[dict]] = None,
+    *,
+    media_type: str = "",
+    media_file_id: str = ""
+) -> list[dict]:
+    out: list[dict] = []
+    seen = set()
+
+    if isinstance(media_items, list):
+        raw_items = media_items
+    elif str(media_type or "").strip() and str(media_file_id or "").strip():
+        raw_items = [{
+            "type": str(media_type or "").strip().lower(),
+            "file_id": str(media_file_id or "").strip(),
+            "media_group_id": "",
+            "message_id": 0,
+            "added_at": int(now_ts()),
+        }]
+    else:
+        raw_items = []
+
+    for item in raw_items:
+        clean = _report_media_item_clean(item)
+        if not clean:
+            continue
+
+        key = (clean["type"], clean["file_id"])
+        if key in seen:
+            continue
+        seen.add(key)
+
+        out.append(clean)
+
+    out.sort(
+        key=lambda x: (
+            int(x.get("message_id") or 0) if int(x.get("message_id") or 0) > 0 else 10**18,
+            int(x.get("added_at") or 0)
+        )
+    )
+
+    return out[:REPORT_MAX_MEDIA]
+
+def _send_report_to_service_team(
+    admin_text: str,
+    media_type: str = "",
+    media_file_id: str = "",
+    *,
+    reporter_user_id: int = 0,
+    report_ts: int = 0,
+    media_items: Optional[list[dict]] = None
+) -> bool:
+    try:
+        rm = None
+        if int(reporter_user_id or 0) > 0 and int(report_ts or 0) > 0:
+            rm = kb_report_answer(int(reporter_user_id), int(report_ts))
+
+        items = _report_normalize_media_items(
+            media_items,
+            media_type=media_type,
+            media_file_id=media_file_id
+        )
+
+        if not items:
+            return _send_message_to_report_recipients(
+                admin_text,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=rm
+            )
+
+        caption = admin_text if len(admin_text or "") <= 1000 else ""
+        ok_media = _send_media_group_to_report_recipients(
+            items,
+            caption=caption,
+            parse_mode="HTML"
+        )
+
+        if not caption:
             ok_text = _send_message_to_report_recipients(
                 admin_text,
                 parse_mode="HTML",
-                disable_web_page_preview=True
+                disable_web_page_preview=True,
+                reply_markup=rm
             )
-            ok_media = _send_media_to_report_recipients(media_type, media_file_id)
             return bool(ok_text or ok_media)
 
-        return _send_message_to_report_recipients(
-            admin_text,
-            parse_mode="HTML",
-            disable_web_page_preview=True
-        )
+        if rm is not None and len(items) > 1:
+            _send_message_to_report_recipients(
+                _report_answer_button_notice_text(int(report_ts)),
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=rm
+            )
+
+        if rm is not None and len(items) == 1:
+            first = items[0]
+            return _send_media_to_report_recipients(
+                first["type"],
+                first["file_id"],
+                caption=admin_text,
+                parse_mode="HTML",
+                reply_markup=rm
+            )
+
+        return bool(ok_media)
     except Exception:
         return False
 
@@ -10531,129 +11185,324 @@ def _handle_report_content_message(message) -> bool:
     else:
         raw = (message.caption or "").strip()
 
-    if raw.startswith("/"):
-        return False
+    answer_target_id, answer_report_ts = _report_answer_state_parse(cat)
+    is_answer_flow = answer_target_id is not None
 
-    if not raw:
-        bot.reply_to(
-            message,
-            _report_text_for_user(uid, "Пустое сообщение. Пришлите текст описания, при желании добавив фото или видео."),
-            parse_mode="HTML",
-            disable_web_page_preview=True
-        )
-        return True
+    if message.content_type == "text":
+        low = str(raw or "").strip().casefold()
 
-    target_un = ""
-    desc = ""
-
-    cat_u = str(cat).upper()
-
-    if is_bot_banned(int(uid)) and cat_u != "APPEAL":
-        report_clear_state(int(uid))
-        bot.reply_to(
-            message,
-            _report_text_for_user(uid, "Для заблокированных пользователей доступна только апелляция."),
-            parse_mode="HTML",
-            disable_web_page_preview=True
-        )
-        return True
-
-    if cat_u == "USER":
-        lines = raw.splitlines()
-        if not lines or not lines[0].strip().startswith("@"):
+        if low == str(REPORT_CANCEL_TEXT).casefold():
+            report_clear_state(uid)
             bot.reply_to(
                 message,
                 _report_text_for_user(
                     uid,
-                    "Для жалобы на пользователя укажите сообщение в формате:\n"
-                    "1-я строка — @username нарушителя\n"
-                    "со 2-й строки — описание проблемы."
+                    "Подготовка ответа отменена." if is_answer_flow else "Подготовка репорта отменена."
+                ),
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=report_reply_remove_markup()
+            )
+            return True
+
+        if low == str(REPORT_SUBMIT_TEXT).casefold():
+            draft = report_draft_get(int(uid))
+            draft_text = str(draft.get("text") or "").strip()
+            media_items = list(draft.get("media") or [])
+
+            if not is_answer_flow and not draft_text:
+                bot.reply_to(
+                    message,
+                    _report_text_for_user(uid, "Сначала отправьте текст описания проблемы."),
+                    parse_mode="HTML",
+                    disable_web_page_preview=True
+                )
+                return True
+
+            if is_answer_flow and not draft_text and not media_items:
+                bot.reply_to(
+                    message,
+                    _report_text_for_user(uid, "Сначала добавьте текст ответа или вложение."),
+                    parse_mode="HTML",
+                    disable_web_page_preview=True
+                )
+                return True
+
+            if is_answer_flow:
+                header = "📩 Ответ техподдержки на ваш запрос"
+                if int(answer_report_ts or 0) > 0:
+                    header += f" от <code>{h(_fmt_ts(int(answer_report_ts)))}</code>"
+
+                if draft_text:
+                    answer_text = f"{header}:\n\n<i>{h(draft_text)}</i>"
+                else:
+                    answer_text = f"{header}."
+
+                ok = _send_report_answer_to_user(
+                    int(answer_target_id),
+                    answer_text,
+                    media_items=media_items
+                )
+                if not ok:
+                    bot.reply_to(
+                        message,
+                        _report_text_for_user(uid, "Не удалось отправить ответ пользователю. Попробуйте ещё раз."),
+                        parse_mode="HTML",
+                        disable_web_page_preview=True
+                    )
+                    return True
+
+                report_clear_state(uid)
+                bot.reply_to(
+                    message,
+                    _report_text_for_user(uid, "Ответ отправлен пользователю."),
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                    reply_markup=report_reply_remove_markup()
+                )
+                return True
+
+            target_un = ""
+            desc = draft_text
+            cat_u = str(cat).upper()
+
+            if is_bot_banned(int(uid)) and cat_u != "APPEAL":
+                report_clear_state(int(uid))
+                bot.reply_to(
+                    message,
+                    _report_text_for_user(uid, "Для заблокированных пользователей доступна только апелляция."),
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                    reply_markup=report_reply_remove_markup()
+                )
+                return True
+
+            if cat_u == "USER":
+                lines = desc.splitlines()
+                if not lines or not lines[0].strip().startswith("@"):
+                    bot.reply_to(
+                        message,
+                        _report_text_for_user(
+                            uid,
+                            "Для жалобы на пользователя укажите текст в формате:\n"
+                            "1-я строка — @username нарушителя\n"
+                            "со 2-й строки — описание проблемы."
+                        ),
+                        parse_mode="HTML",
+                        disable_web_page_preview=True
+                    )
+                    return True
+
+                target_un = lines[0].strip()
+                desc = "\n".join(lines[1:]).strip()
+                if not desc:
+                    bot.reply_to(
+                        message,
+                        _report_text_for_user(uid, "Добавьте описание проблемы со второй строки."),
+                        parse_mode="HTML",
+                        disable_web_page_preview=True
+                    )
+                    return True
+
+            from_name = user_full_name(message.from_user)
+            from_un = (getattr(message.from_user, "username", None) or "").strip()
+            report_ts = int(now_ts())
+            from_line = h(from_name) + (f" (@{h(from_un)})" if from_un else "")
+            ts_txt = _fmt_ts(report_ts)
+            cat_title = REPORT_CATS.get(cat_u, cat_u)
+
+            admin_text = f"Репорт {h(ts_txt)}\nОт {from_line}\nКатегория: {h(cat_title)}\n"
+
+            if cat_u == "USER":
+                admin_text += f"На {h(target_un)}\n"
+
+            if cat_u == "RESTORE":
+                row = get_deleted_lab_row(uid)
+                if row:
+                    deleted_at = int(row["deleted_at"] or 0)
+                    purge_at = int(row["purge_at"] or 0)
+                    admin_text += f"Удалена: <code>{h(_fmt_ts(deleted_at))}</code>\n"
+                    admin_text += f"До полного удаления: <code>{h(_fmt_ts(purge_at))}</code>\n"
+                else:
+                    admin_text += "Сохранённая лаборатория для восстановления не найдена.\n"
+
+            admin_text += "Описание проблемы:\n"
+            admin_text += f"<i>{h(desc)}</i>"
+
+            if _report_is_test_user(uid):
+                admin_text = f"{_report_test_prefix_html()}\n{admin_text}"
+
+            ok = _send_report_to_service_team(
+                admin_text,
+                reporter_user_id=int(uid),
+                report_ts=int(report_ts),
+                media_items=media_items
+            )
+            if not ok:
+                bot.reply_to(
+                    message,
+                    _report_text_for_user(uid, "Не удалось отправить репорт. Попробуйте позже."),
+                    parse_mode="HTML",
+                    disable_web_page_preview=True
+                )
+                return True
+
+            report_clear_state(uid)
+
+            if cat_u == "RESTORE":
+                bot.reply_to(
+                    message,
+                    _report_text_for_user(uid, "Запрос на восстановление лаборатории отправлен техподдержке на рассмотрение."),
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                    reply_markup=report_reply_remove_markup()
+                )
+            else:
+                bot.reply_to(
+                    message,
+                    _report_text_for_user(uid, "📨 Репорт отправлен тех.поддержке на рассмотрение. Благодарим вас за поддержку проекта."),
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                    reply_markup=report_reply_remove_markup()
+                )
+            return True
+
+        if not raw:
+            bot.reply_to(
+                message,
+                _report_text_for_user(
+                    uid,
+                    "Пустое сообщение. Отправьте текст или нажмите «Отмена»."
                 ),
                 parse_mode="HTML",
                 disable_web_page_preview=True
             )
             return True
 
-        target_un = lines[0].strip()
-        desc = "\n".join(lines[1:]).strip()
-        if not desc:
-            bot.reply_to(
-                message,
-                _report_text_for_user(uid, "Добавьте описание проблемы со второй строки."),
-                parse_mode="HTML",
-                disable_web_page_preview=True
+        report_draft_append_text(int(uid), raw)
+        draft = report_draft_get(int(uid))
+        media_count = len(draft.get("media") or [])
+
+        if media_count >= REPORT_MAX_MEDIA:
+            next_hint = (
+                "⚠️ Лимит вложений уже достигнут. Новые вложения больше не добавятся.\n"
+                f"Можно отправить ещё текст или нажать «{REPORT_SUBMIT_TEXT}»."
             )
-            return True
-    else:
-        desc = raw.strip()
-
-    from_name = user_full_name(message.from_user)
-    from_un = (getattr(message.from_user, "username", None) or "").strip()
-    from_line = h(from_name) + (f" (@{h(from_un)})" if from_un else "")
-    ts_txt = _fmt_ts(now_ts())
-    cat_title = REPORT_CATS.get(cat_u, cat_u)
-
-    admin_text = f"Репорт {h(ts_txt)}\nОт {from_line}\nКатегория: {h(cat_title)}\n"
-
-    if cat_u == "USER":
-        admin_text += f"На {h(target_un)}\n"
-
-    if cat_u == "RESTORE":
-        row = get_deleted_lab_row(uid)
-        if row:
-            deleted_at = int(row["deleted_at"] or 0)
-            purge_at = int(row["purge_at"] or 0)
-            admin_text += f"Удалена: <code>{h(_fmt_ts(deleted_at))}</code>\n"
-            admin_text += f"Support restore до: <code>{h(_fmt_ts(purge_at))}</code>\n"
         else:
-            admin_text += "Сохранённая лаборатория для восстановления не найдена.\n"
+            next_hint = (
+                f"Теперь можно добавить фото или видео и затем нажать «{REPORT_SUBMIT_TEXT}»."
+            )
 
-    admin_text += "Описание проблемы:\n"
-    admin_text += f"<i>{h(desc)}</i>"
-
-    if _report_is_test_user(uid):
-        admin_text = f"{_report_test_prefix_html()}\n{admin_text}"
-
-    media_type = ""
-    media_file_id = ""
-    try:
-        if message.content_type == "photo" and message.photo:
-            media_type = "photo"
-            media_file_id = message.photo[-1].file_id
-        elif message.content_type == "video" and message.video:
-            media_type = "video"
-            media_file_id = message.video.file_id
-    except Exception:
-        media_type = ""
-        media_file_id = ""
-
-    ok = _send_report_to_service_team(admin_text, media_type=media_type, media_file_id=media_file_id)
-    if not ok:
         bot.reply_to(
             message,
-            _report_text_for_user(uid, "Не удалось отправить репорт. Попробуйте позже."),
+            _report_text_for_user(
+                uid,
+                f"✅ Текст добавлен к черновику.\n"
+                f"Вложений: {media_count}/{REPORT_MAX_MEDIA}\n"
+                f"{next_hint}"
+            ),
             parse_mode="HTML",
             disable_web_page_preview=True
         )
         return True
 
-    report_clear_state(uid)
+    if message.content_type in ("photo", "video"):
+        media_type = ""
+        media_file_id = ""
+        media_group_id = str(getattr(message, "media_group_id", "") or "").strip()
+        msg_id = int(getattr(message, "message_id", 0) or 0)
 
-    if cat_u == "RESTORE":
+        try:
+            if message.content_type == "photo" and message.photo:
+                media_type = "photo"
+                media_file_id = message.photo[-1].file_id
+            elif message.content_type == "video" and message.video:
+                media_type = "video"
+                media_file_id = message.video.file_id
+        except Exception:
+            media_type = ""
+            media_file_id = ""
+
+        if not media_type or not media_file_id:
+            bot.reply_to(
+                message,
+                _report_text_for_user(uid, "Не удалось обработать вложение."),
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
+            return True
+
+        if raw:
+            report_draft_set_text_if_empty(int(uid), raw)
+
+        added, count = report_draft_add_media(
+            int(uid),
+            media_type,
+            media_file_id,
+            media_group_id=media_group_id,
+            message_id=msg_id
+        )
+
+        if not added:
+            if media_group_id:
+                _report_schedule_media_group_ack(int(uid), media_group_id, message)
+                return True
+
+            if count >= REPORT_MAX_MEDIA:
+                warn_text = (
+                    f"⚠️ Достигнут лимит вложений: {count}/{REPORT_MAX_MEDIA}.\n"
+                    "Новое вложение не добавлено.\n"
+                    f"Можно отправить дополнительный текст, после нажать «{REPORT_SUBMIT_TEXT}»."
+                )
+            else:
+                warn_text = (
+                    "⚠️ Не удалось добавить вложение.\n"
+                )
+
+            bot.reply_to(
+                message,
+                _report_text_for_user(uid, warn_text),
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
+            return True
+
+        if media_group_id:
+            _report_schedule_media_group_ack(int(uid), media_group_id, message)
+            return True
+
+        draft = report_draft_get(int(uid))
+        draft_text = str(draft.get("text") or "").strip()
+
+        if count >= REPORT_MAX_MEDIA:
+            suffix = (
+                f"✅ Одиночное вложение добавлено ({count}/{REPORT_MAX_MEDIA}).\n"
+                "⚠️ Достигнут лимит вложений. Новые вложения больше не добавятся.\n"
+                f"Теперь нажмите «{REPORT_SUBMIT_TEXT}» или отправьте дополнительный текст."
+            )
+        else:
+            suffix = (
+                f"✅ Одиночное вложение добавлено ({count}/{REPORT_MAX_MEDIA}).\n"
+                "При отправке все вложения будут сгруппированы.\n"
+                f"Теперь нажмите «{REPORT_SUBMIT_TEXT}» или добавьте ещё вложения."
+            )
+
+        if is_answer_flow:
+            if not draft_text:
+                suffix += "\nТекст ответа можно добавить отдельным сообщением."
+        else:
+            if not draft_text:
+                suffix += "\nНе забудьте отправить текст описания отдельным сообщением."
+
         bot.reply_to(
             message,
-            _report_text_for_user(uid, "Запрос на восстановление лаборатории отправлен тех.поддержке на рассмотрение."),
+            _report_text_for_user(uid, suffix),
             parse_mode="HTML",
             disable_web_page_preview=True
         )
-    else:
-        bot.reply_to(
-            message,
-            _report_text_for_user(uid, "Репорт отправлен тех.поддержке на рассмотрение. Благодарим вас за поддержку проекта."),
-            parse_mode="HTML",
-            disable_web_page_preview=True
-        )
-    return True
+        return True
+
+    return False
 
 def handle_report_command(message):
     if not _require_private_bot_chat(
@@ -10833,6 +11682,273 @@ def _bot_group_chat_count() -> int:
         ") t"
     )
     return int(row["c"] or 0) if row else 0
+
+def post_channel_get(user_id: int) -> int:
+    row = db_one(
+        "SELECT COALESCE(channel_id,0) AS channel_id FROM post_channel_prefs WHERE user_id=? LIMIT 1",
+        (int(user_id),)
+    )
+    return int(row["channel_id"] or 0) if row else 0
+
+def post_channel_set(user_id: int, channel_id: int):
+    db_exec(
+        "INSERT INTO post_channel_prefs(user_id, channel_id, updated_at) VALUES (?,?,?) "
+        "ON CONFLICT(user_id) DO UPDATE SET "
+        "channel_id=excluded.channel_id, updated_at=excluded.updated_at",
+        (int(user_id), int(channel_id), int(now_ts())),
+        commit=True
+    )
+
+def post_channel_clear(user_id: int):
+    db_exec("DELETE FROM post_channel_prefs WHERE user_id=?", (int(user_id),), commit=True)
+
+def _post_channel_actor_can_use(user_id: int) -> bool:
+    uid = int(user_id)
+    return bool(is_creator(uid) or can_use_owner_commands(uid))
+
+def _post_channel_title_from_db(channel_id: int) -> str:
+    row = db_one(
+        "SELECT COALESCE(title,'') AS title FROM bot_group_chats WHERE chat_id=? LIMIT 1",
+        (int(channel_id),)
+    )
+    return (row["title"] or "").strip() if row else ""
+
+def _post_channel_owner_id(channel_id: int) -> int:
+    try:
+        admins = bot.get_chat_administrators(int(channel_id)) or []
+    except Exception:
+        return 0
+
+    owner_id = 0
+    for cm in admins:
+        try:
+            u = getattr(cm, "user", None)
+            st = (getattr(cm, "status", "") or "").lower()
+            if u:
+                remember_chat_member(int(channel_id), u)
+                if st == "creator":
+                    owner_id = int(u.id)
+        except Exception:
+            pass
+
+    if owner_id > 0:
+        db_exec(
+            "UPDATE bot_group_chats SET owner_id=?, updated_at=? WHERE chat_id=?",
+            (int(owner_id), int(now_ts()), int(channel_id)),
+            commit=True
+        )
+
+    return int(owner_id)
+
+def _post_channel_bot_can_post(channel_id: int) -> bool:
+    try:
+        if not BOT_ID:
+            refresh_bot_identity()
+
+        cm = bot.get_chat_member(int(channel_id), int(BOT_ID))
+        st = (getattr(cm, "status", "") or "").lower()
+
+        if st != "administrator":
+            return False
+
+        return bool(getattr(cm, "can_post_messages", False))
+    except Exception:
+        return False
+
+def _post_channel_check(channel_id: int) -> dict:
+    channel_id = int(channel_id)
+
+    out = {
+        "ok": False,
+        "channel_id": channel_id,
+        "title": _post_channel_title_from_db(channel_id) or f"Канал {channel_id}",
+        "reason": "",
+        "owner_id": 0,
+    }
+
+    if channel_id >= 0:
+        out["reason"] = "Некорректный id канала."
+        return out
+
+    try:
+        ch = bot.get_chat(int(channel_id))
+        chat_type = (getattr(ch, "type", "") or "").lower()
+        title = (
+            getattr(ch, "title", None)
+            or getattr(ch, "full_name", None)
+            or getattr(ch, "first_name", None)
+            or ""
+        )
+
+        if title:
+            out["title"] = str(title).strip()
+
+        if chat_type != "channel":
+            out["reason"] = "Это не канал."
+            return out
+
+        remember_bot_group_chat(
+            int(channel_id),
+            title=out["title"],
+            chat_type="channel",
+            is_active=1
+        )
+    except Exception:
+        out["reason"] = "Бот не может получить данные канала."
+        return out
+
+    if not _post_channel_bot_can_post(int(channel_id)):
+        out["reason"] = "Бот должен быть администратором канала с правом публикации."
+        return out
+
+    owner_id = _post_channel_owner_id(int(channel_id))
+    out["owner_id"] = int(owner_id)
+
+    if int(owner_id) != int(get_current_creator_id()):
+        out["reason"] = "Владельцем канала должен быть текущий создатель бота."
+        return out
+
+    out["ok"] = True
+    out["reason"] = ""
+    return out
+
+def _post_channel_collect_available() -> list[dict]:
+    rows = db_all(
+        "SELECT chat_id, COALESCE(title,'') AS title "
+        "FROM bot_group_chats "
+        "WHERE COALESCE(is_active,0)=1 AND lower(COALESCE(chat_type,''))='channel' "
+        "ORDER BY updated_at DESC, chat_id ASC"
+    ) or []
+
+    out = []
+    for r in rows:
+        channel_id = int(r["chat_id"])
+        chk = _post_channel_check(channel_id)
+        if chk.get("ok"):
+            out.append(chk)
+
+    return out
+
+def _post_channel_cb(user_id: int, channel_id: int) -> str:
+    return f"{POSTCHUI_TAG}:{int(user_id)}:{int(channel_id)}"
+
+def _post_channel_parse_cb(data: str):
+    try:
+        p = (data or "").split(":")
+        if len(p) != 3 or p[0] != POSTCHUI_TAG:
+            return None, None
+        return int(p[1]), int(p[2])
+    except Exception:
+        return None, None
+
+def _post_channel_selected_row(user_id: int) -> Optional[dict]:
+    channel_id = post_channel_get(int(user_id))
+    if channel_id == 0:
+        return None
+
+    chk = _post_channel_check(int(channel_id))
+    if not chk.get("ok"):
+        post_channel_clear(int(user_id))
+        return None
+
+    return chk
+
+def render_post_channels_text(user_id: int) -> tuple[str, Optional[InlineKeyboardMarkup]]:
+    uid = int(user_id)
+    selected = _post_channel_selected_row(uid)
+    rows = _post_channel_collect_available()
+
+    lines = []
+    lines.append("📰 Выбор канала для постов")
+    lines.append("")
+
+    if selected:
+        lines.append(f"Текущий канал: <b>{h(selected['title'])}</b>")
+    else:
+        lines.append("Текущий канал: <b>не выбран</b>")
+
+    lines.append("")
+    lines.append(
+        "В списке отображаются только каналы, где бот является администратором с правом публикации, "
+        "а владельцем канала является текущий создатель бота."
+    )
+
+    kb = InlineKeyboardMarkup(row_width=1)
+
+    if not rows:
+        lines.append("")
+        lines.append(
+            "📑 Доступных каналов пока нет.\n"
+            "Добавьте бота в канал администратором с правом публикации, затем снова используйте /post_chanals."
+        )
+        return "\n".join(lines), None
+
+    lines.append("")
+    lines.append("<blockquote expandable>")
+    for i, row in enumerate(rows, 1):
+        mark = "✅ " if selected and int(selected["channel_id"]) == int(row["channel_id"]) else ""
+        lines.append(f"{i}. {mark}<b>{h(row['title'])}</b>")
+        kb.add(
+            _ikb(
+                f"{mark}{row['title']}"[:64],
+                callback_data=_post_channel_cb(uid, int(row["channel_id"])),
+                style="success" if mark else "primary"
+            )
+        )
+    lines.append("</blockquote>")
+
+    if selected:
+        kb.add(
+            _ikb(
+                "Сбросить выбранный канал",
+                callback_data=_post_channel_cb(uid, 0),
+                style="danger"
+            )
+        )
+
+    return "\n".join(lines), kb
+
+def render_post_channel_agents_section(user_id: int) -> list[str]:
+    if not _post_channel_actor_can_use(int(user_id)):
+        return []
+
+    selected = _post_channel_selected_row(int(user_id))
+    if not selected:
+        return [
+            "📰 Посты:",
+            "/post_chanals — выбрать канал для публикаций",
+            "",
+        ]
+
+    return [
+        f"📰 Посты в «<b>{h(selected['title'])}</b>»:",
+        "/post_chanals — выбрать другой канал",
+        "/post — создать пост",
+        "/statpost — статистический пост",
+        "",
+    ]
+
+def handle_post_channels_command(message):
+    if not _require_private_bot_chat(
+        message,
+        reply_markup=kb_open_bot_pm(),
+        _no_pm_fallback=True
+    ):
+        return
+
+    uid = int(message.from_user.id)
+    if not _post_channel_actor_can_use(uid):
+        bot.reply_to(message, "📑 Эта команда доступна только создателю и старшим агентам.", parse_mode="HTML")
+        return
+
+    text, rm = render_post_channels_text(uid)
+    bot.reply_to(
+        message,
+        text,
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+        reply_markup=rm
+    )
 
 def sync_chat_admins(chat_id: int):
     """
@@ -11449,6 +12565,9 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
     if low in ("agents", "агенты"):
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="agents_panel", args="")
 
+    if low in ("post_chanals", "post_channels", "пост_каналы"):
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="post_channels", args="")
+
     if low == "my_owner":
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="my_owner", args="")
 
@@ -11689,6 +12808,9 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
 
     if low == "promocode_all":
         return Parsed(raw=raw_multiline, has_prefix_char=False, prefix_char=None, cmd="promo_all", args="")
+
+    if low == "promocode_delete_all":
+        return Parsed(raw=raw_multiline, has_prefix_char=False, prefix_char=None, cmd="promo_delete_all", args="")
 
     if low == "promocode_delete" or low.startswith("promocode_delete "):
         rest = ""
@@ -13373,19 +14495,19 @@ def handle_promo_generate_command(message):
     code = _promo_make_random_code()
     bonuses = []
 
-    # 1-3 случайных бонуса
+    # случайные бонусы
     choices = ["res", "mat", "points", "skill"]
     random.shuffle(choices)
-    for kind in choices[: random.randint(1, 3)]:
+    for kind in choices[: random.randint(1, 5)]:
         if kind == "res":
-            bonuses.append({"kind": "res", "ref_code": "", "amount": random.choice([50, 100, 150, 250, 500])})
+            bonuses.append({"kind": "res", "ref_code": "", "amount": random.choice([20, 50, 100, 150, 200, 250, 500, 1000, 2000])})
         elif kind == "mat":
-            bonuses.append({"kind": "mat", "ref_code": "", "amount": random.choice([20, 50, 100, 200])})
+            bonuses.append({"kind": "mat", "ref_code": "", "amount": random.choice([20, 50, 100, 150, 200, 250, 500, 1000, 2000])})
         elif kind == "points":
             bonuses.append({"kind": "points", "ref_code": "", "amount": random.choice([1, 2, 3])})
         else:
             sk = random.choice(list(SKILLS.keys()))
-            bonuses.append({"kind": "skill", "ref_code": sk, "amount": random.choice([1, 2])})
+            bonuses.append({"kind": "skill", "ref_code": sk, "amount": random.choice([1, 2, 3])})
 
     ts = int(now_ts() + 7 * 86400)
     _promo_create(code, 0, ts, bonuses, uid)
@@ -13462,24 +14584,26 @@ def handle_promo_delete_command(message, parsed: Parsed):
         bot.reply_to(message, "📑 Промокод не найден.")
         return
 
-    with DB_LOCK:
-        c = conn.cursor()
-        try:
-            c.execute("BEGIN")
-            c.execute("DELETE FROM promo_bonuses WHERE promo_id=?", (promo_id,))
-            c.execute("DELETE FROM promo_uses WHERE promo_id=?", (promo_id,))
-            c.execute("DELETE FROM promo_codes WHERE promo_id=?", (promo_id,))
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            try:
-                c.close()
-            except Exception:
-                pass
+    _promo_delete_by_id(int(promo_id))
 
     bot.reply_to(message, "✅ Промокод удалён.")
+
+def handle_promo_delete_all_command(message):
+    uid = int(message.from_user.id)
+    if not can_manage_support(uid):
+        return
+
+    deleted_count = _promo_delete_all()
+    if deleted_count <= 0:
+        bot.reply_to(message, "📑 Список промокодов уже пуст.")
+        return
+
+    bot.reply_to(
+        message,
+        f"✅ Все промокоды удалены.\nВсего удалено: <code>{int(deleted_count)}</code>",
+        parse_mode="HTML",
+        disable_web_page_preview=True
+    )
 
 def handle_promo_use_command(message, parsed: Parsed):
     uid = int(message.from_user.id)
@@ -15241,14 +16365,15 @@ CORPUI_TAG = "G"
 TOPUI_TAG = "T"
 SETUI_TAG = "W"
 REPORTUI_TAG = "Y"
+REPORTANSUI_TAG = "YR"
 BLUI_TAG = "K"
 USERSUI_TAG = "US"
 CHATSUI_TAG = "UC"
+POSTCHUI_TAG = "PCH"
 EMPACKUI_TAG = "EP"
 PROMOUI_TAG = "PR"
 DBSTATUI_TAG = "DBS"
 DBFILEUI_TAG = "DBF"
-PROMO_PAGE_SIZE = 15
 #           balance-chain kinds
 BALCHAIN_UPGRADE = "upgrade"
 BALCHAIN_CORP_TRANSFER = "corp_transfer"
@@ -15257,7 +16382,15 @@ BALCHAIN_DUEL_STAKE = "duel_stake"
 BALCHAIN_DUEL_BET = "duel_bet"
 
 # хендлеры и хэлперы
+#           промокод
+PROMO_PAGE_SIZE = 15
 #           report
+REPORT_CANCEL_TEXT = "Отмена"
+REPORT_SUBMIT_TEXT = "Отправить"
+REPORT_MAX_MEDIA = 5
+REPORT_MEDIA_GROUP_ACK_DELAY_SEC = 1.15
+_REPORT_MEDIA_GROUP_ACK_STATE: Dict[str, int] = {}
+_REPORT_MEDIA_GROUP_ACK_LOCK = threading.RLock()
 REPORT_CATS = {
     "BUG": "Ошибка бота",
     "USER": "Жалоба на пользователя",
@@ -15476,7 +16609,92 @@ def _promo_bonus_to_text(b) -> str:
 
     return ""
 
+def _promo_delete_by_id(promo_id: int):
+    with DB_LOCK:
+        c = conn.cursor()
+        try:
+            c.execute("BEGIN")
+            c.execute("DELETE FROM promo_bonuses WHERE promo_id=?", (int(promo_id),))
+            c.execute("DELETE FROM promo_uses WHERE promo_id=?", (int(promo_id),))
+            c.execute("DELETE FROM promo_codes WHERE promo_id=?", (int(promo_id),))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            try:
+                c.close()
+            except Exception:
+                pass
+
+def _promo_delete_all() -> int:
+    with DB_LOCK:
+        c = conn.cursor()
+        try:
+            c.execute("BEGIN")
+
+            row = c.execute("SELECT COUNT(*) AS cnt FROM promo_codes").fetchone()
+            total = int(row["cnt"] or 0) if row else 0
+
+            if total > 0:
+                c.execute("DELETE FROM promo_bonuses")
+                c.execute("DELETE FROM promo_uses")
+                c.execute("DELETE FROM promo_codes")
+
+            conn.commit()
+            return int(total)
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            try:
+                c.close()
+            except Exception:
+                pass
+
+def _promo_delete_expired_temp_codes() -> int:
+    now = int(now_ts())
+
+    with DB_LOCK:
+        c = conn.cursor()
+        try:
+            c.execute("BEGIN")
+
+            rows = c.execute(
+                "SELECT promo_id FROM promo_codes "
+                "WHERE is_permanent=0 AND expires_ts>0 AND expires_ts<=?",
+                (int(now),)
+            ).fetchall()
+
+            promo_ids = [int(r["promo_id"]) for r in (rows or [])]
+            if not promo_ids:
+                conn.commit()
+                return 0
+
+            ph = ",".join(["?"] * len(promo_ids))
+            params = tuple(promo_ids)
+
+            c.execute(f"DELETE FROM promo_bonuses WHERE promo_id IN ({ph})", params)
+            c.execute(f"DELETE FROM promo_uses WHERE promo_id IN ({ph})", params)
+            c.execute(f"DELETE FROM promo_codes WHERE promo_id IN ({ph})", params)
+
+            conn.commit()
+            return len(promo_ids)
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            try:
+                c.close()
+            except Exception:
+                pass
+
 def _promo_fetch_all_rows():
+    try:
+        _promo_delete_expired_temp_codes()
+    except Exception:
+        pass
+
     return db_all(
         "SELECT promo_id, code, code_key, is_permanent, expires_ts, created_at "
         "FROM promo_codes ORDER BY created_at DESC, promo_id DESC"
@@ -15592,6 +16810,11 @@ def _promo_create(code: str, is_permanent: int, expires_ts: int, bonuses: list, 
                 pass
 
 def _promo_apply_to_user(code: str, user_id: int) -> tuple[bool, str]:
+    try:
+        _promo_delete_expired_temp_codes()
+    except Exception:
+        pass
+
     ensure_lab_exists(int(user_id))
     row = db_one(
         "SELECT promo_id, code, is_permanent, expires_ts FROM promo_codes WHERE code_key=? LIMIT 1",
@@ -19711,6 +20934,22 @@ def on_my_chat_member_update(update):
             if status in ("member", "administrator"):
                 remember_bot_group_chat(chat_id, title=chat_title, chat_type=chat_type, is_active=1)
 
+        if chat_type == "channel":
+            if status in ("left", "kicked"):
+                remember_bot_group_chat(chat_id, title=chat_title, chat_type=chat_type, is_active=0)
+                try:
+                    db_exec("DELETE FROM post_channel_prefs WHERE channel_id=?", (int(chat_id),), commit=True)
+                except Exception:
+                    pass
+                return
+
+            if status in ("member", "administrator"):
+                remember_bot_group_chat(chat_id, title=chat_title, chat_type=chat_type, is_active=1)
+                try:
+                    _post_channel_owner_id(int(chat_id))
+                except Exception:
+                    pass
+
         if chat_type == "private":
             fake_user = type("U", (), {})()
             fake_user.id = chat_id
@@ -20139,7 +21378,19 @@ def cb_infect_retry(cq):
         if info["kind"] == "U":
             target_id = int(info["target"])
             count = int(info["count"])
-            parsed.args = f"{target_id} {count}"
+
+            target_expr = ""
+            if target_id > 0:
+                target_expr = f"tg://user?id={target_id}"
+            else:
+                row = get_user_row(int(target_id))
+                uname = ((row["username"] or "").strip() if row else "")
+                if uname:
+                    target_expr = f"@{uname.lstrip('@')}"
+                else:
+                    target_expr = str(target_id)
+
+            parsed.args = f"{count} {target_expr}".strip()
         else:
             mode = info["mode"]
             chat_filter = info["filter"]
@@ -20785,6 +22036,70 @@ def cb_topui(cq):
         except Exception:
             pass
 
+@bot.callback_query_handler(func=lambda cq: (cq.data or "").startswith(f"{POSTCHUI_TAG}:"))
+def cb_post_channel_ui(cq):
+    try:
+        uid, channel_id = _post_channel_parse_cb(cq.data or "")
+        if uid is None:
+            bot.answer_callback_query(cq.id)
+            return
+
+        actor_uid = int(cq.from_user.id)
+        if actor_uid != int(uid):
+            bot.answer_callback_query(cq.id)
+            return
+
+        if not _post_channel_actor_can_use(actor_uid):
+            bot.answer_callback_query(cq.id)
+            return
+
+        if int(channel_id) == 0:
+            post_channel_clear(actor_uid)
+            text, rm = render_post_channels_text(actor_uid)
+
+            if cq.message:
+                limited_edit_message_text(
+                    text=text,
+                    chat_id=cq.message.chat.id,
+                    msg_id=cq.message.message_id,
+                    parse_mode="HTML",
+                    reply_markup=rm,
+                    disable_web_page_preview=True
+                )
+
+            bot.answer_callback_query(cq.id, "Канал сброшен.")
+            return
+
+        chk = _post_channel_check(int(channel_id))
+        if not chk.get("ok"):
+            bot.answer_callback_query(
+                cq.id,
+                str(chk.get("reason") or "Канал недоступен для публикаций."),
+                show_alert=True
+            )
+            return
+
+        post_channel_set(actor_uid, int(channel_id))
+
+        text, rm = render_post_channels_text(actor_uid)
+        if cq.message:
+            limited_edit_message_text(
+                text=text,
+                chat_id=cq.message.chat.id,
+                msg_id=cq.message.message_id,
+                parse_mode="HTML",
+                reply_markup=rm,
+                disable_web_page_preview=True
+            )
+
+        bot.answer_callback_query(cq.id, "Канал выбран.")
+    except Exception as e:
+        send_error_report("cb_post_channel_ui", e)
+        try:
+            bot.answer_callback_query(cq.id)
+        except Exception:
+            pass
+
 @bot.callback_query_handler(func=lambda cq: (cq.data or "").startswith(f"{SETUI_TAG}:"))
 def cb_settings_ui(cq):
     try:
@@ -20905,12 +22220,28 @@ def cb_report_ui(cq):
             bot.answer_callback_query(cq.id, "📑 У вас нет сохранённой лаборатории для восстановления.", show_alert=True)
             return
 
+        prompt_text = _report_prompt(int(uid), act)
+        report_draft_clear(int(uid))
         report_set_state(int(uid), act, "await_content")
-        text = _report_prompt(int(uid), act)
+
+        try:
+            bot.send_message(
+                int(uid),
+                prompt_text,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=kb_report_cancel()
+            )
+        except Exception:
+            report_clear_state(int(uid))
+            bot.answer_callback_query(cq.id, "Не удалось отправить инструкцию в личные сообщения.", show_alert=True)
+            return
+
+        done_text = _report_text_for_user(int(uid), "Категория выбрана. Инструкция отправлена отдельным сообщением.")
 
         if cq.inline_message_id:
             limited_edit_message_text(
-                text=text,
+                text=done_text,
                 inline_id=cq.inline_message_id,
                 parse_mode="HTML",
                 reply_markup=None,
@@ -20918,7 +22249,7 @@ def cb_report_ui(cq):
             )
         elif cq.message:
             limited_edit_message_text(
-                text=text,
+                text=done_text,
                 chat_id=cq.message.chat.id,
                 msg_id=cq.message.message_id,
                 parse_mode="HTML",
@@ -20929,6 +22260,44 @@ def cb_report_ui(cq):
         bot.answer_callback_query(cq.id)
     except Exception as e:
         send_error_report("cb_report_ui", e)
+        try:
+            bot.answer_callback_query(cq.id)
+        except Exception:
+            pass
+
+@bot.callback_query_handler(func=lambda cq: (cq.data or "").startswith(f"{REPORTANSUI_TAG}:"))
+def cb_report_answer_ui(cq):
+    try:
+        target_uid, report_ts = _report_answer_parse_cb(cq.data or "")
+        if target_uid is None:
+            bot.answer_callback_query(cq.id)
+            return
+
+        actor_uid = int(cq.from_user.id)
+        if not _report_can_answer(int(actor_uid)):
+            bot.answer_callback_query(cq.id)
+            return
+
+        prompt = _report_answer_prompt(int(target_uid), int(report_ts))
+        report_draft_clear(int(actor_uid))
+        report_set_state(int(actor_uid), _report_answer_state_cat(int(target_uid), int(report_ts)), "await_content")
+
+        try:
+            bot.send_message(
+                int(actor_uid),
+                prompt,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=kb_report_cancel()
+            )
+        except Exception:
+            report_clear_state(int(actor_uid))
+            bot.answer_callback_query(cq.id, "Не удалось открыть личные сообщения.", show_alert=True)
+            return
+
+        bot.answer_callback_query(cq.id, "Ответ переведён в личные сообщения.")
+    except Exception as e:
+        send_error_report("cb_report_answer_ui", e)
         try:
             bot.answer_callback_query(cq.id)
         except Exception:
@@ -22258,7 +23627,14 @@ def _duel_cancel_pending_invite(invite_row, actor_id: int, *, via_message=None, 
     _duel_schedule_invite_message_autodelete(invite_row)
     return True, "❎ Вызов на дуэль отменён."
 
-def _duel_rematch_started_text(chat_id: int, challenger_id: int, target_id: int, stake_amount: int, first_turn_id: int) -> str:
+def _duel_rematch_started_text(
+    chat_id: int,
+    challenger_id: int,
+    target_id: int,
+    stake_amount: int,
+    first_turn_id: int,
+    inline_mode: bool = False
+) -> str:
     with chat_name_context(int(chat_id)):
         ctag = public_user_tag(int(challenger_id))
         ttag = public_user_tag(int(target_id))
@@ -22270,9 +23646,14 @@ def _duel_rematch_started_text(chat_id: int, challenger_id: int, target_id: int,
         ),
         "",
         f"Право первого выстрела предоставляется <b>{ftag}</b>",
-        "На каждый выстрел у вас есть 5 минут",
-        '💬 Произвести выстрел: "<code>Био выстрел</code>"',
     ]
+
+    if inline_mode:
+        lines.append("💬 Для продолжения дуэли используйте кнопки ниже.")
+    else:
+        lines.append("На каждый выстрел у вас есть 5 минут")
+        lines.append('💬 Произвести выстрел: "<code>Био выстрел</code>"')
+
     return "\n".join(lines)
 
 def _duel_start_rematch_from_finished(duel_row, actor_id: int) -> tuple[bool, str]:
@@ -22369,7 +23750,8 @@ def _duel_start_rematch_from_finished(duel_row, actor_id: int) -> tuple[bool, st
         int(challenger_id),
         int(target_id),
         int(stake_amount),
-        int(first_turn_id)
+        int(first_turn_id),
+        inline_mode=bool(str(duel_row["msg_inline_id"] or "").strip())
     )
     _duel_emit_state(fresh, txt, reply_markup=kb_duel_actions(fresh), edit_existing=True)
     return True, "✅ Реванш начался."
@@ -28397,6 +29779,11 @@ def text_router(message):
             handle_agents_panel_command(message)
             return
 
+        # posts
+        if parsed.cmd == "post_channels":
+            handle_post_channels_command(message)
+            return
+
         # помощь
         if parsed.cmd == "help":
             handle_help_command(message)
@@ -28461,6 +29848,10 @@ def text_router(message):
 
         if parsed.cmd == "promo_delete":
             handle_promo_delete_command(message, parsed)
+            return
+
+        if parsed.cmd == "promo_delete_all":
+            handle_promo_delete_all_command(message)
             return
 
         if parsed.cmd == "promo_use":
