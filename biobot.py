@@ -30,7 +30,7 @@ from telebot.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
     InlineQueryResultArticle, InputTextMessageContent,
     ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove,
-    InputMediaPhoto, InputMediaVideo
+    InputMediaPhoto, InputMediaVideo, MessageEntity
 )
 
 # CONFIGS
@@ -12430,6 +12430,18 @@ def post_draft_add_media(
             except Exception:
                 pass
 
+def _post_ent_get(ent, key: str, default=None):
+    try:
+        if isinstance(ent, dict):
+            return ent.get(key, default)
+    except Exception:
+        pass
+
+    try:
+        return getattr(ent, key, default)
+    except Exception:
+        return default
+
 def _post_u16_to_py_index(text: str, u16_index: int) -> int:
     s = str(text or "")
     target = max(0, int(u16_index or 0))
@@ -12445,8 +12457,8 @@ def _post_u16_to_py_index(text: str, u16_index: int) -> int:
 
 def _post_entity_range_py(text: str, ent) -> tuple[int, int]:
     try:
-        off = int(getattr(ent, "offset", 0) or 0)
-        ln = int(getattr(ent, "length", 0) or 0)
+        off = int(_post_ent_get(ent, "offset", 0) or 0)
+        ln = int(_post_ent_get(ent, "length", 0) or 0)
     except Exception:
         return 0, 0
 
@@ -12459,7 +12471,7 @@ def _post_entity_range_py(text: str, ent) -> tuple[int, int]:
     return start, end
 
 def _post_entity_html_tags(ent):
-    et = str(getattr(ent, "type", "") or "").strip().lower()
+    et = str(_post_ent_get(ent, "type", "") or "").strip().lower()
 
     if et == "bold":
         return "<b>", "</b>"
@@ -12480,26 +12492,31 @@ def _post_entity_html_tags(ent):
         return "<code>", "</code>"
 
     if et == "pre":
-        lang = str(getattr(ent, "language", "") or "").strip()
+        lang = str(_post_ent_get(ent, "language", "") or "").strip()
         if lang:
             return f'<pre><code class="language-{h(lang)}">', "</code></pre>"
         return "<pre>", "</pre>"
 
     if et == "text_link":
-        url = str(getattr(ent, "url", "") or "").strip()
+        url = str(_post_ent_get(ent, "url", "") or "").strip()
         if url:
             return f'<a href="{h(url)}">', "</a>"
         return "", ""
 
     if et == "text_mention":
-        u = getattr(ent, "user", None)
-        uid = int(getattr(u, "id", 0) or 0) if u else 0
+        u = _post_ent_get(ent, "user", None)
+
+        if isinstance(u, dict):
+            uid = int(u.get("id", 0) or 0)
+        else:
+            uid = int(getattr(u, "id", 0) or 0) if u else 0
+
         if uid > 0:
             return f'<a href="tg://user?id={uid}">', "</a>"
         return "", ""
 
     if et == "custom_emoji":
-        ceid = str(getattr(ent, "custom_emoji_id", "") or "").strip()
+        ceid = str(_post_ent_get(ent, "custom_emoji_id", "") or "").strip()
         if ceid:
             return f'<tg-emoji emoji-id="{h(ceid)}">', "</tg-emoji>"
         return "", ""
@@ -12567,18 +12584,30 @@ def _post_entities_to_html(raw_text: str, entities) -> str:
 
     return "".join(out).strip()
 
+def _post_raw_contains_allowed_html(raw_text: str) -> bool:
+    s = str(raw_text or "")
+    return bool(
+        re.search(
+            r"</?\s*(b|strong|i|em|u|s|strike|del|code|pre|a|blockquote|tg-spoiler|tg-emoji)\b",
+            s,
+            flags=re.IGNORECASE
+        )
+    )
+
 def _post_message_html_payload(message) -> str:
     if message.content_type == "text":
-        raw = (getattr(message, "text", None) or "").strip()
+        raw = getattr(message, "text", None) or ""
         entities = list(getattr(message, "entities", None) or [])
         html_val = getattr(message, "html_text", None)
     else:
-        raw = (getattr(message, "caption", None) or "").strip()
+        raw = getattr(message, "caption", None) or ""
         entities = list(getattr(message, "caption_entities", None) or [])
         html_val = getattr(message, "html_caption", None)
 
-    if entities:
-        return _post_entities_to_html(raw, entities)
+    raw = str(raw or "")
+
+    if _post_raw_contains_allowed_html(raw):
+        return raw.strip()
 
     try:
         if callable(html_val):
@@ -12590,7 +12619,12 @@ def _post_message_html_payload(message) -> str:
     if html_text:
         return html_text
 
-    return h(raw)
+    if entities:
+        html_from_entities = _post_entities_to_html(raw, entities).strip()
+        if html_from_entities:
+            return html_from_entities
+
+    return h(raw.strip())
 
 def kb_post_draft() -> ReplyKeyboardMarkup:
     kb = ReplyKeyboardMarkup(resize_keyboard=True, selective=True)
@@ -13042,7 +13076,11 @@ def _post_entity_dict(
     user=None,
     language: str = "",
     custom_emoji_id: str = ""
-) -> Optional[dict]:
+) -> Optional[MessageEntity]:
+    ent_type = str(ent_type or "").strip()
+    if not ent_type:
+        return None
+
     start_py = max(0, min(len(text), int(start_py or 0)))
     end_py = max(start_py, min(len(text), int(end_py or 0)))
 
@@ -13053,32 +13091,46 @@ def _post_entity_dict(
     if length <= 0:
         return None
 
-    d = {
-        "type": str(ent_type or "").strip(),
-        "offset": int(offset),
-        "length": int(length),
-    }
+    try:
+        ent = MessageEntity(ent_type, int(offset), int(length))
+    except Exception:
+        try:
+            ent = MessageEntity(type=ent_type, offset=int(offset), length=int(length))
+        except Exception:
+            return None
 
     if url:
-        d["url"] = str(url)
+        try:
+            ent.url = str(url)
+        except Exception:
+            pass
 
     if user is not None:
-        d["user"] = user
+        try:
+            ent.user = user
+        except Exception:
+            pass
 
     if language:
-        d["language"] = str(language)
+        try:
+            ent.language = str(language)
+        except Exception:
+            pass
 
     if custom_emoji_id:
-        d["custom_emoji_id"] = str(custom_emoji_id)
+        try:
+            ent.custom_emoji_id = str(custom_emoji_id)
+        except Exception:
+            pass
 
-    return d
+    return ent
 
 class _PostHtmlEntityParser(HTMLParser):
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self.text_parts: list[str] = []
         self.stack: list[dict] = []
-        self.entities: list[dict] = []
+        self.entities: list[MessageEntity] = []
 
     @property
     def text(self) -> str:
@@ -13209,7 +13261,19 @@ class _PostHtmlEntityParser(HTMLParser):
             if ent:
                 self.entities.append(ent)
 
-def _post_html_to_text_and_entities(html_text: str) -> tuple[str, list[dict]]:
+def _post_entity_type(ent) -> str:
+    try:
+        return str(_post_ent_get(ent, "type", "") or "").strip()
+    except Exception:
+        return ""
+
+def _post_entity_len(ent) -> int:
+    try:
+        return int(_post_ent_get(ent, "length", 0) or 0)
+    except Exception:
+        return 0
+
+def _post_html_to_text_and_entities(html_text: str) -> tuple[str, list[MessageEntity]]:
     raw = str(html_text or "").strip()
     if not raw:
         return "", []
@@ -13225,21 +13289,23 @@ def _post_html_to_text_and_entities(html_text: str) -> tuple[str, list[dict]]:
     text = parser.text
     entities = list(parser.entities or [])
 
-    entities = [e for e in entities if e.get("type") and int(e.get("length") or 0) > 0]
+    entities = [
+        e for e in entities
+        if _post_entity_type(e) and _post_entity_len(e) > 0
+    ]
 
     return text, entities
 
 def _post_send_message_raw(chat_id: int, text_html: str, *, reply_markup=None) -> bool:
     try:
-        text, entities = _post_html_to_text_and_entities(str(text_html or ""))
-
-        if not text:
+        text_html = str(text_html or "").strip()
+        if not text_html:
             return False
 
         _REAL_BOT_SEND_MESSAGE(
             int(chat_id),
-            text,
-            entities=entities or None,
+            text_html,
+            parse_mode="HTML",
             disable_web_page_preview=True,
             reply_markup=reply_markup
         )
@@ -13253,18 +13319,13 @@ def _post_input_media_item_with_entities(item: dict, *, caption_html: str = ""):
     if not clean:
         return None
 
-    caption_text = ""
-    caption_entities = []
-
-    if caption_html:
-        caption_text, caption_entities = _post_html_to_text_and_entities(caption_html)
+    caption_html = str(caption_html or "").strip()
 
     kwargs = {"media": clean["file_id"]}
 
-    if caption_text:
-        kwargs["caption"] = caption_text
-        if caption_entities:
-            kwargs["caption_entities"] = caption_entities
+    if caption_html:
+        kwargs["caption"] = caption_html
+        kwargs["parse_mode"] = "HTML"
 
     if clean["type"] == "photo":
         return InputMediaPhoto(**kwargs)
@@ -13282,11 +13343,7 @@ def _post_send_media_group_to_chat(
     if not items:
         return False
 
-    caption_text = ""
-    caption_entities = []
-
-    if caption_html:
-        caption_text, caption_entities = _post_html_to_text_and_entities(caption_html)
+    caption_html = str(caption_html or "").strip()
 
     if len(items) == 1:
         first = items[0]
@@ -13295,16 +13352,16 @@ def _post_send_media_group_to_chat(
                 _REAL_BOT_SEND_PHOTO(
                     int(chat_id),
                     first["file_id"],
-                    caption=caption_text or None,
-                    caption_entities=caption_entities or None,
+                    caption=caption_html or None,
+                    parse_mode="HTML" if caption_html else None,
                     reply_markup=reply_markup
                 )
             else:
                 _REAL_BOT_SEND_VIDEO(
                     int(chat_id),
                     first["file_id"],
-                    caption=caption_text or None,
-                    caption_entities=caption_entities or None,
+                    caption=caption_html or None,
+                    parse_mode="HTML" if caption_html else None,
                     reply_markup=reply_markup
                 )
             return True
