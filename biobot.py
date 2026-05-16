@@ -12832,8 +12832,7 @@ def kb_post_limit_choice(user_id: int) -> InlineKeyboardMarkup:
         ),
         _ikb(
             "Обрезать",
-            callback_data=_post_publish_choice_cb(int(user_id), POST_PUBLISH_TRUNCATE_ACTION),
-            style="warning"
+            callback_data=_post_publish_choice_cb(int(user_id), POST_PUBLISH_TRUNCATE_ACTION)
         )
     )
 
