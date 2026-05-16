@@ -13739,7 +13739,7 @@ def render_statpost_status(user_id: int) -> str:
 
     return "\n".join(lines)
 
-def handle_statpost_command(message, parsed: Parsed):
+def handle_statpost_command(message, parsed: "Parsed"):
     if not _require_private_bot_chat(
         message,
         reply_markup=kb_open_bot_pm(),
