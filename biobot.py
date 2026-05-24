@@ -20,7 +20,6 @@ import traceback
 import unicodedata
 import html as html_lib
 from dataclasses import dataclass
-from html.parser import HTMLParser
 from datetime import datetime, timedelta
 from typing import Optional, Tuple, List, Dict
 
@@ -30,7 +29,7 @@ from telebot.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
     InlineQueryResultArticle, InputTextMessageContent,
     ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove,
-    InputMediaPhoto, InputMediaVideo, MessageEntity
+    InputMediaPhoto, InputMediaVideo
 )
 
 # CONFIGS
@@ -54,6 +53,7 @@ def load_bot_token() -> str:
         "⚠️Ошибка: BOT_TOKEN не задан. Укажите переменную окружения BOT_TOKEN "
         "или создайте файл config_local.py с BOT_TOKEN = '...' рядом с файлом запуска бота."
     )
+    
 BOT_TOKEN = load_bot_token()
 
 def load_owner_id(default_id: int) -> int:
@@ -102,7 +102,6 @@ OLD_DATA_DIR = os.path.join(BASE_DIR, "old_data")
 OLD_DB_PATH = os.path.join(OLD_DATA_DIR, "bio_war.db")
 OLD_DB_WAL_PATH = OLD_DB_PATH + "-wal"
 OLD_DB_IMPORT_MARKER_PATH = os.path.join(DATA_DIR, "old_db_import_state.json")
-os.makedirs(DATA_DIR, exist_ok=True)
 
 DB_EXPORTS_DIR = os.path.join(DATA_DIR, "db_exports")
 DB_BACKUP_DIR = os.path.join(DATA_DIR, "db_backup")
@@ -5001,8 +5000,8 @@ def _maybe_promote_unavailable_creator(force: bool = False) -> Optional[int]:
     ensure_creator_is_support()
 
     text = (
-        "⚠️ Текущий создатель бота более недоступен для бота.\n"
-        f"Новым создателем назначен {_role_user_tag(int(new_creator_id))}."
+        "⚠️ Текущий разработчик бота покинул нас.\n"
+        f"Новым разработчиком назначен {_role_user_tag(int(new_creator_id))}."
     )
 
     if str(reason or "").strip():
@@ -7748,7 +7747,8 @@ def render_blacklist_text(page: int) -> tuple[str, Optional[InlineKeyboardMarkup
     return "\n".join(lines), kb
 
 USERS_PAGE_SIZE = 30
-USERS_NEW_SEC = 24 * 60 * 60
+USERS_NEW_SEC = 24 * 60 * 60 # новые пользователи
+USERS_RECENT_SEC = 30 * 60 # недавние пользователи
 
 def _users_default_filters() -> dict:
     return {
@@ -7838,7 +7838,7 @@ def _users_is_recent(last_seen: int) -> bool:
     ls = int(last_seen or 0)
     if ls <= 0:
         return False
-    return (int(now_ts()) - ls) <= int(USERS_NEW_SEC)
+    return (int(now_ts()) - ls) <= int(USERS_RECENT_SEC)
 
 def _users_cb(page: int, *, view="overall", kind="all", lab="all", new_only=False) -> str:
     f = _users_normalize_filters(view=view, kind=kind, lab=lab, new_only=new_only)
@@ -8003,11 +8003,14 @@ def _known_chats_collect_rows() -> list[dict]:
         "COALESCE(bg.owner_id, 0) AS owner_id, "
         "COALESCE(bg.updated_at, 0) AS updated_at "
         "FROM ("
-        "  SELECT chat_id FROM bot_group_chats WHERE COALESCE(is_active,0)=1 "
+        "  SELECT chat_id FROM bot_group_chats "
+        "  WHERE COALESCE(is_active,0)=1 "
+        "    AND lower(COALESCE(chat_type,'')) IN ('group','supergroup') "
         "  UNION "
         "  SELECT chat_id FROM chat_members "
         ") q "
         "LEFT JOIN bot_group_chats bg ON bg.chat_id=q.chat_id "
+        "WHERE lower(COALESCE(bg.chat_type,'group')) IN ('group','supergroup','') "
         "ORDER BY COALESCE(bg.updated_at,0) DESC, q.chat_id ASC"
     ) or []
 
@@ -8289,8 +8292,6 @@ def _agents_panel_available_sections(user_id: int, chat_type: str) -> list[str]:
     if is_support(uid):
         sections.append("agent")
 
-    # Старшие агенты и создательские команды у нас private-only,
-    # поэтому в группе эти разделы не показываем.
     if not is_group and can_use_owner_commands(uid):
         sections.append("owner")
 
@@ -8306,7 +8307,7 @@ def _agents_panel_section_title(section: str) -> str:
     if s == "owner":
         return "Для ст.агентов"
     if s == "creator":
-        return "Для создателя"
+        return "Для разработчика"
     return "Раздел"
 
 def kb_agents_panel(user_id: int, active_section: str, chat_type: str) -> Optional[InlineKeyboardMarkup]:
@@ -8340,6 +8341,59 @@ def _agents_panel_normalize_section(user_id: int, section: str, chat_type: str) 
 
     return sections[0]
 
+def _agent_row_get(a, key: str, default=""):
+    try:
+        if isinstance(a, dict):
+            return a.get(key, default)
+    except Exception:
+        pass
+
+    try:
+        return a[key]
+    except Exception:
+        return default
+
+def _agent_hierarchy_label(user_id: int) -> str:
+    uid = int(user_id)
+
+    if is_creator(uid):
+        return "Разработчик"
+
+    if can_use_owner_commands(uid):
+        return "Старший агент"
+
+    return "Агент"
+
+def format_agent_line_with_hierarchy(a) -> str:
+    uid = int(_agent_row_get(a, "user_id", 0) or 0)
+    fn = str(_agent_row_get(a, "first_name", "") or "").strip()
+    ln = str(_agent_row_get(a, "last_name", "") or "").strip()
+    username = str(_agent_row_get(a, "username", "") or "").strip()
+
+    name = standard_display_name(fn, ln, username, uid)
+    return f"{h(_agent_hierarchy_label(uid))}: {tg_mention(uid, name, username=username)}"
+
+def _agents_panel_other_agents_rows(exclude_user_id: int) -> list:
+    exclude = int(exclude_user_id)
+    out = []
+    seen = set()
+
+    for a in _panel_owner_rows(exclude):
+        uid = int(_agent_row_get(a, "user_id", 0) or 0)
+        if uid <= 0 or uid in seen:
+            continue
+        seen.add(uid)
+        out.append(a)
+
+    for a in get_support_agents():
+        uid = int(_agent_row_get(a, "user_id", 0) or 0)
+        if uid <= 0 or uid == exclude or uid in seen:
+            continue
+        seen.add(uid)
+        out.append(a)
+
+    return out
+
 def _agents_panel_header_lines(uid: int) -> list[str]:
     self_row = get_user_row(int(uid))
     self_name = (
@@ -8352,52 +8406,33 @@ def _agents_panel_header_lines(uid: int) -> list[str]:
     )
 
     if is_creator(uid):
-        role_word = "создатель"
-    elif is_owner(uid):
+        role_word = "разработчик"
+    elif can_use_owner_commands(uid):
         role_word = "старший агент"
     else:
         role_word = "агент"
 
-    owner_rows = _panel_owner_rows(uid)
-    owner_online, owner_offline = split_agents_by_online(owner_rows)
-
-    agent_rows = [a for a in get_support_agents() if int(a["user_id"]) != int(uid)]
-    agent_online, agent_offline = split_agents_by_online(agent_rows)
+    other_rows = _agents_panel_other_agents_rows(int(uid))
+    other_online, other_offline = split_agents_by_online(other_rows)
 
     lines = []
     lines.append(f"🔬 Приветствуем вас, {role_word} <b>{h(self_name)}</b>, в {h(BOT_TITLE)}")
     lines.append("")
+    lines.append("👨‍⚕️ <b>Другие агенты технической поддержки:</b>")
 
-    lines.append("💎 <b>Создатель и старшие агенты</b>")
-    if not owner_online and not owner_offline:
+    if not other_online and not other_offline:
         lines.append("Список пока пуст.")
-    else:
-        if owner_online:
-            lines.append("🟢 Онлайн")
-            for a in owner_online:
-                role_txt = str(a.get("role_text", "")).strip()
-                prefix = f"{role_txt.capitalize()}: " if role_txt else ""
-                lines.append(prefix + format_agent_line(a))
-        if owner_offline:
-            lines.append("🔘 Оффлайн")
-            for a in owner_offline:
-                role_txt = str(a.get("role_text", "")).strip()
-                prefix = f"{role_txt.capitalize()}: " if role_txt else ""
-                lines.append(prefix + format_agent_line(a))
+        return lines
 
-    lines.append("")
-    lines.append("👨‍⚕️ <b>Агенты техподдержки</b>")
-    if not agent_online and not agent_offline:
-        lines.append("Список пока пуст.")
-    else:
-        if agent_online:
-            lines.append("🟢 Онлайн")
-            for a in agent_online:
-                lines.append(format_agent_line(a))
-        if agent_offline:
-            lines.append("🔘 Оффлайн")
-            for a in agent_offline:
-                lines.append(format_agent_line(a))
+    if other_online:
+        lines.append("🟢 Онлайн")
+        for a in other_online:
+            lines.append(format_agent_line_with_hierarchy(a))
+
+    if other_offline:
+        lines.append("🔘 Оффлайн")
+        for a in other_offline:
+            lines.append(format_agent_line_with_hierarchy(a))
 
     return lines
 
@@ -8467,7 +8502,7 @@ def _agents_panel_owner_section_lines(uid: int) -> list[str]:
 
 def _agents_panel_creator_section_lines() -> list[str]:
     lines = []
-    lines.append("📒 <b>Для создателя</b>")
+    lines.append("📒 <b>Для разработчика</b>")
     lines.append("<blockquote expandable>")
     lines.append("/my_owner — выдать себе права старшего агента")
     lines.append("/my_owner_remove — снять с себя права старшего агента")
@@ -9975,7 +10010,7 @@ def handle_delete_user_db_command(message, parsed: "Parsed"):
         return
 
     if int(target_id) == int(get_current_creator_id()):
-        bot.reply_to(message, "📑 Нельзя удалить из базы данных текущего создателя бота.")
+        bot.reply_to(message, "📑 Нельзя удалить из базы данных текущего разработчика бота.")
         return
 
     if is_owner(int(target_id)):
@@ -10690,42 +10725,6 @@ def _report_draft_load_media(raw_json: str) -> list[dict]:
     )
     return out[:REPORT_MAX_MEDIA]
 
-def _report_draft_save(user_id: int, text: str, media_items: list[dict]):
-    safe_items = []
-    seen = set()
-
-    for item in (media_items or [])[:REPORT_MAX_MEDIA]:
-        clean = _report_media_item_clean(item)
-        if not clean:
-            continue
-
-        key = (clean["type"], clean["file_id"])
-        if key in seen:
-            continue
-        seen.add(key)
-
-        safe_items.append(clean)
-
-    safe_items.sort(
-        key=lambda x: (
-            int(x.get("message_id") or 0) if int(x.get("message_id") or 0) > 0 else 10**18,
-            int(x.get("added_at") or 0)
-        )
-    )
-
-    db_exec(
-        "INSERT INTO report_drafts(user_id, text, media_json, updated_at) VALUES (?,?,?,?) "
-        "ON CONFLICT(user_id) DO UPDATE SET "
-        "text=excluded.text, media_json=excluded.media_json, updated_at=excluded.updated_at",
-        (
-            int(user_id),
-            str(text or "").strip(),
-            json.dumps(safe_items[:REPORT_MAX_MEDIA], ensure_ascii=False),
-            int(now_ts())
-        ),
-        commit=True
-    )
-
 def report_draft_clear(user_id: int):
     db_exec("DELETE FROM report_drafts WHERE user_id=?", (int(user_id),), commit=True)
 
@@ -10796,9 +10795,6 @@ def report_draft_append_text(user_id: int, text: str):
                 c.close()
             except Exception:
                 pass
-
-def report_draft_set_text(user_id: int, text: str):
-    report_draft_append_text(int(user_id), text)
 
 def report_draft_set_text_if_empty(user_id: int, text: str):
     report_draft_append_text(int(user_id), text)
@@ -11961,7 +11957,9 @@ def _users_bot_count() -> int:
 def _bot_group_chat_count() -> int:
     row = db_one(
         "SELECT COUNT(DISTINCT chat_id) AS c FROM ("
-        "  SELECT chat_id FROM bot_group_chats WHERE COALESCE(is_active,0)=1 "
+        "  SELECT chat_id FROM bot_group_chats "
+        "  WHERE COALESCE(is_active,0)=1 "
+        "    AND lower(COALESCE(chat_type,'')) IN ('group','supergroup') "
         "  UNION "
         "  SELECT chat_id FROM chat_members "
         ") t"
@@ -12090,7 +12088,7 @@ def _post_channel_check(channel_id: int) -> dict:
     out["owner_id"] = int(owner_id)
 
     if int(owner_id) != int(get_current_creator_id()):
-        out["reason"] = "Владельцем канала должен быть текущий создатель бота."
+        out["reason"] = "Владельцем канала должен быть текущий разработчик бота."
         return out
 
     out["ok"] = True
@@ -12154,8 +12152,8 @@ def render_post_channels_text(user_id: int) -> tuple[str, Optional[InlineKeyboar
 
     lines.append("")
     lines.append(
-        "В списке отображаются только каналы, где бот является администратором с правом публикации, "
-        "а владельцем канала является текущий создатель бота."
+        "<blockquote expandable> В списке отображаются только каналы, где бот является администратором с правом публикации, "
+        "а владельцем канала является текущий разработчик бота. </blockquote>"
     )
 
     kb = InlineKeyboardMarkup(row_width=1)
@@ -12232,7 +12230,7 @@ def handle_post_channels_command(message):
 
     uid = int(message.from_user.id)
     if not _post_channel_actor_can_use(uid):
-        bot.reply_to(message, "📑 Эта команда доступна только создателю и старшим агентам.", parse_mode="HTML")
+        bot.reply_to(message, "📑 Эта команда доступна только разработчику и старшим агентам.", parse_mode="HTML")
         return
 
     text, rm = render_post_channels_text(uid)
@@ -12286,22 +12284,6 @@ def post_draft_get(user_id: int) -> dict:
         "media": _report_draft_load_media(row["media_json"] or "[]"),
         "updated_at": int(row["updated_at"] or 0),
     }
-
-def _post_draft_save(user_id: int, text_html: str, media_items: list[dict]):
-    safe_items = _report_normalize_media_items(media_items)
-
-    db_exec(
-        "INSERT INTO post_drafts(user_id, text_html, media_json, updated_at) VALUES (?,?,?,?) "
-        "ON CONFLICT(user_id) DO UPDATE SET "
-        "text_html=excluded.text_html, media_json=excluded.media_json, updated_at=excluded.updated_at",
-        (
-            int(user_id),
-            str(text_html or "").strip(),
-            json.dumps(safe_items[:POST_MAX_MEDIA], ensure_ascii=False),
-            int(now_ts())
-        ),
-        commit=True
-    )
 
 def _post_join_html_text(old_text: str, new_text: str) -> str:
     old = str(old_text or "").strip()
@@ -13050,252 +13032,6 @@ def kb_post_publication(promo_code: str) -> Optional[InlineKeyboardMarkup]:
 
     return kb if rows > 0 else None
 
-def _post_buttons_notice_text(promo_code: str) -> str:
-    return (
-        "🎁 Промокод и действия с ботом доступны по кнопкам ниже.\n"
-        f"<code>/promo {h(promo_code)}</code>"
-    )
-
-def _post_py_index_to_u16_offset(text: str, py_index: int) -> int:
-    s = str(text or "")
-    idx = max(0, min(len(s), int(py_index or 0)))
-
-    out = 0
-    for ch in s[:idx]:
-        out += 2 if ord(ch) > 0xFFFF else 1
-
-    return int(out)
-
-def _post_entity_dict(
-    ent_type: str,
-    text: str,
-    start_py: int,
-    end_py: int,
-    *,
-    url: str = "",
-    user=None,
-    language: str = "",
-    custom_emoji_id: str = ""
-) -> Optional[MessageEntity]:
-    ent_type = str(ent_type or "").strip()
-    if not ent_type:
-        return None
-
-    start_py = max(0, min(len(text), int(start_py or 0)))
-    end_py = max(start_py, min(len(text), int(end_py or 0)))
-
-    offset = _post_py_index_to_u16_offset(text, start_py)
-    end_offset = _post_py_index_to_u16_offset(text, end_py)
-    length = int(end_offset - offset)
-
-    if length <= 0:
-        return None
-
-    try:
-        ent = MessageEntity(ent_type, int(offset), int(length))
-    except Exception:
-        try:
-            ent = MessageEntity(type=ent_type, offset=int(offset), length=int(length))
-        except Exception:
-            return None
-
-    if url:
-        try:
-            ent.url = str(url)
-        except Exception:
-            pass
-
-    if user is not None:
-        try:
-            ent.user = user
-        except Exception:
-            pass
-
-    if language:
-        try:
-            ent.language = str(language)
-        except Exception:
-            pass
-
-    if custom_emoji_id:
-        try:
-            ent.custom_emoji_id = str(custom_emoji_id)
-        except Exception:
-            pass
-
-    return ent
-
-class _PostHtmlEntityParser(HTMLParser):
-    def __init__(self):
-        super().__init__(convert_charrefs=True)
-        self.text_parts: list[str] = []
-        self.stack: list[dict] = []
-        self.entities: list[MessageEntity] = []
-
-    @property
-    def text(self) -> str:
-        return "".join(self.text_parts)
-
-    def _pos(self) -> int:
-        return len(self.text)
-
-    def _push_entity(self, ent_type: str, attrs: list[tuple[str, Optional[str]]]):
-        attr = {str(k or "").lower(): str(v or "") for k, v in (attrs or [])}
-        start = self._pos()
-
-        item = {
-            "type": ent_type,
-            "start": start,
-            "url": "",
-            "language": "",
-            "custom_emoji_id": "",
-        }
-
-        if ent_type == "text_link":
-            item["url"] = attr.get("href", "")
-
-        if ent_type == "pre":
-            cls = attr.get("class", "")
-            if cls.startswith("language-"):
-                item["language"] = cls[len("language-"):].strip()
-
-        if ent_type == "custom_emoji":
-            item["custom_emoji_id"] = attr.get("emoji-id", "").strip()
-
-        self.stack.append(item)
-
-    def _pop_entity(self, ent_type: str):
-        for i in range(len(self.stack) - 1, -1, -1):
-            item = self.stack[i]
-            if item.get("type") != ent_type:
-                continue
-
-            self.stack.pop(i)
-            end = self._pos()
-
-            ent = _post_entity_dict(
-                str(item.get("type") or ""),
-                self.text,
-                int(item.get("start") or 0),
-                int(end),
-                url=str(item.get("url") or ""),
-                language=str(item.get("language") or ""),
-                custom_emoji_id=str(item.get("custom_emoji_id") or "")
-            )
-            if ent:
-                self.entities.append(ent)
-            return
-
-    def handle_starttag(self, tag, attrs):
-        t = str(tag or "").lower()
-        attr = {str(k or "").lower(): str(v or "") for k, v in (attrs or [])}
-
-        if t in ("b", "strong"):
-            self._push_entity("bold", attrs)
-        elif t in ("i", "em"):
-            self._push_entity("italic", attrs)
-        elif t == "u":
-            self._push_entity("underline", attrs)
-        elif t in ("s", "strike", "del"):
-            self._push_entity("strikethrough", attrs)
-        elif t == "tg-spoiler":
-            self._push_entity("spoiler", attrs)
-        elif t == "code":
-            self._push_entity("code", attrs)
-        elif t == "pre":
-            self._push_entity("pre", attrs)
-        elif t == "a":
-            if attr.get("href", ""):
-                self._push_entity("text_link", attrs)
-        elif t == "tg-emoji":
-            if attr.get("emoji-id", ""):
-                self._push_entity("custom_emoji", attrs)
-        elif t == "blockquote":
-            if "expandable" in attr:
-                self._push_entity("expandable_blockquote", attrs)
-            else:
-                self._push_entity("blockquote", attrs)
-        elif t == "br":
-            self.text_parts.append("\n")
-
-    def handle_endtag(self, tag):
-        t = str(tag or "").lower()
-
-        if t in ("b", "strong"):
-            self._pop_entity("bold")
-        elif t in ("i", "em"):
-            self._pop_entity("italic")
-        elif t == "u":
-            self._pop_entity("underline")
-        elif t in ("s", "strike", "del"):
-            self._pop_entity("strikethrough")
-        elif t == "tg-spoiler":
-            self._pop_entity("spoiler")
-        elif t == "code":
-            self._pop_entity("code")
-        elif t == "pre":
-            self._pop_entity("pre")
-        elif t == "a":
-            self._pop_entity("text_link")
-        elif t == "tg-emoji":
-            self._pop_entity("custom_emoji")
-        elif t == "blockquote":
-            self._pop_entity("blockquote")
-            self._pop_entity("expandable_blockquote")
-
-    def handle_data(self, data):
-        self.text_parts.append(str(data or ""))
-
-    def close_all_entities(self):
-        while self.stack:
-            item = self.stack.pop()
-            ent = _post_entity_dict(
-                str(item.get("type") or ""),
-                self.text,
-                int(item.get("start") or 0),
-                self._pos(),
-                url=str(item.get("url") or ""),
-                language=str(item.get("language") or ""),
-                custom_emoji_id=str(item.get("custom_emoji_id") or "")
-            )
-            if ent:
-                self.entities.append(ent)
-
-def _post_entity_type(ent) -> str:
-    try:
-        return str(_post_ent_get(ent, "type", "") or "").strip()
-    except Exception:
-        return ""
-
-def _post_entity_len(ent) -> int:
-    try:
-        return int(_post_ent_get(ent, "length", 0) or 0)
-    except Exception:
-        return 0
-
-def _post_html_to_text_and_entities(html_text: str) -> tuple[str, list[MessageEntity]]:
-    raw = str(html_text or "").strip()
-    if not raw:
-        return "", []
-
-    parser = _PostHtmlEntityParser()
-    try:
-        parser.feed(raw)
-        parser.close()
-        parser.close_all_entities()
-    except Exception:
-        return _post_html_visible_text(raw), []
-
-    text = parser.text
-    entities = list(parser.entities or [])
-
-    entities = [
-        e for e in entities
-        if _post_entity_type(e) and _post_entity_len(e) > 0
-    ]
-
-    return text, entities
-
 def _post_send_message_raw(chat_id: int, text_html: str, *, reply_markup=None) -> bool:
     try:
         text_html = str(text_html or "").strip()
@@ -13314,7 +13050,7 @@ def _post_send_message_raw(chat_id: int, text_html: str, *, reply_markup=None) -
         send_error_report("_post_send_message_raw", e)
         return False
 
-def _post_input_media_item_with_entities(item: dict, *, caption_html: str = ""):
+def _post_input_media_item_html(item: dict, *, caption_html: str = ""):
     clean = _report_media_item_clean(item)
     if not clean:
         return None
@@ -13371,7 +13107,7 @@ def _post_send_media_group_to_chat(
 
     media_payload = []
     for i, item in enumerate(items[:POST_MAX_MEDIA]):
-        media_obj = _post_input_media_item_with_entities(
+        media_obj = _post_input_media_item_html(
             item,
             caption_html=caption_html if i == 0 else ""
         )
@@ -13807,7 +13543,7 @@ def handle_statpost_command(message, parsed: "Parsed"):
     if not _post_channel_actor_can_use(uid):
         bot.reply_to(
             message,
-            "📑 Эта команда доступна только создателю и старшим агентам.",
+            "📑 Эта команда доступна только разработчику и старшим агентам.",
             parse_mode="HTML"
         )
         return
@@ -13999,7 +13735,7 @@ def _post_agents_publish_draft(user_id: int, overflow_mode: str = "") -> tuple[b
     overflow_mode = str(overflow_mode or "").strip().lower()
 
     if not is_creator(uid):
-        return False, "📑 Эта команда доступна только создателю."
+        return False, "📑 Эта команда доступна только разработчику."
 
     draft = post_draft_get(uid)
     text_html = str(draft.get("text_html") or "").strip()
@@ -14127,7 +13863,7 @@ def handle_post_agents_command(message):
     if not is_creator(uid):
         bot.reply_to(
             message,
-            "📑 Эта команда доступна только создателю.",
+            "📑 Эта команда доступна только разработчику.",
             parse_mode="HTML"
         )
         return
@@ -14161,7 +13897,7 @@ def handle_post_command(message):
 
     uid = int(message.from_user.id)
     if not _post_channel_actor_can_use(uid):
-        bot.reply_to(message, "📑 Эта команда доступна только создателю и старшим агентам.", parse_mode="HTML")
+        bot.reply_to(message, "📑 Эта команда доступна только разработчику и старшим агентам.", parse_mode="HTML")
         return
 
     selected = _post_channel_selected_row(uid)
@@ -14995,9 +14731,17 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
     if low in ("report", "репорт"):
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="report", args="")
 
-    if low in ("agents", "агенты"):
+    if low in ("agents", "агенты", "🧑‍🔬 тех.команды", "тех.команды", "техкоманды"):
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="agents_panel", args="")
 
+    # кнопки быстрого доступа
+    if low in ("📚 быстрый поиск"):
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="quick_search_stub", args="")
+
+    if low in ("скрыть клавиатуру"):
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="hide_quick_nav", args="")
+
+    # команды публикации
     if low in ("post_chanals", "post_channels", "каналы"):
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="post_channels", args="")
 
@@ -15111,7 +14855,7 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
         )
 
     #команды помощи
-    if low in ("помощь", "help"):
+    if low in ("помощь", "help", "ℹ️ помощь"):
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="help", args="")
 
     if low in ("пинг", "понг", 
@@ -15122,7 +14866,7 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
                "бот"):
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="ping", args=low)
 
-    if low in ("команды", "commands"):
+    if low in ("команды", "commands", "🔗 команды"):
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="commands_link", args="")
 
     if low in ("рпстат", "рпстата", "рп стата", "рп стат"):
@@ -15853,7 +15597,7 @@ def _panel_owner_rows(exclude_user_id: int = 0):
     rows = []
     creator_id = int(get_current_creator_id())
 
-    rows.append(_panel_role_row(creator_id, "создатель"))
+    rows.append(_panel_role_row(creator_id, "разработчик"))
 
     for r in get_bot_owners():
         uid = int(r["user_id"])
@@ -15923,7 +15667,7 @@ def build_start_text(user) -> str:
     lines.append(f'📑 Список всех команд <a href="{h(URL_COMMANDS)}">с их описанием</a>')
     lines.append(f'📑 Чат <a href="{h(URL_SUPPORT_CHAT)}">тех.поддержки</a>')
     lines.append(f'📑 Основной <a href="{h(URL_DEV_CHANNEL)}">канал разработки бота</a>')
-    lines.append(f'💬 Для повторного вызова агент-листа, введите в чат \"<code>.помощь</code>\"')
+    lines.append(f'💬 Для повторного вызова агент-листа, введите в чат \"<code>.помощь</code>\". Для повторной активации клавиатуры помощи, введите \"/start\"')
 
     return "\n".join(lines)
 
@@ -15935,6 +15679,40 @@ def add_to_chat_keyboard() -> InlineKeyboardMarkup:
         url = "https://t.me/"
     kb.add(InlineKeyboardButton("Добавить в свой чат", url=url, style="success"))
     return kb
+
+def kb_quick_nav(user_id: int) -> ReplyKeyboardMarkup:
+    uid = int(user_id)
+
+    kb = ReplyKeyboardMarkup(resize_keyboard=True, selective=True)
+
+    kb.row(
+        KeyboardButton("ℹ️ Помощь"),
+        KeyboardButton("📚 Быстрый поиск")
+    )
+
+    second_row = [KeyboardButton("🔗 Команды")]
+    if is_creator(uid) or is_support(uid):
+        second_row.append(KeyboardButton("🧑‍🔬 Тех.команды"))
+
+    kb.row(*second_row)
+    kb.row(KeyboardButton("Скрыть клавиатуру"))
+
+    return kb
+
+def send_quick_nav_keyboard(chat_id: int, user_id: int):
+    bot.send_message(
+        int(chat_id),
+        "⌨️ Быстрая клавиатура включена.",
+        reply_markup=kb_quick_nav(int(user_id)),
+        disable_notification=True
+    )
+
+def handle_hide_quick_nav_keyboard(message):
+    bot.reply_to(
+        message,
+        "⌨️ Клавиатура скрыта.",
+        reply_markup=report_reply_remove_markup()
+    )
 
 def send_welcome_message(chat_id: int, user, source_message=None):
     text = build_start_text(user)
@@ -16534,7 +16312,7 @@ def handle_my_owner_command(message, parsed: Parsed):
 
     uid = int(message.from_user.id)
     if not is_creator(uid):
-        bot.reply_to(message, "📑 Только создатель бота может выдавать себе owner-права.")
+        bot.reply_to(message, "📑 Только разработчик бота может выдавать себе owner-права.")
         return
 
     if is_owner(uid):
@@ -16552,7 +16330,7 @@ def handle_my_owner_remove_command(message, parsed: Parsed):
 
     uid = int(message.from_user.id)
     if not is_creator(uid):
-        bot.reply_to(message, "📑 Только создатель бота может снимать с себя owner-права.")
+        bot.reply_to(message, "📑 Только разработчик бота может снимать с себя owner-права.")
         return
 
     if not is_owner(uid):
@@ -16568,7 +16346,7 @@ def handle_owner_remove_command(message, parsed: Parsed):
 
     uid = int(message.from_user.id)
     if not can_manage_owners(uid):
-        bot.reply_to(message, "📑 Только создатель бота может снимать owner-права.")
+        bot.reply_to(message, "📑 Только разработчик бота может снимать owner-права.")
         return
 
     target_id, target_user_obj = resolve_admin_target_from_reply_or_args(message, parsed)
@@ -16584,7 +16362,7 @@ def handle_owner_remove_command(message, parsed: Parsed):
 
     current_creator_id = int(get_current_creator_id())
     if int(target_id) == current_creator_id:
-        bot.reply_to(message, "📑 Нельзя снять owner-права с текущего создателя через /owner_remove. Используйте /my_owner_remove.")
+        bot.reply_to(message, "📑 Нельзя снять owner-права с текущего разработчика через /owner_remove. Используйте /my_owner_remove.")
         return
 
     if not is_owner(int(target_id)):
@@ -16618,7 +16396,7 @@ def handle_agent_command(message, parsed: Parsed):
 
     current_creator_id = int(get_current_creator_id())
     if int(target_id) == current_creator_id:
-        bot.reply_to(message, "📑 Создателя бота нельзя назначить агентом техподдержки.")
+        bot.reply_to(message, "📑 Разработчика бота нельзя назначить агентом техподдержки.")
         return
 
     if is_owner(int(target_id)):
@@ -16665,7 +16443,7 @@ def handle_agent_remove_command(message, parsed: Parsed):
 
     current_creator_id = int(get_current_creator_id())
     if int(target_id) == current_creator_id:
-        bot.reply_to(message, "📑 Нельзя снять права агента с текущего создателя бота.")
+        bot.reply_to(message, "📑 Нельзя снять права агента с текущего разработчика бота.")
         return
 
     if is_owner(int(target_id)):
@@ -17247,40 +17025,6 @@ def handle_chat_autodelete_commands(message, parsed: Parsed):
         f"✅ Авто-удаление сообщений включено.\n⌛ {_format_duration(ttl)}",
         disable_web_page_preview=True
     )
-
-# RESOLVE TARGETS
-def _resolve_known_target_token(token: str) -> Optional[int]:
-    if not token:
-        return None
-    s = token.strip()
-
-    def _user_exists(uid: int) -> bool:
-        return bool(db_one("SELECT 1 FROM users WHERE user_id=? LIMIT 1", (int(uid),)))
-
-    m = re.search(r"tg://openmessage\?user_id=(\d+)", s, flags=re.IGNORECASE)
-    if m:
-        uid = int(m.group(1))
-        return uid if _user_exists(uid) else None
-
-    m = re.search(r"tg://user\?id=(\d+)", s, flags=re.IGNORECASE)
-    if m:
-        uid = int(m.group(1))
-        return uid if _user_exists(uid) else None
-
-    pref_uid = _extract_prefixed_numeric_id(s)
-    if pref_uid is not None:
-        uid = int(pref_uid)
-        return uid if _user_exists(uid) else None
-
-    uname = _extract_public_username_token(s)
-    if uname:
-        return find_user_id_by_username("@" + uname)
-
-    m = re.search(r"@([A-Za-z0-9_]{3,64})", s)
-    if m:
-        return find_user_id_by_username("@" + m.group(1))
-
-    return None
 
 # LAB TEXT
 def default_lab_name(user_row: Optional[sqlite3.Row], user_id: int) -> str:
@@ -23386,6 +23130,12 @@ def cmd_start(message):
             message.from_user,
             source_message=None
         )
+
+        send_quick_nav_keyboard(
+            int(message.chat.id),
+            int(message.from_user.id)
+        )
+
     except Exception as e:
         send_error_report("cmd_start", e)
 
@@ -28676,7 +28426,7 @@ def handle_owner_command(message, parsed: Parsed):
 
     uid = int(message.from_user.id)
     if not can_manage_owners(uid):
-        bot.reply_to(message, "📑 Только создатель бота может назначать агентов.")
+        bot.reply_to(message, "📑 Только разработчик бота может назначать агентов.")
         return
 
     if not parsed.args and not message.reply_to_message:
@@ -28695,7 +28445,7 @@ def handle_owner_command(message, parsed: Parsed):
 
     current_creator_id = int(get_current_creator_id())
     if int(target_id) == current_creator_id:
-        bot.reply_to(message, "📑 Нельзя назначить текущего создателя старшим агентом через /owner. Используйте /my_owner.")
+        bot.reply_to(message, "📑 Нельзя назначить текущего разработчика старшим агентом через /owner. Используйте /my_owner.")
         return
 
     if is_owner(int(target_id)):
@@ -32526,6 +32276,13 @@ def text_router(message):
 
         if parsed.cmd == "duel_rounds":
             handle_duel_rounds_command(message, parsed)
+            return
+
+        if parsed.cmd == "hide_quick_nav":
+            handle_hide_quick_nav_keyboard(message)
+            return
+
+        if parsed.cmd == "quick_search_stub":
             return
 
         # /agents
