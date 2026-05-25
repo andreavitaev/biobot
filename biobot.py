@@ -91,7 +91,7 @@ INLINE_THUMB_DUEL_URL = "https://raw.githubusercontent.com/andreavitaev/biobot/i
 # запасной вариант
 INLINE_THUMB_DEFAULT_URL = "https://raw.githubusercontent.com/andreavitaev/boss-rush-assets/main/thumb_1.jpg"
 
-ONLINE_TTL_SECONDS = 300  # 5 минут онлайн по последней активности с ботом
+ONLINE_TTL_SECONDS = 60  # онлайн по последней активности с ботом
 
 # PATHS / DB
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -3246,6 +3246,31 @@ def init_db():
     """, commit=True)
 
     db_exec("""
+    CREATE TABLE IF NOT EXISTS agent_status_prefs (
+        user_id      INTEGER PRIMARY KEY,
+        status_code  TEXT NOT NULL DEFAULT '',
+        updated_at   INTEGER NOT NULL DEFAULT 0
+    );
+    """, commit=True)
+
+    db_exec("""
+    CREATE TABLE IF NOT EXISTS user_activity_seen (
+        user_id              INTEGER PRIMARY KEY,
+        last_activity_ts      INTEGER NOT NULL DEFAULT 0,
+        last_message_ts       INTEGER NOT NULL DEFAULT 0,
+        last_private_msg_ts   INTEGER NOT NULL DEFAULT 0,
+        last_group_msg_ts     INTEGER NOT NULL DEFAULT 0,
+        last_callback_ts      INTEGER NOT NULL DEFAULT 0,
+        last_inline_ts        INTEGER NOT NULL DEFAULT 0,
+        last_member_event_ts  INTEGER NOT NULL DEFAULT 0,
+        last_admin_seen_ts    INTEGER NOT NULL DEFAULT 0,
+        last_chat_id          INTEGER NOT NULL DEFAULT 0,
+        last_source           TEXT NOT NULL DEFAULT '',
+        updated_at            INTEGER NOT NULL DEFAULT 0
+    );
+    """, commit=True)
+
+    db_exec("""
     CREATE TABLE IF NOT EXISTS bot_creator (
         slot_id              INTEGER PRIMARY KEY CHECK(slot_id=1),
         user_id              INTEGER NOT NULL,
@@ -4718,8 +4743,10 @@ def _restore_deleted_lab(user_id: int, *, support_mode: bool = False) -> tuple[b
         send_error_report("_restore_deleted_lab", e)
         return False, "📑 Не удалось восстановить Лабораторию."
 
-def upsert_user(tg_user):
+def upsert_user(tg_user, *, touch_seen: bool = True):
     now = int(now_ts())
+    touch = 1 if bool(touch_seen) else 0
+
     db_exec("""
         INSERT INTO users(
             user_id, username, first_name, last_name, first_seen, first_seen_verified, last_seen,
@@ -4730,7 +4757,10 @@ def upsert_user(tg_user):
             username=excluded.username,
             first_name=excluded.first_name,
             last_name=excluded.last_name,
-            last_seen=excluded.last_seen,
+            last_seen=CASE
+                WHEN ?=1 THEN excluded.last_seen
+                ELSE users.last_seen
+            END,
             is_placeholder=0,
             is_bot=CASE
                 WHEN COALESCE(users.bot_status_locked,0)=1 THEN users.is_bot
@@ -4738,14 +4768,15 @@ def upsert_user(tg_user):
             END
     """, (
         int(tg_user.id),
-        (tg_user.username or "").lower() if tg_user.username else None,
-        tg_user.first_name,
-        tg_user.last_name,
+        (tg_user.username or "").lower() if getattr(tg_user, "username", None) else None,
+        getattr(tg_user, "first_name", None),
+        getattr(tg_user, "last_name", None),
         now,
         1,
-        now,
+        now if touch else 0,
         0,
-        1 if bool(getattr(tg_user, "is_bot", False)) else 0
+        1 if bool(getattr(tg_user, "is_bot", False)) else 0,
+        touch
     ), commit=True)
 
 def get_current_creator_id() -> int:
@@ -8133,7 +8164,8 @@ def _users_collect_rows(filters: Optional[dict] = None) -> list[dict]:
         is_bot = int(r["is_bot"] or 0)
         lab_active = int(r["lab_active"] or 0)
         is_new = _users_is_new(int(r["first_seen"] or 0), int(r["first_seen_verified"] or 0))
-        is_recent = _users_is_recent(int(r["last_seen"] or 0))
+        safe_seen = activity_last_seen_ts(int(r["user_id"]), fallback=int(r["last_seen"] or 0))
+        is_recent = _users_is_recent(int(safe_seen or 0))
 
         if f["kind"] == "bots" and is_bot != 1:
             continue
@@ -8377,14 +8409,67 @@ def _agent_hierarchy_label(user_id: int) -> str:
 
     return "Агент"
 
-def format_agent_line_with_hierarchy(a) -> str:
+def _agent_bold_mention(user_id: int, name: str, username: str = "") -> str:
+    uid = int(user_id)
+
+    un = _normalize_username_for_link(username or "")
+    if not un:
+        try:
+            row = db_one("SELECT username FROM users WHERE user_id=? LIMIT 1", (uid,))
+            if row:
+                un = _normalize_username_for_link((row["username"] or ""))
+        except Exception:
+            un = ""
+
+    if un:
+        href = f"https://t.me/{un}"
+    else:
+        href = f"tg://openmessage?user_id={uid}"
+
+    return f'<a href="{href}"><b>{h(name)}</b></a>'
+
+def format_agent_line_with_status(a) -> str:
     uid = int(_agent_row_get(a, "user_id", 0) or 0)
     fn = str(_agent_row_get(a, "first_name", "") or "").strip()
     ln = str(_agent_row_get(a, "last_name", "") or "").strip()
     username = str(_agent_row_get(a, "username", "") or "").strip()
+    last_seen = int(_agent_row_get(a, "last_seen", 0) or 0)
 
     name = standard_display_name(fn, ln, username, uid)
-    return f"{h(_agent_hierarchy_label(uid))}: {tg_mention(uid, name, username=username)}"
+    tag = _agent_bold_mention(uid, name, username=username)
+    status = agent_status_list_label(uid, last_seen)
+    role = _agent_hierarchy_label(uid)
+
+    return f"{h(role)} {tag} ({h(status)})"
+
+def _agents_sort_rows_by_status(rows: list) -> tuple[list, list]:
+    primary = []
+    secondary = []
+
+    for a in rows or []:
+        uid = int(_agent_row_get(a, "user_id", 0) or 0)
+        last_seen = int(_agent_row_get(a, "last_seen", 0) or 0)
+        code = agent_status_list_code(uid, last_seen)
+
+        if code in (AGENT_STATUS_ONLINE, AGENT_STATUS_OFFLINE):
+            primary.append(a)
+        else:
+            secondary.append(a)
+
+    primary.sort(
+        key=lambda a: agent_status_sort_key(
+            int(_agent_row_get(a, "user_id", 0) or 0),
+            int(_agent_row_get(a, "last_seen", 0) or 0)
+        )
+    )
+    secondary.sort(
+        key=lambda a: agent_status_sort_key(
+            int(_agent_row_get(a, "user_id", 0) or 0),
+            int(_agent_row_get(a, "last_seen", 0) or 0)
+        )
+    )
+
+    return primary, secondary
 
 def _agents_panel_other_agents_rows(exclude_user_id: int) -> list:
     exclude = int(exclude_user_id)
@@ -8426,26 +8511,29 @@ def _agents_panel_header_lines(uid: int) -> list[str]:
         role_word = "агент"
 
     other_rows = _agents_panel_other_agents_rows(int(uid))
-    other_online, other_offline = split_agents_by_online(other_rows)
+    primary_rows, secondary_rows = _agents_sort_rows_by_status(other_rows)
 
     lines = []
     lines.append(f"🔬 Приветствуем вас, {role_word} <b>{h(self_name)}</b>, в {h(BOT_TITLE)}")
     lines.append("")
     lines.append("👨‍⚕️ <b>Другие агенты технической поддержки:</b>")
 
-    if not other_online and not other_offline:
+    if not primary_rows and not secondary_rows:
         lines.append("Список пока пуст.")
         return lines
 
-    if other_online:
-        lines.append("🟢 Онлайн")
-        for a in other_online:
-            lines.append(format_agent_line_with_hierarchy(a))
+    lines.append("<blockquote expandable>")
 
-    if other_offline:
-        lines.append("🔘 Оффлайн")
-        for a in other_offline:
-            lines.append(format_agent_line_with_hierarchy(a))
+    for a in primary_rows:
+        lines.append(format_agent_line_with_status(a))
+
+    if primary_rows and secondary_rows:
+        lines.append("")
+
+    for a in secondary_rows:
+        lines.append(format_agent_line_with_status(a))
+
+    lines.append("</blockquote>")
 
     return lines
 
@@ -8479,6 +8567,12 @@ def _agents_panel_owner_section_lines(uid: int) -> list[str]:
     lines.append("/agent_remove — снять права агента техподдержки")
     lines.append("/its + {ссылка} + {<code>бот</code>|<code>юзер</code>} — ручное редактирование списка")
     lines.append("")
+    lines.append("💾 Data Base")
+    lines.append("/db_fife_stat — параметры базы данных")
+    lines.append("/db_fife_msg + {период} — автосэйв таймер")
+    lines.append("/db_fife — файл базы данных")
+    lines.append("/db_fife_upd — обновить базу данных")
+    lines.append("")
     lines.append("⚔️ Дуэль")
     lines.append("/duel_cof_break — изменить 🪃")
     lines.append("/duel_cof_break_bon — изменить 🪃 бонус")
@@ -8491,12 +8585,6 @@ def _agents_panel_owner_section_lines(uid: int) -> list[str]:
     lines.append("/edit_k — изменить k")
     lines.append("/edit_b — изменить β")
     lines.append("/cof_inf_stats — информация по переменным заражения")
-    lines.append("")
-    lines.append("💾 Data Base")
-    lines.append("/db_fife_stat — параметры базы данных")
-    lines.append("/db_fife_msg + {период} — автосэйв таймер")
-    lines.append("/db_fife — файл базы данных")
-    lines.append("/db_fife_upd — обновить базу данных")
     lines.append("")
     lines.append("🎁 Промокоды")
     lines.append("/promocode_generate — генерация случайного временного промокода")
@@ -8513,6 +8601,22 @@ def _agents_panel_owner_section_lines(uid: int) -> list[str]:
     lines.append("</blockquote>")
     return lines
 
+def render_creator_post_config_section() -> list[str]:
+    selected = _post_channel_selected_row(int(get_current_creator_id()))
+
+    lines = []
+    lines.append("📰 Настройка постов")
+
+    if selected:
+        lines.append(f"Текущий канал: «<b>{h(selected['title'])}</b>»")
+        lines.append("/post_chanals — выбрать другой канал для публикаций")
+    else:
+        lines.append("Канал для публикаций: не выбран")
+        lines.append("/post_chanals — выбрать канал для публикаций")
+
+    lines.append("")
+    return lines
+
 def _agents_panel_creator_section_lines() -> list[str]:
     lines = []
     lines.append("📒 <b>Для разработчика</b>")
@@ -8522,6 +8626,9 @@ def _agents_panel_creator_section_lines() -> list[str]:
     lines.append("/owner — назначить старшего агента")
     lines.append("/owner_remove — снять права старшего агента")
     lines.append("/post_agents — сообщение всем агентам техподдержки")
+    lines.append("")
+
+    lines.extend(render_creator_post_config_section())
     lines.append("</blockquote>")
     return lines
 
@@ -10553,6 +10660,226 @@ def corp_notice_manager_ids(corp_id: int) -> list[int]:
             out.append(int(uid))
     return out
 
+# AGENT STATUS
+AGENT_STATUS_AUTO = ""
+AGENT_STATUS_ONLINE = "online"
+AGENT_STATUS_BUSY = "busy"
+AGENT_STATUS_HIDDEN = "hidden"
+AGENT_STATUS_INACTIVE = "inactive"
+AGENT_STATUS_OFFLINE = "offline"
+
+AGENT_STATUS_CODES = {
+    AGENT_STATUS_ONLINE,
+    AGENT_STATUS_BUSY,
+    AGENT_STATUS_HIDDEN,
+    AGENT_STATUS_INACTIVE,
+    AGENT_STATUS_OFFLINE,
+}
+
+AGENT_STATUS_SETTINGS = {
+    AGENT_STATUS_AUTO: ("🟢/🔘", "Авто"),
+    AGENT_STATUS_ONLINE: ("🟢", "В сети"),
+    AGENT_STATUS_BUSY: ("🟡", "Занят"),
+    AGENT_STATUS_HIDDEN: ("⚪", "Скрыт"),
+    AGENT_STATUS_INACTIVE: ("🔴", "Не активен"),
+    AGENT_STATUS_OFFLINE: ("🔘", "Не в сети"),
+}
+
+AGENT_STATUS_LIST = {
+    AGENT_STATUS_ONLINE: ("🟢", "Онлайн"),
+    AGENT_STATUS_BUSY: ("🟡", "Занят"),
+    AGENT_STATUS_HIDDEN: ("⚪", "Скрыт"),
+    AGENT_STATUS_INACTIVE: ("🔴", "Не на месте"),
+    AGENT_STATUS_OFFLINE: ("🔘", "Офлайн"),
+}
+
+def _agent_status_actor_can_use(user_id: int) -> bool:
+    uid = int(user_id)
+    return bool(is_creator(uid) or is_support(uid))
+
+def agent_status_get(user_id: int) -> str:
+    row = db_one(
+        "SELECT status_code FROM agent_status_prefs WHERE user_id=? LIMIT 1",
+        (int(user_id),)
+    )
+    if not row:
+        return AGENT_STATUS_AUTO
+
+    code = str(row["status_code"] or "").strip().lower()
+    return code if code in AGENT_STATUS_CODES else AGENT_STATUS_AUTO
+
+def agent_status_set(user_id: int, status_code: str):
+    code = str(status_code or "").strip().lower()
+
+    if code not in AGENT_STATUS_CODES:
+        agent_status_clear(int(user_id))
+        return
+
+    db_exec(
+        "INSERT INTO agent_status_prefs(user_id, status_code, updated_at) VALUES (?,?,?) "
+        "ON CONFLICT(user_id) DO UPDATE SET "
+        "status_code=excluded.status_code, updated_at=excluded.updated_at",
+        (int(user_id), code, int(now_ts())),
+        commit=True
+    )
+
+def agent_status_clear(user_id: int):
+    db_exec(
+        "DELETE FROM agent_status_prefs WHERE user_id=?",
+        (int(user_id),),
+        commit=True
+    )
+
+def agent_status_settings_label(user_id: int) -> str:
+    code = agent_status_get(int(user_id))
+    emo, name = AGENT_STATUS_SETTINGS.get(code, AGENT_STATUS_SETTINGS[AGENT_STATUS_AUTO])
+    return f"{emo} {name}"
+
+def agent_status_button_label(user_id: int) -> str:
+    code = agent_status_get(int(user_id))
+    if not code:
+        return "Статус"
+    emo, _name = AGENT_STATUS_SETTINGS.get(code, AGENT_STATUS_SETTINGS[AGENT_STATUS_AUTO])
+    return f"Статус {emo}"
+
+def _agent_auto_is_online(user_id: int, last_seen: int = 0) -> bool:
+    ls = activity_last_seen_ts(int(user_id), fallback=int(last_seen or 0))
+    if ls <= 0:
+        return False
+
+    return ls >= int(now_ts()) - int(ONLINE_TTL_SECONDS)
+
+def agent_status_list_code(user_id: int, last_seen: int = 0) -> str:
+    uid = int(user_id)
+    code = agent_status_get(uid)
+
+    if code == AGENT_STATUS_AUTO:
+        return AGENT_STATUS_ONLINE if _agent_auto_is_online(uid, int(last_seen or 0)) else AGENT_STATUS_OFFLINE
+
+    return code
+
+def agent_status_list_label(user_id: int, last_seen: int = 0) -> str:
+    code = agent_status_list_code(int(user_id), int(last_seen or 0))
+    emo, name = AGENT_STATUS_LIST.get(code, AGENT_STATUS_LIST[AGENT_STATUS_OFFLINE])
+    return f"{emo} {name}"
+
+def agent_status_sort_key(user_id: int, last_seen: int = 0) -> tuple:
+    uid = int(user_id)
+    safe_seen = activity_last_seen_ts(uid, fallback=int(last_seen or 0))
+    code = agent_status_list_code(uid, int(safe_seen or 0))
+
+    order = {
+        AGENT_STATUS_ONLINE: (0, 0),
+        AGENT_STATUS_OFFLINE: (0, 1),
+        AGENT_STATUS_BUSY: (1, 0),
+        AGENT_STATUS_HIDDEN: (2, 0),
+        AGENT_STATUS_INACTIVE: (3, 0),
+    }
+
+    base = order.get(code, (9, 9))
+    return (base[0], base[1], -int(safe_seen or 0), uid)
+
+def render_agent_status_menu_text(user_id: int) -> str:
+    return (
+        "⚙️ Настройка отображаемого статуса\n"
+        f"Текущий статус: <b>{h(agent_status_settings_label(int(user_id)))}</b>\n\n"
+        "Выберите параметр:"
+    )
+
+def _agent_status_setting_cb(user_id: int, code: str) -> str:
+    code = str(code or "").strip().upper()
+    return _settings_cb(int(user_id), f"ST_{code}")
+
+def _agent_status_code_from_settings_action(act: str) -> Optional[str]:
+    a = str(act or "").strip().upper()
+
+    if a == "ST_AUTO":
+        return AGENT_STATUS_AUTO
+    if a == "ST_ON":
+        return AGENT_STATUS_ONLINE
+    if a == "ST_BUSY":
+        return AGENT_STATUS_BUSY
+    if a == "ST_HIDE":
+        return AGENT_STATUS_HIDDEN
+    if a == "ST_INACTIVE":
+        return AGENT_STATUS_INACTIVE
+    if a == "ST_OFF":
+        return AGENT_STATUS_OFFLINE
+
+    return None
+
+def kb_agent_status_settings(user_id: int) -> InlineKeyboardMarkup:
+    uid = int(user_id)
+    current = agent_status_get(uid)
+
+    def btn(text: str, action_code: str, status_code: str):
+        return _ikb(
+            text,
+            callback_data=_agent_status_setting_cb(uid, action_code),
+            style=("success" if current == status_code else None)
+        )
+
+    kb = InlineKeyboardMarkup(row_width=2)
+
+    kb.row(
+        btn("🟢 В сети", "ON", AGENT_STATUS_ONLINE),
+        btn("🟡 Занят", "BUSY", AGENT_STATUS_BUSY)
+    )
+    kb.row(
+        btn("⚪ Скрыт", "HIDE", AGENT_STATUS_HIDDEN),
+        btn("🔴 Не активен", "INACTIVE", AGENT_STATUS_INACTIVE)
+    )
+    kb.row(
+        btn("🔘 Не в сети", "OFF", AGENT_STATUS_OFFLINE)
+    )
+    kb.row(
+        _ikb(
+            "Сбросить выбор",
+            callback_data=_agent_status_setting_cb(uid, "AUTO"),
+            style="danger"
+        )
+    )
+    kb.row(
+        _ikb(
+            "❰ К параметрам",
+            callback_data=_settings_cb(uid, "ST_BACK")
+        )
+    )
+
+    return kb
+
+def _agent_status_command_arg_to_code(arg: str):
+    s = str(arg or "").strip().casefold()
+
+    if s in ("", "показать", "show"):
+        return None, ""
+
+    if s in ("сброс", "авто", "auto", "reset"):
+        return AGENT_STATUS_AUTO, ""
+
+    if s in ("онлайн", "онл", "online", "on"):
+        return AGENT_STATUS_ONLINE, ""
+
+    if s in ("офлайн", "офл", "offline", "off"):
+        return AGENT_STATUS_OFFLINE, ""
+
+    if s in ("занят", "busy"):
+        return AGENT_STATUS_BUSY, ""
+
+    if s in ("скрыт", "скрытый", "hide", "hidden"):
+        return AGENT_STATUS_HIDDEN, ""
+
+    if s in ("неактивен", "неактив", "неакт", "inactive", "away"):
+        return AGENT_STATUS_INACTIVE, ""
+
+    return None, (
+        "📑 Неизвестный статус.\n"
+        "Доступно:\n"
+        "<blockquote expandable><code>авто</code>, <code>онлайн</code>, <code>офлайн</code>, "
+        "<code>занят</code>, <code>скрыт</code>, <code>неактивен</code></blockquote>"
+    )
+
+# Параметры и настройки
 def render_settings_text(user_id: int, current_chat_id: int = 0) -> str:
     uid = int(user_id)
     current_chat_id = int(current_chat_id or 0)
@@ -10615,6 +10942,8 @@ def render_settings_text(user_id: int, current_chat_id: int = 0) -> str:
     lines.append(f"💰 Баланс: {bal_txt}")
     lines.append(f"🔬 Досье лаборатории: {lab_txt}")
     lines.append(f"🗨️ РП-команды: {'⭕' if rp_commands_enabled(uid) == 1 else '❌'}")
+    if _agent_status_actor_can_use(uid):
+        lines.append(f"Статус: {h(agent_status_settings_label(uid))}")
     lines.append("")
     lines.append("УВЕДОМЛЕНИЯ:")
     lines.append(f"Уведомления: {notify_txt}")
@@ -10665,18 +10994,36 @@ def kb_settings(
     g = get_user_gender(uid)
     rp_en = rp_commands_enabled(uid)
     
-    kb.row(
-        _ikb(
-            f"Пол: {'Мужской' if g == 'male' else 'Женский'}",
-            callback_data=_settings_cb(uid, "G"),
-            style="primary"
-        ),
-        _ikb(
-            "Выключить РП" if rp_en == 1 else "Включить РП",
-            callback_data=_settings_cb(uid, "RP"),
-            style=("danger" if rp_en == 1 else "success")
+    if _agent_status_actor_can_use(uid):
+        kb.row(
+            _ikb(
+                f"Пол: {'Мужской' if g == 'male' else 'Женский'}",
+                callback_data=_settings_cb(uid, "G"),
+                style="primary"
+            ),
+            _ikb(
+                agent_status_button_label(uid),
+                callback_data=_settings_cb(uid, "ST")
+            ),
+            _ikb(
+                "Выключить РП" if rp_en == 1 else "Включить РП",
+                callback_data=_settings_cb(uid, "RP"),
+                style=("danger" if rp_en == 1 else "success")
+            )
         )
-    )
+    else:
+        kb.row(
+            _ikb(
+                f"Пол: {'Мужской' if g == 'male' else 'Женский'}",
+                callback_data=_settings_cb(uid, "G"),
+                style="primary"
+            ),
+            _ikb(
+                "Выключить РП" if rp_en == 1 else "Включить РП",
+                callback_data=_settings_cb(uid, "RP"),
+                style=("danger" if rp_en == 1 else "success")
+            )
+        )
 
     notify_chat_id, notify_off = get_notify_prefs(uid)
     can_show_chat_notify = (
@@ -10724,6 +11071,54 @@ def kb_settings(
         )
 
     return kb
+
+def handle_agent_status_command(message, parsed: "Parsed"):
+    uid = int(message.from_user.id)
+
+    if not _require_private_bot_chat(message):
+        return
+
+    if not _agent_status_actor_can_use(uid):
+        bot.reply_to(
+            message,
+            "📑 Эта команда доступна только агентам техподдержки.",
+            parse_mode="HTML"
+        )
+        return
+
+    args = (parsed.args or "").strip()
+    code, err = _agent_status_command_arg_to_code(args)
+
+    if err:
+        bot.reply_to(
+            message,
+            err,
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
+        return
+
+    if code is None and not args:
+        bot.reply_to(
+            message,
+            render_agent_status_menu_text(uid),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=kb_agent_status_settings(uid)
+        )
+        return
+
+    if code == AGENT_STATUS_AUTO:
+        agent_status_clear(uid)
+    else:
+        agent_status_set(uid, code)
+
+    bot.reply_to(
+        message,
+        f"✅ Статус обновлён: <b>{h(agent_status_settings_label(uid))}</b>",
+        parse_mode="HTML",
+        disable_web_page_preview=True
+    )
 
 def handle_settings_command(message):
     uid = int(message.from_user.id)
@@ -11975,9 +12370,517 @@ def set_balance_chain_state_from_message(
         source_message_id=int(getattr(message, "message_id", 0) or 0),
     )
 
+# user activity seen
+def _activity_user_id_from_obj(tg_user) -> int:
+    try:
+        return int(getattr(tg_user, "id", 0) or 0)
+    except Exception:
+        return 0
+
+def _activity_is_bot_user(tg_user) -> bool:
+    try:
+        return bool(getattr(tg_user, "is_bot", False))
+    except Exception:
+        return False
+
+def activity_mark_user(
+    tg_user,
+    *,
+    source: str,
+    chat_id: int = 0,
+    message_id: int = 0,
+    touch_user_last_seen: bool = True
+):
+    uid = _activity_user_id_from_obj(tg_user)
+    if uid <= 0:
+        return
+
+    if _activity_is_bot_user(tg_user):
+        try:
+            upsert_user(tg_user, touch_seen=False)
+        except Exception:
+            pass
+        return
+
+    ts = int(now_ts())
+    src = str(source or "").strip().lower()
+    cid = int(chat_id or 0)
+
+    try:
+        upsert_user(tg_user, touch_seen=bool(touch_user_last_seen))
+    except Exception:
+        pass
+
+    last_message_ts = ts if src in ("message_private", "message_group", "message_other") else 0
+    last_private_msg_ts = ts if src == "message_private" else 0
+    last_group_msg_ts = ts if src == "message_group" else 0
+    last_callback_ts = ts if src == "callback" else 0
+    last_inline_ts = ts if src == "inline_query" else 0
+    last_member_event_ts = ts if src in ("member_event_actor", "member_event_subject") else 0
+
+    db_exec(
+        """
+        INSERT INTO user_activity_seen(
+            user_id, last_activity_ts, last_message_ts, last_private_msg_ts,
+            last_group_msg_ts, last_callback_ts, last_inline_ts, last_member_event_ts,
+            last_admin_seen_ts, last_chat_id, last_source, updated_at
+        )
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            last_activity_ts=MAX(user_activity_seen.last_activity_ts, excluded.last_activity_ts),
+            last_message_ts=MAX(user_activity_seen.last_message_ts, excluded.last_message_ts),
+            last_private_msg_ts=MAX(user_activity_seen.last_private_msg_ts, excluded.last_private_msg_ts),
+            last_group_msg_ts=MAX(user_activity_seen.last_group_msg_ts, excluded.last_group_msg_ts),
+            last_callback_ts=MAX(user_activity_seen.last_callback_ts, excluded.last_callback_ts),
+            last_inline_ts=MAX(user_activity_seen.last_inline_ts, excluded.last_inline_ts),
+            last_member_event_ts=MAX(user_activity_seen.last_member_event_ts, excluded.last_member_event_ts),
+            last_chat_id=CASE
+                WHEN excluded.last_activity_ts>=user_activity_seen.last_activity_ts THEN excluded.last_chat_id
+                ELSE user_activity_seen.last_chat_id
+            END,
+            last_source=CASE
+                WHEN excluded.last_activity_ts>=user_activity_seen.last_activity_ts THEN excluded.last_source
+                ELSE user_activity_seen.last_source
+            END,
+            updated_at=excluded.updated_at
+        """,
+        (
+            uid,
+            ts,
+            last_message_ts,
+            last_private_msg_ts,
+            last_group_msg_ts,
+            last_callback_ts,
+            last_inline_ts,
+            last_member_event_ts,
+            0,
+            cid,
+            src,
+            ts
+        ),
+        commit=True
+    )
+
+def activity_mark_admin_seen(user_id: int, chat_id: int = 0):
+    uid = int(user_id or 0)
+    if uid <= 0:
+        return
+
+    ts = int(now_ts())
+    db_exec(
+        """
+        INSERT INTO user_activity_seen(
+            user_id, last_activity_ts, last_message_ts, last_private_msg_ts,
+            last_group_msg_ts, last_callback_ts, last_inline_ts, last_member_event_ts,
+            last_admin_seen_ts, last_chat_id, last_source, updated_at
+        )
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            last_admin_seen_ts=MAX(user_activity_seen.last_admin_seen_ts, excluded.last_admin_seen_ts),
+            updated_at=excluded.updated_at
+        """,
+        (
+            uid,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            ts,
+            int(chat_id or 0),
+            "admin_seen",
+            ts
+        ),
+        commit=True
+    )
+
+def activity_seen_row(user_id: int):
+    return db_one(
+        "SELECT * FROM user_activity_seen WHERE user_id=? LIMIT 1",
+        (int(user_id),)
+    )
+
+def activity_last_seen_ts(user_id: int, fallback: int = 0) -> int:
+    row = activity_seen_row(int(user_id))
+    if not row:
+        return int(fallback or 0)
+
+    vals = [
+        int(row["last_activity_ts"] or 0),
+        int(row["last_message_ts"] or 0),
+        int(row["last_private_msg_ts"] or 0),
+        int(row["last_group_msg_ts"] or 0),
+        int(row["last_callback_ts"] or 0),
+        int(row["last_inline_ts"] or 0),
+        int(row["last_member_event_ts"] or 0),
+        int(fallback or 0),
+    ]
+
+    return max(vals)
+
+def activity_source_label(source: str) -> str:
+    s = str(source or "").strip().lower()
+
+    if s == "message_private":
+        return "личное сообщение"
+    if s == "message_group":
+        return "сообщение в группе"
+    if s == "callback":
+        return "нажатие кнопки"
+    if s == "inline_query":
+        return "inline-запрос"
+    if s in ("member_event_actor", "member_event_subject"):
+        return "событие участника"
+
+    return "активность"
+
+_ACTIVITY_HOOK_INSTALLED = False
+
+def _activity_message_source(message) -> str:
+    chat_type = (getattr(getattr(message, "chat", None), "type", "") or "").lower()
+
+    if chat_type == "private":
+        return "message_private"
+
+    if chat_type in ("group", "supergroup"):
+        return "message_group"
+
+    return "message_other"
+
+def _activity_track_message(message):
+    try:
+        chat = getattr(message, "chat", None)
+        chat_type = (getattr(chat, "type", "") or "").lower()
+
+        if chat_type == "channel":
+            return
+
+        if is_channel_sender_message(message):
+            return
+
+        user = getattr(message, "from_user", None)
+        if not user:
+            return
+
+        chat_id = int(getattr(chat, "id", 0) or 0)
+        msg_id = int(getattr(message, "message_id", 0) or 0)
+
+        activity_mark_user(
+            user,
+            source=_activity_message_source(message),
+            chat_id=chat_id,
+            message_id=msg_id,
+            touch_user_last_seen=True
+        )
+
+        if chat_type in ("group", "supergroup"):
+            remember_chat_member(chat_id, user, activity=True)
+
+        for nu in (getattr(message, "new_chat_members", None) or []):
+            if nu:
+                activity_mark_user(
+                    nu,
+                    source="member_event_subject",
+                    chat_id=chat_id,
+                    message_id=msg_id,
+                    touch_user_last_seen=True
+                )
+                if chat_type in ("group", "supergroup"):
+                    remember_chat_member(chat_id, nu, activity=True)
+    except Exception:
+        pass
+
+def _activity_track_callback_query(cq):
+    try:
+        user = getattr(cq, "from_user", None)
+        if not user:
+            return
+
+        msg = getattr(cq, "message", None)
+        chat = getattr(msg, "chat", None) if msg else None
+        chat_id = int(getattr(chat, "id", 0) or 0) if chat else 0
+        chat_type = (getattr(chat, "type", "") or "").lower() if chat else ""
+
+        activity_mark_user(
+            user,
+            source="callback",
+            chat_id=chat_id,
+            message_id=int(getattr(msg, "message_id", 0) or 0) if msg else 0,
+            touch_user_last_seen=True
+        )
+
+        if chat and chat_type in ("group", "supergroup"):
+            remember_chat_member(chat_id, user, activity=True)
+    except Exception:
+        pass
+
+def _activity_track_inline_query(iq):
+    try:
+        user = getattr(iq, "from_user", None)
+        if not user:
+            return
+
+        activity_mark_user(
+            user,
+            source="inline_query",
+            chat_id=0,
+            message_id=0,
+            touch_user_last_seen=True
+        )
+    except Exception:
+        pass
+
+def _activity_track_chat_member_update(update):
+    try:
+        chat = getattr(update, "chat", None)
+        chat_id = int(getattr(chat, "id", 0) or 0) if chat else 0
+
+        actor = getattr(update, "from_user", None)
+        if actor:
+            activity_mark_user(
+                actor,
+                source="member_event_actor",
+                chat_id=chat_id,
+                message_id=0,
+                touch_user_last_seen=True
+            )
+
+        new_cm = getattr(update, "new_chat_member", None)
+        subject = getattr(new_cm, "user", None) if new_cm else None
+        if subject:
+            activity_mark_user(
+                subject,
+                source="member_event_subject",
+                chat_id=chat_id,
+                message_id=0,
+                touch_user_last_seen=True
+            )
+    except Exception:
+        pass
+
+def _activity_scan_update(update):
+    try:
+        msg = getattr(update, "message", None)
+        if msg:
+            _activity_track_message(msg)
+
+        edited_msg = getattr(update, "edited_message", None)
+        if edited_msg:
+            _activity_track_message(edited_msg)
+
+        cq = getattr(update, "callback_query", None)
+        if cq:
+            _activity_track_callback_query(cq)
+
+        iq = getattr(update, "inline_query", None)
+        if iq:
+            _activity_track_inline_query(iq)
+
+        cmu = getattr(update, "chat_member", None)
+        if cmu:
+            _activity_track_chat_member_update(cmu)
+
+        my_cmu = getattr(update, "my_chat_member", None)
+        if my_cmu:
+            _activity_track_chat_member_update(my_cmu)
+    except Exception:
+        pass
+
+def install_activity_tracking_hook():
+    global _ACTIVITY_HOOK_INSTALLED
+
+    if _ACTIVITY_HOOK_INSTALLED:
+        return
+
+    original_process_new_updates = bot.process_new_updates
+
+    def _wrapped_process_new_updates(updates):
+        try:
+            for upd in (updates or []):
+                _activity_scan_update(upd)
+        except Exception:
+            pass
+
+        return original_process_new_updates(updates)
+
+    bot.process_new_updates = _wrapped_process_new_updates
+    _ACTIVITY_HOOK_INSTALLED = True_ACTIVITY_HOOK_INSTALLED = False
+
+def _activity_message_source(message) -> str:
+    chat_type = (getattr(getattr(message, "chat", None), "type", "") or "").lower()
+
+    if chat_type == "private":
+        return "message_private"
+
+    if chat_type in ("group", "supergroup"):
+        return "message_group"
+
+    return "message_other"
+
+def _activity_track_message(message):
+    try:
+        chat = getattr(message, "chat", None)
+        chat_type = (getattr(chat, "type", "") or "").lower()
+
+        if chat_type == "channel":
+            return
+
+        if is_channel_sender_message(message):
+            return
+
+        user = getattr(message, "from_user", None)
+        if not user:
+            return
+
+        chat_id = int(getattr(chat, "id", 0) or 0)
+        msg_id = int(getattr(message, "message_id", 0) or 0)
+
+        activity_mark_user(
+            user,
+            source=_activity_message_source(message),
+            chat_id=chat_id,
+            message_id=msg_id,
+            touch_user_last_seen=True
+        )
+
+        if chat_type in ("group", "supergroup"):
+            remember_chat_member(chat_id, user, activity=True)
+
+        for nu in (getattr(message, "new_chat_members", None) or []):
+            if nu:
+                activity_mark_user(
+                    nu,
+                    source="member_event_subject",
+                    chat_id=chat_id,
+                    message_id=msg_id,
+                    touch_user_last_seen=True
+                )
+                if chat_type in ("group", "supergroup"):
+                    remember_chat_member(chat_id, nu, activity=True)
+    except Exception:
+        pass
+
+def _activity_track_callback_query(cq):
+    try:
+        user = getattr(cq, "from_user", None)
+        if not user:
+            return
+
+        msg = getattr(cq, "message", None)
+        chat = getattr(msg, "chat", None) if msg else None
+        chat_id = int(getattr(chat, "id", 0) or 0) if chat else 0
+        chat_type = (getattr(chat, "type", "") or "").lower() if chat else ""
+
+        activity_mark_user(
+            user,
+            source="callback",
+            chat_id=chat_id,
+            message_id=int(getattr(msg, "message_id", 0) or 0) if msg else 0,
+            touch_user_last_seen=True
+        )
+
+        if chat and chat_type in ("group", "supergroup"):
+            remember_chat_member(chat_id, user, activity=True)
+    except Exception:
+        pass
+
+def _activity_track_inline_query(iq):
+    try:
+        user = getattr(iq, "from_user", None)
+        if not user:
+            return
+
+        activity_mark_user(
+            user,
+            source="inline_query",
+            chat_id=0,
+            message_id=0,
+            touch_user_last_seen=True
+        )
+    except Exception:
+        pass
+
+def _activity_track_chat_member_update(update):
+    try:
+        chat = getattr(update, "chat", None)
+        chat_id = int(getattr(chat, "id", 0) or 0) if chat else 0
+
+        actor = getattr(update, "from_user", None)
+        if actor:
+            activity_mark_user(
+                actor,
+                source="member_event_actor",
+                chat_id=chat_id,
+                message_id=0,
+                touch_user_last_seen=True
+            )
+
+        new_cm = getattr(update, "new_chat_member", None)
+        subject = getattr(new_cm, "user", None) if new_cm else None
+        if subject:
+            activity_mark_user(
+                subject,
+                source="member_event_subject",
+                chat_id=chat_id,
+                message_id=0,
+                touch_user_last_seen=True
+            )
+    except Exception:
+        pass
+
+def _activity_scan_update(update):
+    try:
+        msg = getattr(update, "message", None)
+        if msg:
+            _activity_track_message(msg)
+
+        edited_msg = getattr(update, "edited_message", None)
+        if edited_msg:
+            _activity_track_message(edited_msg)
+
+        cq = getattr(update, "callback_query", None)
+        if cq:
+            _activity_track_callback_query(cq)
+
+        iq = getattr(update, "inline_query", None)
+        if iq:
+            _activity_track_inline_query(iq)
+
+        cmu = getattr(update, "chat_member", None)
+        if cmu:
+            _activity_track_chat_member_update(cmu)
+
+        my_cmu = getattr(update, "my_chat_member", None)
+        if my_cmu:
+            _activity_track_chat_member_update(my_cmu)
+    except Exception:
+        pass
+
+def install_activity_tracking_hook():
+    global _ACTIVITY_HOOK_INSTALLED
+
+    if _ACTIVITY_HOOK_INSTALLED:
+        return
+
+    original_process_new_updates = bot.process_new_updates
+
+    def _wrapped_process_new_updates(updates):
+        try:
+            for upd in (updates or []):
+                _activity_scan_update(upd)
+        except Exception:
+            pass
+
+        return original_process_new_updates(updates)
+
+    bot.process_new_updates = _wrapped_process_new_updates
+    _ACTIVITY_HOOK_INSTALLED = True
+
 # chat member
-def remember_chat_member(chat_id: int, tg_user):
-    upsert_user(tg_user)
+def remember_chat_member(chat_id: int, tg_user, *, activity: bool = True):
+    upsert_user(tg_user, touch_seen=bool(activity))
 
     try:
         _merge_placeholder_to_real_user(tg_user)
@@ -12001,10 +12904,16 @@ def remember_chat_member(chat_id: int, tg_user):
             pass
 
     uname = (getattr(tg_user, "username", None) or "").strip().lower() or None
+    ts = int(now_ts()) if bool(activity) else 0
     db_exec(
         "INSERT INTO chat_members(chat_id,user_id,username,last_seen) VALUES(?,?,?,?) "
-        "ON CONFLICT(chat_id,user_id) DO UPDATE SET username=excluded.username, last_seen=excluded.last_seen",
-        (int(chat_id), int(tg_user.id), uname, now_ts()),
+        "ON CONFLICT(chat_id,user_id) DO UPDATE SET "
+        "username=excluded.username, "
+        "last_seen=CASE "
+        "    WHEN ?=1 THEN excluded.last_seen "
+        "    ELSE chat_members.last_seen "
+        "END",
+        (int(chat_id), int(tg_user.id), uname, ts, 1 if bool(activity) else 0),
         commit=True
     )
 
@@ -12099,6 +13008,9 @@ def _post_channel_actor_can_use(user_id: int) -> bool:
     uid = int(user_id)
     return bool(is_creator(uid) or can_use_owner_commands(uid))
 
+def _post_channel_config_actor_can_use(user_id: int) -> bool:
+    return bool(is_creator(int(user_id)))
+
 def _post_channel_title_from_db(channel_id: int) -> str:
     row = db_one(
         "SELECT COALESCE(title,'') AS title FROM bot_group_chats WHERE chat_id=? LIMIT 1",
@@ -12118,7 +13030,9 @@ def _post_channel_owner_id(channel_id: int) -> int:
             u = getattr(cm, "user", None)
             st = (getattr(cm, "status", "") or "").lower()
             if u:
-                remember_chat_member(int(channel_id), u)
+                remember_chat_member(int(channel_id), u, activity=False)
+                activity_mark_admin_seen(int(u.id), int(channel_id))
+
                 if st == "creator":
                     owner_id = int(u.id)
         except Exception:
@@ -12235,13 +13149,17 @@ def _post_channel_parse_cb(data: str):
         return None, None
 
 def _post_channel_selected_row(user_id: int) -> Optional[dict]:
-    channel_id = post_channel_get(int(user_id))
+    uid = int(user_id)
+
+    pref_user_id = uid if is_creator(uid) else int(get_current_creator_id())
+
+    channel_id = post_channel_get(int(pref_user_id))
     if channel_id == 0:
         return None
 
     chk = _post_channel_check(int(channel_id))
     if not chk.get("ok"):
-        post_channel_clear(int(user_id))
+        post_channel_clear(int(pref_user_id))
         return None
 
     return chk
@@ -12302,18 +13220,21 @@ def render_post_channels_text(user_id: int) -> tuple[str, Optional[InlineKeyboar
     return "\n".join(lines), kb
 
 def render_post_channel_agents_section(user_id: int) -> list[str]:
-    if not _post_channel_actor_can_use(int(user_id)):
+    uid = int(user_id)
+
+    if not _post_channel_actor_can_use(uid):
         return []
 
-    selected = _post_channel_selected_row(int(user_id))
+    selected = _post_channel_selected_row(uid)
+
     if not selected:
         return [
             "📰 Посты:",
-            "/post_chanals — выбрать канал для публикаций",
+            "Канал для публикаций ещё не выбран разработчиком.",
             "",
         ]
 
-    stat_row = _statpost_get(int(user_id))
+    stat_row = _statpost_get(uid)
     stat_line = "/statpost — статистический пост"
     if stat_row:
         spec = _statpost_load_spec(stat_row)
@@ -12324,7 +13245,6 @@ def render_post_channel_agents_section(user_id: int) -> list[str]:
 
     return [
         f"📰 Посты в «<b>{h(selected['title'])}</b>»:",
-        "/post_chanals — выбрать другой канал",
         "/post — создать пост",
         stat_line,
         "",
@@ -12339,8 +13259,8 @@ def handle_post_channels_command(message):
         return
 
     uid = int(message.from_user.id)
-    if not _post_channel_actor_can_use(uid):
-        bot.reply_to(message, "📑 Эта команда доступна только разработчику и старшим агентам.", parse_mode="HTML")
+    if not _post_channel_config_actor_can_use(uid):
+        bot.reply_to(message, "📑 Эта команда доступна только разработчику.", parse_mode="HTML")
         return
 
     text, rm = render_post_channels_text(uid)
@@ -14246,7 +15166,9 @@ def sync_chat_admins(chat_id: int):
             u = getattr(cm, "user", None)
             st = (getattr(cm, "status", "") or "").lower()
             if u:
-                remember_chat_member(int(chat_id), u)
+                remember_chat_member(int(chat_id), u, activity=False)
+                activity_mark_admin_seen(int(u.id), int(chat_id))
+
                 if st == "creator":
                     owner_id = int(u.id)
         except Exception:
@@ -14791,7 +15713,7 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
     if timer_low == "таймеры":
         return Parsed(raw=raw_multiline, has_prefix_char=False, prefix_char=None, cmd="timer_list", args="")
 
-    if timer_sign == "!" and timer_low in ("сбросить таймеры", "удалить все таймеры"):
+    if timer_sign == "!" and timer_low in ("сбросить таймеры", "удалить таймеры", "удалить все таймеры"):
         return Parsed(raw=raw_multiline, has_prefix_char=False, prefix_char=None, cmd="timer_clear_all", args="")
 
     if timer_sign == "-" and timer_low.startswith("таймер "):
@@ -14835,20 +15757,37 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
         return Parsed(raw=raw_multiline, has_prefix_char=False, prefix_char=None, cmd="chat_autodel_status", args="")
 
     # команды лс
-    if low in ("settings", "настройки"):
+    if low in ("settings", "настройки", "⚙️ параметры", "параметры"):
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="settings", args="")
 
-    if low in ("report", "репорт"):
+    if low == "status" or low.startswith("status "):
+        rest = ""
+        parts = t.split(" ", 1)
+        if len(parts) > 1:
+            rest = parts[1].strip()
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="agent_status", args=rest)
+
+    if low == "статус" or low.startswith("статус "):
+        rest = ""
+        parts = t.split(" ", 1)
+        if len(parts) > 1:
+            rest = parts[1].strip()
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="agent_status", args=rest)
+
+    if low in ("report", "репорт", "📠 репорт"):
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="report", args="")
 
-    if low in ("agents", "агенты", "🧑‍🔬 тех.команды", "тех.команды", "техкоманды"):
+    if low in ("agents", "агенты", "🧑‍🔬 тех.команды", "техкоманды"):
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="agents_panel", args="")
 
     # кнопки быстрого доступа
-    if low in ("📚 быстрый поиск"):
+    if low in ("👥 пользователи",):
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="users_list", args="")
+
+    if low in ("📚 быстрый поиск",):
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="quick_search_stub", args="")
 
-    if low in ("скрыть клавиатуру"):
+    if low in ("скрыть клавиатуру",):
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="hide_quick_nav", args="")
 
     # команды публикации
@@ -15745,13 +16684,22 @@ def build_start_text(user) -> str:
         seen.add(uid)
         support_rows.append(r)
 
-    online, offline = split_agents_by_online(support_rows)
+    primary_rows, secondary_rows = _agents_sort_rows_by_status(support_rows)
 
     u_name = user_full_name(user)
 
     def _support_line(a) -> str:
-        prefix = ""
-        return prefix + format_agent_line(a)
+        uid = int(_agent_row_get(a, "user_id", 0) or 0)
+        fn = str(_agent_row_get(a, "first_name", "") or "").strip()
+        ln = str(_agent_row_get(a, "last_name", "") or "").strip()
+        username = str(_agent_row_get(a, "username", "") or "").strip()
+        last_seen = int(_agent_row_get(a, "last_seen", 0) or 0)
+
+        name = standard_display_name(fn, ln, username, uid)
+        tag = _agent_bold_mention(uid, name, username=username)
+        status = agent_status_list_label(uid, last_seen)
+
+        return f"{tag} ({h(status)})"
 
     lines = []
     lines.append(f'👋 Приветствуем вас, <b>{h(u_name)}</b>, в {h(BOT_TITLE)}')
@@ -15763,15 +16711,21 @@ def build_start_text(user) -> str:
 
     lines.append('👨‍⚕️ <b>Агенты поддержки</b>, которые могут ответить на ваши вопросы')
 
-    if not online and not offline:
+    if not primary_rows and not secondary_rows:
         lines.append("Список пока пуст.")
     else:
-        if online:
-            lines.append("🟢 Онлайн")
-            lines.extend([_support_line(a) for a in online])
-        if offline:
-            lines.append("🔘 Оффлайн")
-            lines.extend([_support_line(a) for a in offline])
+        lines.append("<blockquote expandable>")
+
+        for a in primary_rows:
+            lines.append(_support_line(a))
+
+        if primary_rows and secondary_rows:
+            lines.append("")
+
+        for a in secondary_rows:
+            lines.append(_support_line(a))
+
+        lines.append("</blockquote>")
 
     lines.append("")
     lines.append(f'📑 Список всех команд <a href="{h(URL_COMMANDS)}">с их описанием</a>')
@@ -15797,14 +16751,21 @@ def kb_quick_nav(user_id: int) -> ReplyKeyboardMarkup:
 
     kb.row(
         KeyboardButton("ℹ️ Помощь"),
+        KeyboardButton("📠 Репорт"),
         KeyboardButton("📚 Быстрый поиск")
     )
 
-    second_row = [KeyboardButton("🔗 Команды")]
-    if is_creator(uid) or is_support(uid):
-        second_row.append(KeyboardButton("🧑‍🔬 Тех.команды"))
+    kb.row(
+        KeyboardButton("⚙️ Параметры"),
+        KeyboardButton("🔗 Команды")
+    )
 
-    kb.row(*second_row)
+    if is_creator(uid) or is_support(uid):
+        kb.row(
+            KeyboardButton("🧑‍🔬 Тех.команды"),
+            KeyboardButton("👥 Пользователи")
+        )
+
     kb.row(KeyboardButton("Скрыть клавиатуру"))
 
     return kb
@@ -15816,6 +16777,21 @@ def send_quick_nav_keyboard(chat_id: int, user_id: int):
         reply_markup=kb_quick_nav(int(user_id)),
         disable_notification=True
     )
+
+def _quick_nav_button_text_is_private_only(text: str) -> bool:
+    low = (text or "").strip().casefold()
+
+    return low in {
+        "ℹ️ помощь",
+        "📠 репорт",
+        "📚 быстрый поиск",
+        "⚙️ параметры",
+        "⚙️параметры",
+        "🔗 команды",
+        "🧑‍🔬 тех.команды",
+        "👥 пользователи",
+        "скрыть клавиатуру",
+    }
 
 def handle_hide_quick_nav_keyboard(message):
     bot.reply_to(
@@ -24620,7 +25596,7 @@ def cb_post_channel_ui(cq):
             bot.answer_callback_query(cq.id)
             return
 
-        if not _post_channel_actor_can_use(actor_uid):
+        if not _post_channel_config_actor_can_use(actor_uid):
             bot.answer_callback_query(cq.id)
             return
 
@@ -24681,6 +25657,98 @@ def cb_settings_ui(cq):
 
         if int(cq.from_user.id) != int(uid):
             bot.answer_callback_query(cq.id)
+            return
+
+        if act == "ST":
+            if not _agent_status_actor_can_use(int(uid)):
+                bot.answer_callback_query(cq.id)
+                return
+
+            text = render_agent_status_menu_text(int(uid))
+            rm = kb_agent_status_settings(int(uid))
+
+            if cq.inline_message_id:
+                limited_edit_message_text(
+                    text=text,
+                    inline_id=cq.inline_message_id,
+                    parse_mode="HTML",
+                    reply_markup=rm,
+                    disable_web_page_preview=True
+                )
+            elif cq.message:
+                limited_edit_message_text(
+                    text=text,
+                    chat_id=cq.message.chat.id,
+                    msg_id=cq.message.message_id,
+                    parse_mode="HTML",
+                    reply_markup=rm,
+                    disable_web_page_preview=True
+                )
+
+            bot.answer_callback_query(cq.id)
+            return
+
+        if act == "ST_BACK":
+            current_chat_id = int(cq.message.chat.id) if cq.message else 0
+            current_chat_type = (cq.message.chat.type if cq.message else "private")
+
+            text = render_settings_text(int(uid), current_chat_id)
+            rm = kb_settings(int(uid), current_chat_id, current_chat_type)
+
+            if cq.inline_message_id:
+                limited_edit_message_text(
+                    text=text,
+                    inline_id=cq.inline_message_id,
+                    parse_mode="HTML",
+                    reply_markup=rm,
+                    disable_web_page_preview=True
+                )
+            elif cq.message:
+                limited_edit_message_text(
+                    text=text,
+                    chat_id=cq.message.chat.id,
+                    msg_id=cq.message.message_id,
+                    parse_mode="HTML",
+                    reply_markup=rm,
+                    disable_web_page_preview=True
+                )
+
+            bot.answer_callback_query(cq.id)
+            return
+
+        status_code = _agent_status_code_from_settings_action(act)
+        if status_code is not None:
+            if not _agent_status_actor_can_use(int(uid)):
+                bot.answer_callback_query(cq.id)
+                return
+
+            if status_code == AGENT_STATUS_AUTO:
+                agent_status_clear(int(uid))
+            else:
+                agent_status_set(int(uid), status_code)
+
+            text = render_agent_status_menu_text(int(uid))
+            rm = kb_agent_status_settings(int(uid))
+
+            if cq.inline_message_id:
+                limited_edit_message_text(
+                    text=text,
+                    inline_id=cq.inline_message_id,
+                    parse_mode="HTML",
+                    reply_markup=rm,
+                    disable_web_page_preview=True
+                )
+            elif cq.message:
+                limited_edit_message_text(
+                    text=text,
+                    chat_id=cq.message.chat.id,
+                    msg_id=cq.message.message_id,
+                    parse_mode="HTML",
+                    reply_markup=rm,
+                    disable_web_page_preview=True
+                )
+
+            bot.answer_callback_query(cq.id, "Статус обновлён.")
             return
 
         if act in ("HB", "HL"):
@@ -32213,7 +33281,12 @@ def text_router(message):
             remember_chat_member(message.chat.id, message.from_user)       
         ensure_creator_is_support()
 
-        parsed = parse_message_as_command(message.text or "")
+        raw_text_for_parse = message.text or ""
+
+        if message.chat.type != "private" and _quick_nav_button_text_is_private_only(raw_text_for_parse):
+            return
+
+        parsed = parse_message_as_command(raw_text_for_parse)
         stage, cat = report_get_state(int(uid))
         post_stage, _post_created_ts = post_state_get(int(uid))
 
@@ -32509,6 +33582,11 @@ def text_router(message):
             handle_settings_command(message)
             return
         
+        # статус агента
+        if parsed.cmd == "agent_status":
+            handle_agent_status_command(message, parsed)
+            return
+
         # /report
         if parsed.cmd == "report":
             handle_report_command(message)
@@ -32790,6 +33868,8 @@ if __name__ == "__main__":
         send_error_report("_maybe_promote_unavailable_creator_startup", e)
 
     refresh_bot_identity()
+    install_activity_tracking_hook()
+
     threading.Thread(target=_infection_daemon, daemon=True).start()
     threading.Thread(target=_pathogen_factory_daemon, daemon=True).start()
     threading.Thread(target=_vaccine_factory_daemon, daemon=True).start()
@@ -32803,7 +33883,7 @@ if __name__ == "__main__":
                 skip_pending=True,
                 timeout=10,
                 long_polling_timeout=20,
-                allowed_updates=["message", "inline_query", "callback_query", "chat_member", "my_chat_member"]
+                allowed_updates=["message", "edited_message", "inline_query", "callback_query", "chat_member", "my_chat_member"]
             )
         except Exception as e:
             send_error_report("infinity_polling", e)
