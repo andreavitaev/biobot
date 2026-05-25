@@ -8017,6 +8017,18 @@ def _known_chats_collect_rows() -> list[dict]:
     out = []
     for r in rows:
         chat_id = int(r["chat_id"])
+
+        type_row = db_one(
+            "SELECT lower(COALESCE(chat_type,'')) AS chat_type, COALESCE(is_active,0) AS is_active "
+            "FROM bot_group_chats WHERE chat_id=? LIMIT 1",
+            (int(chat_id),)
+        )
+
+        if type_row:
+            chat_type = str(type_row["chat_type"] or "").strip().lower()
+            if chat_type == "channel":
+                continue
+
         title = (r["title"] or "").strip() or f"Чат {chat_id}"
         owner_id = int(r["owner_id"] or 0)
 
@@ -8217,12 +8229,13 @@ def render_users_text(page: int, filters: Optional[dict] = None) -> tuple[str, O
     lines.append("<blockquote expandable>")
 
     for idx, row in enumerate(part, start + 1):
+        marks = []
         if bool(row["is_new"]):
-            mark = "🆕 "
-        elif bool(row["is_recent"]):
-            mark = "🆙 "
-        else:
-            mark = ""
+            marks.append("🆕")
+        if bool(row["is_recent"]):
+            marks.append("🆙")
+
+        mark = ("".join(marks) + " ") if marks else ""
 
         lines.append(
             f"{idx}. {mark}{h(row['name'])}|<code>{int(row['user_id'])}</code>|{h(row['username'])}|{h(row['lab_text'])}"
@@ -10293,17 +10306,64 @@ def set_pm_opened(user_id: int, value: int = 1):
         commit=True
     )
 
+def _notify_chat_is_group_chat(chat_id: int) -> bool:
+    cid = int(chat_id)
+
+    row = db_one(
+        "SELECT lower(COALESCE(chat_type,'')) AS chat_type, COALESCE(is_active,0) AS is_active "
+        "FROM bot_group_chats WHERE chat_id=? LIMIT 1",
+        (cid,)
+    )
+
+    if row:
+        chat_type = str(row["chat_type"] or "").strip().lower()
+        is_active = int(row["is_active"] or 0)
+
+        if is_active != 1:
+            return False
+
+        return chat_type in ("group", "supergroup", "")
+
+    try:
+        ch = bot.get_chat(cid)
+        chat_type = (getattr(ch, "type", "") or "").lower()
+
+        if chat_type in ("group", "supergroup"):
+            title = (
+                getattr(ch, "title", None)
+                or getattr(ch, "full_name", None)
+                or getattr(ch, "first_name", None)
+                or ""
+            )
+            remember_bot_group_chat(cid, title=title, chat_type=chat_type, is_active=1)
+            return True
+
+        if chat_type == "channel":
+            return False
+    except Exception:
+        pass
+
+    return False
+
 def _known_common_chat_ids_for_user(user_id: int) -> list[int]:
     rows = db_all(
         "SELECT DISTINCT cm.chat_id "
         "FROM chat_members cm "
         "LEFT JOIN bot_group_chats bg ON bg.chat_id=cm.chat_id "
         "WHERE cm.user_id=? "
-        "  AND (bg.chat_id IS NULL OR COALESCE(bg.is_active,0)=1) "
+        "  AND (bg.chat_id IS NULL OR (COALESCE(bg.is_active,0)=1 "
+        "       AND lower(COALESCE(bg.chat_type,'')) IN ('group','supergroup',''))) "
         "ORDER BY cm.chat_id ASC",
         (int(user_id),)
     ) or []
-    return [int(r["chat_id"]) for r in rows]
+
+    out = []
+    for r in rows:
+        cid = int(r["chat_id"])
+        if _notify_chat_is_group_chat(cid):
+            out.append(cid)
+
+    return out
 
 def _pick_random_common_chat_for_user(user_id: int) -> int:
     chats = _known_common_chat_ids_for_user(int(user_id))
@@ -10331,12 +10391,31 @@ def send_user_notification(user_id: int, text: str, *, respect_notify_off: bool 
             return None
 
         pm_opened = get_pm_opened(uid)
+
         if int(notify_chat_id) != 0:
-            dest = int(notify_chat_id)
+            saved_dest = int(notify_chat_id)
+
+            if _notify_chat_is_group_chat(saved_dest):
+                dest = saved_dest
+            else:
+                try:
+                    set_notify_prefs(uid, 0, 0)
+                except Exception:
+                    pass
+
+                dest = int(uid) if int(pm_opened) == 1 else int(_pick_random_common_chat_for_user(uid) or 0)
         else:
             dest = int(uid) if int(pm_opened) == 1 else int(_pick_random_common_chat_for_user(uid) or 0)
 
         if dest == 0:
+            return None
+
+        if int(dest) < 0 and not _notify_chat_is_group_chat(int(dest)):
+            try:
+                if int(notify_chat_id) == int(dest):
+                    set_notify_prefs(uid, 0, 0)
+            except Exception:
+                pass
             return None
 
         try:
@@ -11945,6 +12024,37 @@ def remember_bot_group_chat(chat_id: int, title: str = "", chat_type: str = "gro
         ),
         commit=True
     )
+
+def forget_bot_channel(chat_id: int):
+    cid = int(chat_id)
+
+    try:
+        db_exec("DELETE FROM post_channel_prefs WHERE channel_id=?", (cid,), commit=True)
+    except Exception:
+        pass
+
+    try:
+        db_exec("DELETE FROM chat_members WHERE chat_id=?", (cid,), commit=True)
+    except Exception:
+        pass
+
+    try:
+        db_exec(
+            "UPDATE users SET notify_chat_id=0, notify_off=0 WHERE notify_chat_id=?",
+            (cid,),
+            commit=True
+        )
+    except Exception:
+        pass
+
+    try:
+        db_exec(
+            "DELETE FROM bot_group_chats WHERE chat_id=? AND lower(COALESCE(chat_type,''))='channel'",
+            (cid,),
+            commit=True
+        )
+    except Exception:
+        pass
 
 def _users_total_count() -> int:
     row = db_one("SELECT COUNT(*) AS c FROM users WHERE COALESCE(is_bot,0)=0")
@@ -22956,6 +23066,13 @@ def handle_notify_toggle(message, cmd: str):
         if message.chat.type in ("group", "supergroup"):
             chat_id = int(message.chat.id)
             ok = True
+            if not _notify_chat_is_group_chat(chat_id):
+                set_notify_prefs(uid, 0, 0)
+                bot.reply_to(
+                    message,
+                    "⚠️ Уведомления можно включить только в личных сообщениях или групповом чате."
+                )
+                return
             try:
                 me = bot.get_me()
                 cm = bot.get_chat_member(chat_id, me.id)
@@ -23269,11 +23386,7 @@ def on_my_chat_member_update(update):
 
         if chat_type == "channel":
             if status in ("left", "kicked"):
-                remember_bot_group_chat(chat_id, title=chat_title, chat_type=chat_type, is_active=0)
-                try:
-                    db_exec("DELETE FROM post_channel_prefs WHERE channel_id=?", (int(chat_id),), commit=True)
-                except Exception:
-                    pass
+                forget_bot_channel(int(chat_id))
                 return
 
             if status in ("member", "administrator"):
