@@ -1710,10 +1710,10 @@ PREMIUM_EMOJI_IDS: Dict[str, str] = {
     "🤧": "5370880659759831851",
     "🤒": "5373262021556967911",
     "🕵️‍♂️": "",
-    "👨‍🔬": "5460722519369591542",
+    "👨‍🔬": "5408834671574294163",
     "👮": "",
     "🥷": "5195316351048121745",
-    "👨‍⚕️": "5408834671574294163",
+    "👨‍⚕️": "",
     "🧑‍✈️": "",
     "🧑‍💼": "",
     "🏥": "5264827875588077689",
@@ -3567,6 +3567,29 @@ def init_db():
         user_id      INTEGER PRIMARY KEY,
         text_html    TEXT NOT NULL DEFAULT '',
         media_json   TEXT NOT NULL DEFAULT '[]',
+        updated_at   INTEGER NOT NULL DEFAULT 0
+    );
+    """, commit=True)
+
+    db_exec("""
+    CREATE TABLE IF NOT EXISTS post_meta (
+        user_id       INTEGER PRIMARY KEY,
+        post_kind     TEXT NOT NULL DEFAULT '',
+        promo_enabled INTEGER NOT NULL DEFAULT -1,
+        updated_at    INTEGER NOT NULL DEFAULT 0
+    );
+    """, commit=True)
+
+    db_exec("""
+    CREATE TABLE IF NOT EXISTS post_update_drafts (
+        user_id      INTEGER PRIMARY KEY,
+        version      TEXT NOT NULL DEFAULT '',
+        title_html   TEXT NOT NULL DEFAULT '',
+        intro_html   TEXT NOT NULL DEFAULT '',
+        fixes_html   TEXT NOT NULL DEFAULT '',
+        changes_html TEXT NOT NULL DEFAULT '',
+        new_html     TEXT NOT NULL DEFAULT '',
+        active_part  TEXT NOT NULL DEFAULT '',
         updated_at   INTEGER NOT NULL DEFAULT 0
     );
     """, commit=True)
@@ -11630,7 +11653,7 @@ def _report_prompt(uid: int, cat: str) -> str:
 
     if cat == "USER":
         text = (
-            "Сначала отправьте текст репорта отдельным сообщением:\n"
+            "Отправьте текст жалобы отдельным сообщением, согласно форме:\n"
             "・ 1-я строка — @username нарушителя\n"
             "・ со 2-й строки — описание проблемы\n\n"
             f"После этого можно добавить до {REPORT_MAX_MEDIA} фото или видео отдельными сообщениями.\n"
@@ -11649,7 +11672,7 @@ def _report_prompt(uid: int, cat: str) -> str:
                 f"🧾 Крайний срок восстановления через поддержку: <code>{h(_fmt_ts(purge_at))}</code>"
             )
         text = (
-            "Сначала отправьте текст запроса на восстановление лаборатории.\n"
+            "Отправьте текст запроса на восстановление лаборатории.\n"
             f"После этого можно добавить до {REPORT_MAX_MEDIA} фото или видео отдельными сообщениями.\n"
             f"Когда всё будет готово, нажмите «{REPORT_SUBMIT_TEXT}»."
             f"{extra}"
@@ -11658,14 +11681,14 @@ def _report_prompt(uid: int, cat: str) -> str:
 
     if cat == "APPEAL":
         text = (
-            "Сначала отправьте текст апелляции.\n"
+            "Отправьте текст апелляции.\n"
             f"После этого можно добавить до {REPORT_MAX_MEDIA} фото или видео отдельными сообщениями.\n"
             f"Когда всё будет готово, нажмите «{REPORT_SUBMIT_TEXT}»."
         )
         return _report_text_for_user(int(uid), text)
 
     text = (
-        "Сначала отправьте текст описания проблемы.\n"
+        "Отправьте текст описания проблемы.\n"
         f"После этого можно добавить до {REPORT_MAX_MEDIA} фото или видео отдельными сообщениями.\n"
         f"Когда всё будет готово, нажмите «{REPORT_SUBMIT_TEXT}»."
     )
@@ -11761,7 +11784,7 @@ def _send_media_group_to_report_recipients(
     return ok
 
 def _report_answer_button_notice_text(report_ts: int) -> str:
-    txt = "↩️ Ответить на этот репорт"
+    txt = "↩️ Ответить на это обращение"
     if int(report_ts or 0) > 0:
         txt += f"\nЗапрос от: <code>{h(_fmt_ts(int(report_ts)))}</code>"
     return txt
@@ -11927,7 +11950,7 @@ def _handle_report_content_message(message) -> bool:
                 message,
                 _report_text_for_user(
                     report_notice_user_id,
-                    "Подготовка ответа отменена." if is_answer_flow else "Подготовка репорта отменена."
+                    "Подготовка ответа отменена." if is_answer_flow else "Подготовка обращения отменена."
                 ),
                 parse_mode="HTML",
                 disable_web_page_preview=True,
@@ -11963,7 +11986,7 @@ def _handle_report_content_message(message) -> bool:
                     report_clear_state(uid)
                     bot.reply_to(
                         message,
-                        _report_text_for_user(report_notice_user_id, "Нельзя отправить ответ на собственный репорт."),
+                        _report_text_for_user(report_notice_user_id, "Нельзя отправить ответ на собственное обращение."),
                         parse_mode="HTML",
                         disable_web_page_preview=True,
                         reply_markup=report_reply_remove_markup()
@@ -12052,7 +12075,7 @@ def _handle_report_content_message(message) -> bool:
             ts_txt = _fmt_ts(report_ts)
             cat_title = REPORT_CATS.get(cat_u, cat_u)
 
-            admin_text = f"Репорт {h(ts_txt)}\nОт {from_line}\nКатегория: {h(cat_title)}\n"
+            admin_text = f"Обращение {h(ts_txt)}\nОт {from_line}\nКатегория: {h(cat_title)}\n"
 
             if cat_u == "USER":
                 admin_text += f"На {h(target_un)}\n"
@@ -12082,7 +12105,7 @@ def _handle_report_content_message(message) -> bool:
             if not ok:
                 bot.reply_to(
                     message,
-                    _report_text_for_user(report_notice_user_id, "Не удалось отправить репорт. Попробуйте позже."),
+                    _report_text_for_user(report_notice_user_id, "Не удалось отправить обращение. Попробуйте позже."),
                     parse_mode="HTML",
                     disable_web_page_preview=True
                 )
@@ -12101,7 +12124,7 @@ def _handle_report_content_message(message) -> bool:
             else:
                 bot.reply_to(
                     message,
-                    _report_text_for_user(report_notice_user_id, "📨 Репорт отправлен тех.поддержке на рассмотрение. Благодарим вас за поддержку проекта."),
+                    _report_text_for_user(report_notice_user_id, "📨 Обращение отправлено тех.поддержке на рассмотрение. Благодарим вас за поддержку проекта."),
                     parse_mode="HTML",
                     disable_web_page_preview=True,
                     reply_markup=report_reply_remove_markup()
@@ -13274,7 +13297,12 @@ def handle_post_channels_command(message):
 
 # post drafts and state
 def _post_is_draft_stage(stage: str) -> bool:
-    return str(stage or "") in (POST_STAGE_CHANNEL, POST_STAGE_AGENTS)
+    return str(stage or "") in (
+        POST_STAGE_CHANNEL,
+        POST_STAGE_AGENTS,
+        POST_STAGE_UPDATE_VERSION,
+        POST_STAGE_UPDATE_CONTENT,
+    )
 
 def post_state_get(user_id: int) -> tuple[str, int]:
     row = db_one(
@@ -13297,9 +13325,443 @@ def post_state_set(user_id: int, stage: str):
 def post_draft_clear(user_id: int):
     db_exec("DELETE FROM post_drafts WHERE user_id=?", (int(user_id),), commit=True)
 
+def post_meta_clear(user_id: int):
+    db_exec("DELETE FROM post_meta WHERE user_id=?", (int(user_id),), commit=True)
+
+def post_update_clear(user_id: int):
+    db_exec("DELETE FROM post_update_drafts WHERE user_id=?", (int(user_id),), commit=True)
+
 def post_state_clear(user_id: int):
     post_draft_clear(int(user_id))
+    post_meta_clear(int(user_id))
+    post_update_clear(int(user_id))
     db_exec("DELETE FROM post_state WHERE user_id=?", (int(user_id),), commit=True)
+
+def post_meta_get(user_id: int) -> dict:
+    row = db_one(
+        "SELECT post_kind, promo_enabled, updated_at FROM post_meta WHERE user_id=? LIMIT 1",
+        (int(user_id),)
+    )
+    if not row:
+        return {
+            "post_kind": POST_KIND_UPDATE,
+            "promo_enabled": POST_PROMO_AUTO,
+            "updated_at": 0,
+        }
+
+    kind = str(row["post_kind"] or "").strip().lower()
+    if kind not in (POST_KIND_UPDATE, POST_KIND_PROJECTS, POST_KIND_OTHER, POST_KIND_AD):
+        kind = POST_KIND_UPDATE
+
+    return {
+        "post_kind": kind,
+        "promo_enabled": int(row["promo_enabled"] or POST_PROMO_AUTO),
+        "updated_at": int(row["updated_at"] or 0),
+    }
+
+def post_meta_set(user_id: int, post_kind: str, *, promo_enabled: int = "POST_PROMO_AUTO"):
+    kind = str(post_kind or "").strip().lower()
+    if kind not in (POST_KIND_UPDATE, POST_KIND_PROJECTS, POST_KIND_OTHER, POST_KIND_AD):
+        kind = POST_KIND_UPDATE
+
+    db_exec(
+        "INSERT INTO post_meta(user_id, post_kind, promo_enabled, updated_at) VALUES (?,?,?,?) "
+        "ON CONFLICT(user_id) DO UPDATE SET "
+        "post_kind=excluded.post_kind, "
+        "promo_enabled=excluded.promo_enabled, "
+        "updated_at=excluded.updated_at",
+        (int(user_id), kind, int(promo_enabled), int(now_ts())),
+        commit=True
+    )
+
+def post_meta_kind(user_id: int) -> str:
+    return str(post_meta_get(int(user_id)).get("post_kind") or POST_KIND_UPDATE)
+
+def post_kind_title(post_kind: str) -> str:
+    k = str(post_kind or "").strip().lower()
+    if k == POST_KIND_UPDATE:
+        return "Обновление"
+    if k == POST_KIND_PROJECTS:
+        return "Проекты"
+    if k == POST_KIND_OTHER:
+        return "Прочее"
+    if k == POST_KIND_AD:
+        return "Реклама"
+    return "Пост"
+
+def post_kind_has_promo(user_id: int) -> bool:
+    meta = post_meta_get(int(user_id))
+    kind = str(meta.get("post_kind") or POST_KIND_UPDATE)
+
+    if kind == POST_KIND_UPDATE:
+        return True
+
+    if kind in (POST_KIND_PROJECTS, POST_KIND_AD):
+        return False
+
+    if kind == POST_KIND_OTHER:
+        return int(meta.get("promo_enabled") or POST_PROMO_OFF) == POST_PROMO_ON
+
+    return False
+
+def post_media_limit_for_kind(post_kind: str) -> int:
+    kind = str(post_kind or "").strip().lower()
+
+    if kind in (POST_KIND_PROJECTS, POST_KIND_AD):
+        return int(POST_MAX_PROJECT_MEDIA)
+
+    return int(POST_MAX_MEDIA)
+
+def post_media_limit_for_user(user_id: int) -> int:
+    return post_media_limit_for_kind(post_meta_kind(int(user_id)))
+
+POST_MEDIA_TYPES = {
+    "photo", "video",
+    "document", "audio", "voice", "animation", "video_note"
+}
+
+POST_GROUPABLE_MEDIA_TYPES = {"photo", "video"}
+
+def _post_media_item_clean(item: dict) -> Optional[dict]:
+    if not isinstance(item, dict):
+        return None
+
+    mtype = str(item.get("type") or "").strip().lower()
+    fid = str(item.get("file_id") or "").strip()
+
+    if mtype not in POST_MEDIA_TYPES or not fid:
+        return None
+
+    return {
+        "type": mtype,
+        "file_id": fid,
+        "media_group_id": str(item.get("media_group_id") or "").strip(),
+        "message_id": int(item.get("message_id") or 0),
+        "file_size": int(item.get("file_size") or 0),
+        "added_at": int(item.get("added_at") or 0),
+    }
+
+def _post_load_media(raw_json: str) -> list[dict]:
+    try:
+        data = json.loads((raw_json or "") or "[]")
+    except Exception:
+        data = []
+
+    if not isinstance(data, list):
+        return []
+
+    out = []
+    seen = set()
+
+    for item in data:
+        clean = _post_media_item_clean(item)
+        if not clean:
+            continue
+
+        key = (clean["type"], clean["file_id"])
+        if key in seen:
+            continue
+
+        seen.add(key)
+        out.append(clean)
+
+    out.sort(
+        key=lambda x: (
+            int(x.get("message_id") or 0) if int(x.get("message_id") or 0) > 0 else 10**18,
+            int(x.get("added_at") or 0)
+        )
+    )
+
+    return out[:POST_MAX_MEDIA]
+
+def _post_normalize_media_items(media_items: Optional[list[dict]] = None) -> list[dict]:
+    out = []
+    seen = set()
+
+    for item in list(media_items or []):
+        clean = _post_media_item_clean(item)
+        if not clean:
+            continue
+
+        key = (clean["type"], clean["file_id"])
+        if key in seen:
+            continue
+
+        seen.add(key)
+        out.append(clean)
+
+    out.sort(
+        key=lambda x: (
+            int(x.get("message_id") or 0) if int(x.get("message_id") or 0) > 0 else 10**18,
+            int(x.get("added_at") or 0)
+        )
+    )
+
+    return out[:POST_MAX_MEDIA]
+
+def post_update_get(user_id: int) -> dict:
+    row = db_one(
+        "SELECT version, title_html, intro_html, fixes_html, changes_html, new_html, active_part, updated_at "
+        "FROM post_update_drafts WHERE user_id=? LIMIT 1",
+        (int(user_id),)
+    )
+
+    if not row:
+        return {
+            "version": "",
+            "title_html": "",
+            "intro_html": "",
+            "fixes_html": "",
+            "changes_html": "",
+            "new_html": "",
+            "active_part": "",
+            "updated_at": 0,
+        }
+
+    return {
+        "version": str(row["version"] or "").strip(),
+        "title_html": str(row["title_html"] or "").strip(),
+        "intro_html": str(row["intro_html"] or "").strip(),
+        "fixes_html": str(row["fixes_html"] or "").strip(),
+        "changes_html": str(row["changes_html"] or "").strip(),
+        "new_html": str(row["new_html"] or "").strip(),
+        "active_part": str(row["active_part"] or "").strip(),
+        "updated_at": int(row["updated_at"] or 0),
+    }
+
+def post_update_save(user_id: int, data: dict):
+    db_exec(
+        "INSERT INTO post_update_drafts("
+        "user_id, version, title_html, intro_html, fixes_html, changes_html, new_html, active_part, updated_at"
+        ") VALUES (?,?,?,?,?,?,?,?,?) "
+        "ON CONFLICT(user_id) DO UPDATE SET "
+        "version=excluded.version, "
+        "title_html=excluded.title_html, "
+        "intro_html=excluded.intro_html, "
+        "fixes_html=excluded.fixes_html, "
+        "changes_html=excluded.changes_html, "
+        "new_html=excluded.new_html, "
+        "active_part=excluded.active_part, "
+        "updated_at=excluded.updated_at",
+        (
+            int(user_id),
+            str(data.get("version") or "").strip(),
+            str(data.get("title_html") or "").strip(),
+            str(data.get("intro_html") or "").strip(),
+            str(data.get("fixes_html") or "").strip(),
+            str(data.get("changes_html") or "").strip(),
+            str(data.get("new_html") or "").strip(),
+            str(data.get("active_part") or "").strip(),
+            int(now_ts())
+        ),
+        commit=True
+    )
+
+def post_update_set_version_title(user_id: int, version: str, title_html: str = ""):
+    data = post_update_get(int(user_id))
+    data["version"] = str(version or "").strip()
+    data["title_html"] = str(title_html or "").strip()
+    data["active_part"] = POST_UPDATE_PART_INTRO
+    post_update_save(int(user_id), data)
+
+def post_update_set_active_part(user_id: int, part: str):
+    p = str(part or "").strip()
+
+    if p not in (
+        POST_UPDATE_PART_MEDIA,
+        POST_UPDATE_PART_INTRO,
+        POST_UPDATE_PART_FIXES,
+        POST_UPDATE_PART_CHANGES,
+        POST_UPDATE_PART_NEW,
+    ):
+        p = ""
+
+    data = post_update_get(int(user_id))
+    data["active_part"] = p
+    post_update_save(int(user_id), data)
+
+def post_update_append_part(user_id: int, part: str, html_text: str):
+    p = str(part or "").strip()
+    add = str(html_text or "").strip()
+
+    if p not in POST_UPDATE_TEXT_PARTS or not add:
+        return
+
+    field = {
+        POST_UPDATE_PART_INTRO: "intro_html",
+        POST_UPDATE_PART_FIXES: "fixes_html",
+        POST_UPDATE_PART_CHANGES: "changes_html",
+        POST_UPDATE_PART_NEW: "new_html",
+    }.get(p)
+
+    if not field:
+        return
+
+    data = post_update_get(int(user_id))
+    data[field] = _post_join_html_text(str(data.get(field) or ""), add)
+    data["active_part"] = p
+    post_update_save(int(user_id), data)
+
+def post_update_part_label(part: str) -> str:
+    p = str(part or "").strip()
+
+    if p == POST_UPDATE_PART_MEDIA:
+        return "Медиа"
+    if p == POST_UPDATE_PART_INTRO:
+        return "Ввод"
+    if p == POST_UPDATE_PART_FIXES:
+        return "Исправления"
+    if p == POST_UPDATE_PART_CHANGES:
+        return "Изменения"
+    if p == POST_UPDATE_PART_NEW:
+        return "Новое"
+
+    return "не выбран"
+
+def _post_bot_link_for_update() -> str:
+    if not BOT_USERNAME:
+        refresh_bot_identity()
+
+    bot_name = str(BOT_TITLE or "").strip()
+    if not bot_name:
+        bot_name = str(BOT_USERNAME or "").lstrip("@").strip() or "Bio War Bot"
+
+    if BOT_USERNAME:
+        return f'<a href="https://t.me/{h(BOT_USERNAME.lstrip("@"))}"><b>{h(bot_name)}</b></a>'
+
+    return f"<b>{h(bot_name)}</b>"
+
+def post_update_build_text_html(user_id: int) -> str:
+    data = post_update_get(int(user_id))
+
+    version = str(data.get("version") or "").strip()
+    if not version:
+        return ""
+
+    title_html = str(data.get("title_html") or "").strip()
+    intro_html = str(data.get("intro_html") or "").strip()
+    fixes_html = str(data.get("fixes_html") or "").strip()
+    changes_html = str(data.get("changes_html") or "").strip()
+    new_html = str(data.get("new_html") or "").strip()
+
+    quote_lines = [
+        f"<i>Патч {h(version)}</i> {_post_bot_link_for_update()}"
+    ]
+
+    if title_html:
+        quote_lines.append("Название обновления:")
+        quote_lines.append(title_html)
+
+    quote_html = "<blockquote>" + "\n".join(quote_lines) + "</blockquote>"
+
+    parts = []
+
+    if intro_html:
+        parts.append(f"{intro_html}\n{quote_html}")
+    else:
+        parts.append(quote_html)
+
+    if fixes_html:
+        parts.append(f"<i>Что исправлено?</i>\n{fixes_html}")
+
+    if changes_html:
+        parts.append(f"<i>Что изменено?</i>\n{changes_html}")
+
+    if new_html:
+        parts.append(f"<i>Что нового?</i>\n{new_html}")
+
+    return "\n\n".join([x for x in parts if str(x or "").strip()]).strip()
+
+def post_effective_draft_text_html(user_id: int) -> str:
+    uid = int(user_id)
+    kind = post_meta_kind(uid)
+
+    if kind == POST_KIND_UPDATE:
+        return post_update_build_text_html(uid)
+
+    draft = post_draft_get(uid)
+    return str(draft.get("text_html") or "").strip()
+
+def _post_update_version_parse(raw_text: str) -> tuple[str, str, str]:
+    raw = str(raw_text or "").strip()
+
+    if not raw:
+        return "", "", "📑 Укажите версию обновления."
+
+    parts = raw.split(None, 1)
+    version = str(parts[0] or "").strip()
+    title = str(parts[1] or "").strip() if len(parts) > 1 else ""
+
+    if not re.match(r"^[A-Za-z0-9._-]+$", version):
+        return "", "", (
+            "📑 Версия указана некорректно.\n"
+            "Используйте только цифры, английские буквы и символы <code>.</code> <code>_</code> <code>-</code>, без пробелов."
+        )
+
+    return version, h(title) if title else "", ""
+
+def _post_update_part_cb(user_id: int, part: str) -> str:
+    return f"{POSTUPDUI_TAG}:{int(user_id)}:{str(part or '').strip()}"
+
+def _post_update_part_parse_cb(data: str):
+    try:
+        p = (data or "").split(":")
+        if len(p) != 3 or p[0] != POSTUPDUI_TAG:
+            return None, ""
+        return int(p[1]), str(p[2] or "").strip()
+    except Exception:
+        return None, ""
+
+def kb_post_update_parts(user_id: int) -> InlineKeyboardMarkup:
+    uid = int(user_id)
+    active = str(post_update_get(uid).get("active_part") or "")
+
+    def btn(text: str, part: str):
+        return _ikb(
+            text,
+            callback_data=_post_update_part_cb(uid, part),
+            style="primary" if active == part else None
+        )
+
+    kb = InlineKeyboardMarkup(row_width=3)
+
+    kb.row(
+        btn("Медиа", POST_UPDATE_PART_MEDIA),
+        btn("Ввод", POST_UPDATE_PART_INTRO)
+    )
+    kb.row(
+        btn("Исправления", POST_UPDATE_PART_FIXES),
+        btn("Изменения", POST_UPDATE_PART_CHANGES),
+        btn("Новое", POST_UPDATE_PART_NEW)
+    )
+
+    return kb
+
+def render_post_update_menu_text(user_id: int) -> str:
+    uid = int(user_id)
+    data = post_update_get(uid)
+    draft = post_draft_get(uid)
+
+    active = str(data.get("active_part") or "")
+    media_count = len(draft.get("media") or [])
+    media_limit = post_media_limit_for_user(uid)
+
+    lines = []
+    lines.append("📰 Подготовка поста")
+    lines.append("Тип: <b>{}</b>".format(h(post_kind_title(post_meta_kind(uid)))))
+    lines.append("")
+    lines.append(f"Версия: <b>{h(data.get('version') or 'не указана')}</b>")
+
+    if str(data.get("title_html") or "").strip():
+        lines.append(f"Название: {data.get('title_html')}")
+
+    lines.append("")
+    lines.append(f"Активный раздел: <b>{h(post_update_part_label(active))}</b>")
+    lines.append(f"Вложений: {media_count}/{media_limit}")
+    lines.append("")
+    lines.append("Выберите раздел кнопками ниже и отправьте текст или вложение.")
+
+    return "\n".join(lines)
 
 def post_draft_get(user_id: int) -> dict:
     row = db_one(
@@ -13311,7 +13773,7 @@ def post_draft_get(user_id: int) -> dict:
 
     return {
         "text_html": str(row["text_html"] or "").strip(),
-        "media": _report_draft_load_media(row["media_json"] or "[]"),
+        "media": _post_load_media(row["media_json"] or "[]"),
         "updated_at": int(row["updated_at"] or 0),
     }
 
@@ -13324,7 +13786,7 @@ def _post_join_html_text(old_text: str, new_text: str) -> str:
     if not new:
         return old
 
-    return f"{old}\n\n{new}"
+    return f"{old} {new}"
 
 def post_draft_append_text(user_id: int, text_html: str):
     add_text = str(text_html or "").strip()
@@ -13342,7 +13804,7 @@ def post_draft_append_text(user_id: int, text_html: str):
             ).fetchone()
 
             current_text = str(row["text_html"] or "").strip() if row else ""
-            media = _report_draft_load_media(row["media_json"] or "[]") if row else []
+            media = _post_load_media(row["media_json"] or "[]") if row else []
 
             new_text = _post_join_html_text(current_text, add_text)
             ts = int(now_ts())
@@ -13375,15 +13837,22 @@ def post_draft_add_media(
     media_file_id: str,
     *,
     media_group_id: str = "",
-    message_id: int = 0
+    message_id: int = 0,
+    file_size: int = 0
 ) -> tuple[bool, int]:
+    uid = int(user_id)
     mtype = str(media_type or "").strip().lower()
     fid = str(media_file_id or "").strip()
     group_id = str(media_group_id or "").strip()
     msg_id = int(message_id or 0)
+    fsize = int(file_size or 0)
 
-    if mtype not in ("photo", "video") or not fid:
-        draft = post_draft_get(int(user_id))
+    if mtype not in POST_MEDIA_TYPES or not fid:
+        draft = post_draft_get(uid)
+        return False, len(draft.get("media") or [])
+
+    if fsize > POST_FILE_MAX_BYTES:
+        draft = post_draft_get(uid)
         return False, len(draft.get("media") or [])
 
     with DB_LOCK:
@@ -13393,18 +13862,21 @@ def post_draft_add_media(
 
             row = c.execute(
                 "SELECT text_html, media_json FROM post_drafts WHERE user_id=? LIMIT 1",
-                (int(user_id),)
+                (uid,)
             ).fetchone()
 
             text_html = str(row["text_html"] or "").strip() if row else ""
-            media = _report_draft_load_media(row["media_json"] or "[]") if row else []
+            media = _post_load_media(row["media_json"] or "[]") if row else []
 
             for item in media:
                 if str(item.get("type") or "") == mtype and str(item.get("file_id") or "") == fid:
                     conn.commit()
                     return True, len(media)
 
-            if len(media) >= POST_MAX_MEDIA:
+            kind = post_meta_kind(uid)
+            max_media = POST_MAX_PROJECT_MEDIA if kind in (POST_KIND_PROJECTS, POST_KIND_AD) else POST_MAX_MEDIA
+
+            if len(media) >= max_media:
                 conn.commit()
                 return False, len(media)
 
@@ -13413,10 +13885,11 @@ def post_draft_add_media(
                 "file_id": fid,
                 "media_group_id": group_id,
                 "message_id": msg_id,
+                "file_size": fsize,
                 "added_at": int(now_ts()),
             })
 
-            media = _report_draft_load_media(json.dumps(media, ensure_ascii=False))
+            media = _post_load_media(json.dumps(media, ensure_ascii=False))
             ts = int(now_ts())
 
             c.execute(
@@ -13424,15 +13897,15 @@ def post_draft_add_media(
                 "ON CONFLICT(user_id) DO UPDATE SET "
                 "text_html=excluded.text_html, media_json=excluded.media_json, updated_at=excluded.updated_at",
                 (
-                    int(user_id),
+                    uid,
                     text_html,
-                    json.dumps(media[:POST_MAX_MEDIA], ensure_ascii=False),
+                    json.dumps(media[:max_media], ensure_ascii=False),
                     ts
                 )
             )
 
             conn.commit()
-            return True, len(media[:POST_MAX_MEDIA])
+            return True, len(media[:max_media])
         except Exception:
             conn.rollback()
             raise
@@ -13638,11 +14111,88 @@ def _post_message_html_payload(message) -> str:
 
     return h(raw.strip())
 
+def _post_extract_media_from_message(message) -> tuple[str, str, int]:
+    ctype = str(getattr(message, "content_type", "") or "").strip().lower()
+
+    try:
+        if ctype == "photo" and message.photo:
+            return "photo", message.photo[-1].file_id, int(getattr(message.photo[-1], "file_size", 0) or 0)
+
+        if ctype == "video" and message.video:
+            return "video", message.video.file_id, int(getattr(message.video, "file_size", 0) or 0)
+
+        if ctype == "document" and message.document:
+            return "document", message.document.file_id, int(getattr(message.document, "file_size", 0) or 0)
+
+        if ctype == "audio" and message.audio:
+            return "audio", message.audio.file_id, int(getattr(message.audio, "file_size", 0) or 0)
+
+        if ctype == "voice" and message.voice:
+            return "voice", message.voice.file_id, int(getattr(message.voice, "file_size", 0) or 0)
+
+        if ctype == "animation" and message.animation:
+            return "animation", message.animation.file_id, int(getattr(message.animation, "file_size", 0) or 0)
+
+        if ctype == "video_note" and message.video_note:
+            return "video_note", message.video_note.file_id, int(getattr(message.video_note, "file_size", 0) or 0)
+    except Exception:
+        pass
+
+    return "", "", 0
+
 def kb_post_draft() -> ReplyKeyboardMarkup:
     kb = ReplyKeyboardMarkup(resize_keyboard=True, selective=True)
     kb.row(
         KeyboardButton(POST_SUBMIT_TEXT),
         KeyboardButton(POST_CANCEL_TEXT)
+    )
+    return kb
+
+def _post_type_cb(user_id: int, kind: str) -> str:
+    return f"{POSTTYPEUI_TAG}:{int(user_id)}:{str(kind or '').strip()}"
+
+def _post_type_parse_cb(data: str):
+    try:
+        p = (data or "").split(":")
+        if len(p) != 3 or p[0] != POSTTYPEUI_TAG:
+            return None, ""
+        return int(p[1]), str(p[2] or "").strip()
+    except Exception:
+        return None, ""
+
+def kb_post_type_choice(user_id: int) -> InlineKeyboardMarkup:
+    uid = int(user_id)
+    kb = InlineKeyboardMarkup(row_width=2)
+
+    kb.row(
+        _ikb("Обновление", callback_data=_post_type_cb(uid, POST_KIND_UPDATE)),
+        _ikb("Проекты", callback_data=_post_type_cb(uid, POST_KIND_PROJECTS))
+    )
+    kb.row(
+        _ikb("Прочее", callback_data=_post_type_cb(uid, POST_KIND_OTHER)),
+        _ikb("Реклама", callback_data=_post_type_cb(uid, POST_KIND_AD))
+    )
+
+    return kb
+
+def _post_promo_choice_cb(user_id: int, promo_enabled: int) -> str:
+    return f"{POSTPROMOUI_TAG}:{int(user_id)}:{int(promo_enabled)}"
+
+def _post_promo_choice_parse_cb(data: str):
+    try:
+        p = (data or "").split(":")
+        if len(p) != 3 or p[0] != POSTPROMOUI_TAG:
+            return None, 0
+        return int(p[1]), int(p[2])
+    except Exception:
+        return None, 0
+
+def kb_post_other_promo_choice(user_id: int) -> InlineKeyboardMarkup:
+    uid = int(user_id)
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.row(
+        _ikb("С промокодом", callback_data=_post_promo_choice_cb(uid, POST_PROMO_ON), style="success"),
+        _ikb("Без промокода", callback_data=_post_promo_choice_cb(uid, POST_PROMO_OFF), style="danger")
     )
     return kb
 
@@ -13671,18 +14221,19 @@ def _post_schedule_media_group_ack(user_id: int, media_group_id: str, message):
 
             draft = post_draft_get(int(user_id))
             media_count = len(draft.get("media") or [])
+            media_limit = post_media_limit_for_user(int(user_id))
 
-            if media_count >= POST_MAX_MEDIA:
+            if media_count >= media_limit:
                 txt = (
                     "✅ Группа вложений обработана.\n"
-                    f"Вложений: {media_count}/{POST_MAX_MEDIA}\n"
+                    f"Вложений: {media_count}/{media_limit}\n"
                     "⚠️ Достигнут лимит вложений. Новые вложения больше не добавляются.\n"
                     f"Теперь нажмите «{POST_SUBMIT_TEXT}» или отправьте дополнительный текст."
                 )
             else:
                 txt = (
                     "✅ Группа вложений добавлена.\n"
-                    f"Вложений: {media_count}/{POST_MAX_MEDIA}\n"
+                    f"Вложений: {media_count}/{media_limit}\n"
                     f"Теперь нажмите «{POST_SUBMIT_TEXT}» или добавьте ещё вложения."
                 )
 
@@ -13775,6 +14326,31 @@ def _post_html_text_units(raw_text: str):
         for ch in s[pos:]:
             yield ch, 1
 
+def _post_html_text_segments(raw_text: str):
+    buf = ""
+    buf_len = 0
+    buf_is_space = None
+
+    for unit, unit_len in _post_html_text_units(raw_text):
+        try:
+            visible = html_lib.unescape(unit)
+        except Exception:
+            visible = unit
+
+        is_space = bool(str(visible or "").isspace())
+
+        if buf and buf_is_space != is_space:
+            yield buf, buf_len, bool(buf_is_space)
+            buf = ""
+            buf_len = 0
+
+        buf += unit
+        buf_len += int(unit_len or 0)
+        buf_is_space = is_space
+
+    if buf:
+        yield buf, buf_len, bool(buf_is_space)
+
 def _post_html_split_by_visible_limit(html_text: str, limit: int) -> list[str]:
     limit = max(1, int(limit or 1))
     s = str(html_text or "").strip()
@@ -13793,14 +14369,29 @@ def _post_html_split_by_visible_limit(html_text: str, limit: int) -> list[str]:
     def reopen_tags() -> str:
         return "".join(tag for _name, tag in stack)
 
+    def cur_has_visible_text() -> bool:
+        return _post_html_visible_len(cur) > 0
+
     def finish_chunk():
         nonlocal cur, cur_len
 
-        if cur.strip():
-            chunks.append(cur + close_tags())
+        if cur_has_visible_text():
+            chunks.append(cur.rstrip() + close_tags())
 
         cur = reopen_tags()
         cur_len = 0
+
+    def append_long_word_by_units(word_text: str):
+        nonlocal cur, cur_len
+
+        for unit, unit_len in _post_html_text_units(word_text):
+            unit_len = int(unit_len or 0)
+
+            if cur_len + unit_len > limit and cur_len > 0:
+                finish_chunk()
+
+            cur += unit
+            cur_len += unit_len
 
     for token in tokens:
         if not token:
@@ -13819,15 +14410,39 @@ def _post_html_split_by_visible_limit(html_text: str, limit: int) -> list[str]:
                         break
             continue
 
-        for unit, unit_len in _post_html_text_units(token):
-            if cur_len + unit_len > limit and cur_len > 0:
+        for seg_text, seg_len, seg_is_space in _post_html_text_segments(token):
+            seg_text = str(seg_text or "")
+            seg_len = int(seg_len or 0)
+
+            if not seg_text or seg_len <= 0:
+                continue
+
+            if seg_is_space and cur_len <= 0:
+                continue
+
+            if seg_is_space:
+                if cur_len + seg_len <= limit:
+                    cur += seg_text
+                    cur_len += seg_len
+                else:
+                    finish_chunk()
+                continue
+
+            if seg_len <= limit:
+                if cur_len + seg_len > limit and cur_len > 0:
+                    finish_chunk()
+
+                cur += seg_text
+                cur_len += seg_len
+                continue
+
+            if cur_len > 0:
                 finish_chunk()
 
-            cur += unit
-            cur_len += unit_len
+            append_long_word_by_units(seg_text)
 
-    if cur.strip():
-        chunks.append(cur + close_tags())
+    if cur_has_visible_text():
+        chunks.append(cur.rstrip() + close_tags())
 
     return [c for c in chunks if _post_html_visible_len(c) > 0]
 
@@ -14025,6 +14640,392 @@ def _post_text_with_promo_extra(text_html: str, promo_info: dict, *, expandable_
         return f"{base}\n\n{extra}"
     return extra
 
+def _post_channel_username(channel_id: int) -> str:
+    try:
+        ch = bot.get_chat(int(channel_id))
+        un = str(getattr(ch, "username", "") or "").strip()
+        return un.lstrip("@")
+    except Exception:
+        return ""
+
+def _post_channel_tag_suffix(channel_id: int) -> str:
+    un = _post_channel_username(int(channel_id))
+    return f"@{h(un)}" if un else ""
+
+def _post_kind_tag_html(post_kind: str, channel_id: int, text_html: str = "") -> str:
+    kind = str(post_kind or "").strip().lower()
+    suffix = _post_channel_tag_suffix(int(channel_id))
+
+    if kind == POST_KIND_PROJECTS:
+        return f"#проекты{suffix}"
+
+    if kind == POST_KIND_OTHER:
+        return f"#щитпостинг{suffix}"
+
+    if kind == POST_KIND_AD:
+        tags = []
+        links = _post_extract_links_for_buttons(text_html)
+        tg_channel = ""
+        tg_bot = ""
+
+        for item in links:
+            url = str(item.get("url") or "")
+            kind2 = str(item.get("kind") or "")
+
+            if kind2 == "channel" and not tg_channel:
+                tg_channel = str(item.get("username") or "").lstrip("@")
+            elif kind2 == "bot" and not tg_bot:
+                tg_bot = str(item.get("username") or "").lstrip("@")
+
+        if tg_channel:
+            tags.append(f"#реклама@{h(tg_channel)}")
+        if tg_bot:
+            tags.append(f"#реклама@{h(tg_bot)}")
+
+        if not tags:
+            tags.append(f"#реклама{suffix}")
+
+        return "\n".join(tags)
+
+    return _post_update_tag_html()
+
+def _post_url_normalize(raw: str) -> str:
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+
+    s = s.strip(" \t\r\n.,;:!?)]}»”'\"")
+
+    if s.startswith("@"):
+        return f"https://t.me/{s[1:]}"
+
+    if s.startswith("t.me/"):
+        return f"https://{s}"
+
+    if s.startswith("telegram.me/"):
+        return f"https://{s}"
+
+    if s.startswith(("http://", "https://")):
+        return s
+
+    if re.match(r"^[A-Za-z0-9.-]+\.[A-Za-z]{2,}(/.*)?$", s):
+        return f"https://{s}"
+
+    return ""
+
+def _post_link_kind_and_username(url: str) -> tuple[str, str]:
+    u = str(url or "").strip()
+
+    m = re.search(r"(?:https?://)?(?:t\.me|telegram\.me)/([A-Za-z0-9_]{3,64})", u, flags=re.IGNORECASE)
+    if m:
+        username = m.group(1)
+        if username.lower().endswith("bot"):
+            return "bot", username
+        return "channel", username
+
+    return "external", ""
+
+def _post_default_button_text(link_kind: str) -> str:
+    if link_kind == "channel":
+        return "Перейти в тгк"
+    if link_kind == "bot":
+        return "Перейти к боту"
+    return "Перейти в источник"
+
+def _post_link_button_url(url: str, link_kind: str) -> str:
+    if link_kind == "bot":
+        m = re.search(r"(?:https?://)?(?:t\.me|telegram\.me)/([A-Za-z0-9_]{3,64})", url, flags=re.IGNORECASE)
+        if m:
+            return f"https://t.me/{m.group(1)}?start=1"
+    return url
+
+def _post_button_text_sanitize(text: str, fallback: str) -> str:
+    s = str(text or "").strip()
+    if not s:
+        return fallback
+
+    if len(s) > 64:
+        s = s[:64].rstrip()
+
+    return s or fallback
+
+_POST_LINK_BUTTON_PATTERN = re.compile(
+    r"(?:(?:https?://)?(?:t\.me|telegram\.me)/[A-Za-z0-9_]{3,64}"
+    r"|https?://[^\s<>()]+"
+    r"|@[A-Za-z0-9_]{3,64}"
+    r"|[A-Za-z0-9.-]+\.[A-Za-z]{2,}/?[^\s<>()]*)",
+    flags=re.IGNORECASE
+)
+
+def _post_plain_link_matches(plain_text: str) -> list[dict]:
+    plain = str(plain_text or "")
+    out = []
+
+    for m in _POST_LINK_BUTTON_PATTERN.finditer(plain):
+        raw_url = m.group(0)
+        url = _post_url_normalize(raw_url)
+        if not url:
+            continue
+
+        kind, username = _post_link_kind_and_username(url)
+        out.append({
+            "raw": raw_url,
+            "url": _post_link_button_url(url, kind),
+            "base_url": url,
+            "kind": kind,
+            "username": username,
+            "start": int(m.start()),
+            "end": int(m.end()),
+            "label": _post_default_button_text(kind),
+        })
+
+    return out
+
+def _post_first_line_custom_links(text_html: str) -> list[dict]:
+    plain = _post_html_visible_text(text_html)
+    first_line, _body = _timer_first_line_and_body(plain)
+
+    first_line = str(first_line or "").strip()
+    if not first_line:
+        return []
+
+    matches = _post_plain_link_matches(first_line)
+    if not matches:
+        return []
+
+    out = []
+
+    for i, item in enumerate(matches):
+        label_start = int(item["end"])
+        label_end = int(matches[i + 1]["start"]) if i + 1 < len(matches) else len(first_line)
+
+        raw_label = first_line[label_start:label_end].strip(" \t\r\n—-–|:;")
+        fallback = _post_default_button_text(str(item.get("kind") or ""))
+        label = _post_button_text_sanitize(raw_label, fallback)
+
+        out.append({
+            "url": str(item.get("url") or ""),
+            "kind": str(item.get("kind") or ""),
+            "username": str(item.get("username") or ""),
+            "label": label,
+            "custom": bool(raw_label),
+        })
+
+        if len(out) >= POST_MAX_LINK_BUTTONS:
+            break
+
+    return out
+
+def _post_hidden_first_line_urls(text_html: str) -> set[str]:
+    out = set()
+
+    for item in _post_first_line_custom_links(text_html):
+        url = str(item.get("url") or "").strip()
+        if url:
+            out.add(url)
+
+    return out
+
+def _post_has_hidden_first_line_links(text_html: str) -> bool:
+    return bool(_post_hidden_first_line_urls(text_html))
+
+def _post_remove_hidden_first_line_html(text_html: str) -> str:
+    raw = str(text_html or "")
+
+    if not _post_has_hidden_first_line_links(raw):
+        return raw.strip()
+
+    if "\n" not in raw:
+        return ""
+
+    _first, body = raw.split("\n", 1)
+    return str(body or "").lstrip()
+
+def _post_display_text_for_kind(post_kind: str, text_html: str) -> str:
+    kind = str(post_kind or "").strip().lower()
+
+    if kind in (POST_KIND_PROJECTS, POST_KIND_AD):
+        return _post_remove_hidden_first_line_html(text_html)
+
+    return str(text_html or "").strip()
+
+def _post_link_notice_html(text_html: str) -> str:
+    raw = str(text_html or "")
+    hidden_urls = _post_hidden_first_line_urls(raw)
+
+    links = []
+
+    # 1) Скрытые ссылки первой строки.
+    for item in _post_first_line_custom_links(raw):
+        url = str(item.get("url") or "").strip()
+        if not url:
+            continue
+
+        links.append({
+            "url": url,
+            "hidden": True,
+        })
+
+    # 2) HTML-ссылки из видимой части.
+    visible_html = _post_remove_hidden_first_line_html(raw)
+
+    for m in re.finditer(
+        r'<a\s+[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
+        visible_html,
+        flags=re.IGNORECASE | re.DOTALL
+    ):
+        url = _post_url_normalize(html_lib.unescape(m.group(1)))
+        if not url:
+            continue
+
+        kind, _username = _post_link_kind_and_username(url)
+        links.append({
+            "url": _post_link_button_url(url, kind),
+            "hidden": False,
+        })
+
+    # 3) Чистые ссылки из видимой части.
+    visible_plain = _post_html_visible_text(visible_html)
+
+    for item in _post_plain_link_matches(visible_plain):
+        url = str(item.get("url") or "").strip()
+        if not url:
+            continue
+
+        links.append({
+            "url": url,
+            "hidden": False,
+        })
+
+    if not links:
+        return ""
+
+    dedup = []
+    seen = set()
+
+    for item in links:
+        url = str(item.get("url") or "").strip()
+        if not url or url in seen:
+            continue
+
+        seen.add(url)
+        dedup.append(item)
+
+    if not dedup:
+        return ""
+
+    lines = []
+
+    for i, item in enumerate(dedup[:6], 1):
+        is_hidden = bool(item.get("hidden"))
+
+        if i <= POST_MAX_LINK_BUTTONS:
+            if is_hidden:
+                lines.append(f"✅ Скрытая ссылка {i} обработана")
+            else:
+                lines.append(f"✅ Ссылка {i} обработана")
+        else:
+            if is_hidden:
+                lines.append(f"🚫 Скрытая ссылка {i} отклонена")
+            else:
+                lines.append(f"🚫 Ссылка {i} отклонена")
+
+    if len(dedup) > 6:
+        lines.append("…")
+
+    body = "\n".join(lines).strip()
+    if not body:
+        return ""
+
+    if len(dedup) > 4:
+        return f"<blockquote expandable>{h(body)}</blockquote>"
+
+    return body
+
+def _post_extract_links_for_buttons(text_html: str) -> list[dict]:
+    raw = str(text_html or "")
+    links = []
+
+    for item in _post_first_line_custom_links(raw):
+        links.append(item)
+
+    for m in re.finditer(
+        r'<a\s+[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
+        raw,
+        flags=re.IGNORECASE | re.DOTALL
+    ):
+        url = _post_url_normalize(html_lib.unescape(m.group(1)))
+        label = _post_html_visible_text(m.group(2)).strip()
+
+        if not url:
+            continue
+
+        kind, username = _post_link_kind_and_username(url)
+        links.append({
+            "url": _post_link_button_url(url, kind),
+            "kind": kind,
+            "username": username,
+            "label": _post_button_text_sanitize(label, _post_default_button_text(kind)),
+            "custom": bool(label),
+        })
+
+    visible_html = _post_remove_hidden_first_line_html(raw)
+    plain = _post_html_visible_text(visible_html)
+
+    for item in _post_plain_link_matches(plain):
+        links.append({
+            "url": str(item.get("url") or ""),
+            "kind": str(item.get("kind") or ""),
+            "username": str(item.get("username") or ""),
+            "label": _post_default_button_text(str(item.get("kind") or "")),
+            "custom": False,
+        })
+
+    out = []
+    seen = set()
+
+    for item in links:
+        url = str(item.get("url") or "").strip()
+        if not url or url in seen:
+            continue
+
+        seen.add(url)
+        out.append(item)
+
+        if len(out) >= POST_MAX_LINK_BUTTONS:
+            break
+
+    return out
+
+def kb_post_external_links(text_html: str) -> Optional[InlineKeyboardMarkup]:
+    links = _post_extract_links_for_buttons(text_html)
+    if not links:
+        return None
+
+    kb = InlineKeyboardMarkup(row_width=1)
+    for item in links[:POST_MAX_LINK_BUTTONS]:
+        kb.add(
+            _ikb(
+                str(item.get("label") or _post_default_button_text(str(item.get("kind") or ""))),
+                url=str(item.get("url") or ""),
+                style="primary"
+            )
+        )
+
+    return kb
+
+def _post_append_tag(text_html: str, tag_html: str) -> str:
+    base = str(text_html or "").strip()
+    tag = str(tag_html or "").strip()
+
+    if not tag:
+        return base
+
+    if base:
+        return f"{base}\n\n{tag}"
+
+    return tag
+
 def _post_add_to_chat_url() -> str:
     if not BOT_USERNAME:
         refresh_bot_identity()
@@ -14062,7 +15063,13 @@ def kb_post_publication(promo_code: str) -> Optional[InlineKeyboardMarkup]:
 
     return kb if rows > 0 else None
 
-def _post_send_message_raw(chat_id: int, text_html: str, *, reply_markup=None) -> bool:
+def _post_send_message_raw(
+    chat_id: int,
+    text_html: str,
+    *,
+    reply_markup=None,
+    disable_web_page_preview: bool = True
+) -> bool:
     try:
         text_html = str(text_html or "").strip()
         if not text_html:
@@ -14072,7 +15079,7 @@ def _post_send_message_raw(chat_id: int, text_html: str, *, reply_markup=None) -
             int(chat_id),
             text_html,
             parse_mode="HTML",
-            disable_web_page_preview=True,
+            disable_web_page_preview=bool(disable_web_page_preview),
             reply_markup=reply_markup
         )
         return True
@@ -14081,8 +15088,11 @@ def _post_send_message_raw(chat_id: int, text_html: str, *, reply_markup=None) -
         return False
 
 def _post_input_media_item_html(item: dict, *, caption_html: str = ""):
-    clean = _report_media_item_clean(item)
+    clean = _post_media_item_clean(item)
     if not clean:
+        return None
+
+    if clean["type"] not in POST_GROUPABLE_MEDIA_TYPES:
         return None
 
     caption_html = str(caption_html or "").strip()
@@ -14098,6 +15108,46 @@ def _post_input_media_item_html(item: dict, *, caption_html: str = ""):
 
     return InputMediaVideo(**kwargs)
 
+def _post_send_single_media_to_chat(chat_id: int, item: dict, *, caption_html: str = "", reply_markup=None) -> bool:
+    clean = _post_media_item_clean(item)
+    if not clean:
+        return False
+
+    caption_html = str(caption_html or "").strip()
+    kwargs = {
+        "caption": caption_html or None,
+        "parse_mode": "HTML" if caption_html else None,
+        "reply_markup": reply_markup,
+    }
+
+    try:
+        mtype = clean["type"]
+        fid = clean["file_id"]
+
+        if mtype == "photo":
+            _REAL_BOT_SEND_PHOTO(int(chat_id), fid, **kwargs)
+        elif mtype == "video":
+            _REAL_BOT_SEND_VIDEO(int(chat_id), fid, **kwargs)
+        elif mtype == "document":
+            bot.send_document(int(chat_id), fid, **kwargs)
+        elif mtype == "audio":
+            bot.send_audio(int(chat_id), fid, **kwargs)
+        elif mtype == "voice":
+            bot.send_voice(int(chat_id), fid, caption=caption_html or None, parse_mode="HTML" if caption_html else None)
+        elif mtype == "animation":
+            bot.send_animation(int(chat_id), fid, **kwargs)
+        elif mtype == "video_note":
+            bot.send_video_note(int(chat_id), fid)
+            if caption_html or reply_markup:
+                _post_send_message_raw(int(chat_id), caption_html or " ", reply_markup=reply_markup)
+        else:
+            return False
+
+        return True
+    except Exception as e:
+        send_error_report("_post_send_single_media_to_chat", e)
+        return False
+
 def _post_send_media_group_to_chat(
     chat_id: int,
     media_items: list[dict],
@@ -14105,54 +15155,60 @@ def _post_send_media_group_to_chat(
     caption_html: str = "",
     reply_markup=None
 ) -> bool:
-    items = _report_normalize_media_items(media_items)
+    items = _post_normalize_media_items(media_items)
     if not items:
         return False
 
     caption_html = str(caption_html or "").strip()
 
     if len(items) == 1:
-        first = items[0]
-        try:
-            if first["type"] == "photo":
-                _REAL_BOT_SEND_PHOTO(
-                    int(chat_id),
-                    first["file_id"],
-                    caption=caption_html or None,
-                    parse_mode="HTML" if caption_html else None,
-                    reply_markup=reply_markup
-                )
-            else:
-                _REAL_BOT_SEND_VIDEO(
-                    int(chat_id),
-                    first["file_id"],
-                    caption=caption_html or None,
-                    parse_mode="HTML" if caption_html else None,
-                    reply_markup=reply_markup
-                )
-            return True
-        except Exception as e:
-            send_error_report("_post_send_media_group_to_chat.single", e)
-            return False
-
-    media_payload = []
-    for i, item in enumerate(items[:POST_MAX_MEDIA]):
-        media_obj = _post_input_media_item_html(
-            item,
-            caption_html=caption_html if i == 0 else ""
+        return _post_send_single_media_to_chat(
+            int(chat_id),
+            items[0],
+            caption_html=caption_html,
+            reply_markup=reply_markup
         )
-        if media_obj:
-            media_payload.append(media_obj)
 
-    if not media_payload:
-        return False
+    groupable = [x for x in items if str(x.get("type") or "") in POST_GROUPABLE_MEDIA_TYPES]
+    files = [x for x in items if str(x.get("type") or "") not in POST_GROUPABLE_MEDIA_TYPES]
 
-    try:
-        bot.send_media_group(int(chat_id), media_payload)
-        return True
-    except Exception as e:
-        send_error_report("_post_send_media_group_to_chat.group", e)
-        return False
+    ok = False
+
+    if groupable:
+        media_payload = []
+        for i, item in enumerate(groupable[:POST_MAX_MEDIA]):
+            media_obj = _post_input_media_item_html(
+                item,
+                caption_html=caption_html if i == 0 else ""
+            )
+            if media_obj:
+                media_payload.append(media_obj)
+
+        if media_payload:
+            try:
+                bot.send_media_group(int(chat_id), media_payload)
+                ok = True
+            except Exception as e:
+                send_error_report("_post_send_media_group_to_chat.group", e)
+
+        for item in files:
+            if _post_send_single_media_to_chat(int(chat_id), item):
+                ok = True
+
+        return ok
+
+    first = True
+    for item in items:
+        sent = _post_send_single_media_to_chat(
+            int(chat_id),
+            item,
+            caption_html=caption_html if first else "",
+            reply_markup=reply_markup if first else None
+        )
+        ok = bool(ok or sent)
+        first = False
+
+    return ok
 
 def _post_publish_draft(user_id: int, overflow_mode: str = "") -> tuple[bool, str]:
     uid = int(user_id)
@@ -14164,175 +15220,162 @@ def _post_publish_draft(user_id: int, overflow_mode: str = "") -> tuple[bool, st
 
     channel_id = int(selected["channel_id"])
     draft = post_draft_get(uid)
+    meta = post_meta_get(uid)
 
-    text_html = str(draft.get("text_html") or "").strip()
-    media_items = _report_normalize_media_items(list(draft.get("media") or []))
+    post_kind = str(meta.get("post_kind") or POST_KIND_UPDATE)
+    use_promo = post_kind_has_promo(uid)
+
+    if post_kind == POST_KIND_UPDATE:
+        text_html = post_update_build_text_html(uid)
+        source_text_html = text_html
+        display_text_html = text_html
+    else:
+        text_html = str(draft.get("text_html") or "").strip()
+        source_text_html = text_html
+        display_text_html = _post_display_text_for_kind(post_kind, source_text_html)
+
+    media_items = _post_normalize_media_items(list(draft.get("media") or []))
+
+    if post_kind == POST_KIND_UPDATE and not text_html:
+        return False, "📑 Сначала укажите версию обновления."
 
     if not text_html and not media_items:
-        return False, "📑 Черновик пуст. Добавьте текст, фото или видео."
+        return False, "📑 Черновик пуст. Добавьте текст, фото, видео или файл."
 
     promo_info = None
 
     try:
-        promo_info = _post_create_publication_promo(uid)
-        promo_code = str(promo_info.get("code") or "").strip()
-        extra_html = _post_promo_extra_html(promo_info)
-        rm = kb_post_publication(promo_code)
+        rm = None
+        extra_html = ""
+        full_text_html = text_html
 
-        text_len = _post_html_visible_len(text_html)
-        full_text_html = _post_text_with_promo_extra(text_html, promo_info)
+        if use_promo:
+            promo_info = _post_create_publication_promo(uid)
+            promo_code = str(promo_info.get("code") or "").strip()
+            extra_html = _post_promo_extra_html(promo_info)
+            full_text_html = _post_text_with_promo_extra(display_text_html, promo_info)
+            rm = kb_post_publication(promo_code)
+        else:
+            tag_html = _post_kind_tag_html(post_kind, int(channel_id), source_text_html)
+            full_text_html = _post_append_tag(display_text_html, tag_html)
+
+            if post_kind in (POST_KIND_PROJECTS, POST_KIND_AD):
+                rm = kb_post_external_links(source_text_html)
+
+        text_len = _post_html_visible_len(display_text_html)
         full_len = _post_html_visible_len(full_text_html)
         media_count = len(media_items)
+        has_media = media_count > 0
+        has_group = media_count > 1
+
+        disable_preview = True
+        if post_kind == POST_KIND_PROJECTS and not has_media:
+            disable_preview = False
+        if post_kind == POST_KIND_AD and not has_media:
+            disable_preview = False
 
         needs_choice = False
 
-        if media_count <= 0:
-            needs_choice = text_len > POST_TEXT_LIMIT
+        if not has_media:
+            needs_choice = full_len > POST_TEXT_LIMIT
         elif media_count == 1:
-            needs_choice = text_len > POST_CAPTION_LIMIT or full_len > POST_TEXT_LIMIT
+            needs_choice = full_len > POST_TEXT_LIMIT
         else:
             needs_choice = text_len > POST_CAPTION_LIMIT
 
         if needs_choice and overflow_mode not in (POST_PUBLISH_PARTS_ACTION, POST_PUBLISH_TRUNCATE_ACTION):
-            try:
-                _promo_delete_by_id(int(promo_info.get("promo_id") or 0))
-            except Exception:
-                pass
-
+            if promo_info:
+                try:
+                    _promo_delete_by_id(int(promo_info.get("promo_id") or 0))
+                except Exception:
+                    pass
             return False, POST_LIMIT_CHOICE_TOKEN
 
         if overflow_mode == POST_PUBLISH_TRUNCATE_ACTION:
-            if media_count <= 0:
-                available = max(1, POST_TEXT_LIMIT - _post_html_visible_len(extra_html) - 2)
-                text_part = _post_html_truncate_by_visible_limit(text_html, available)
-                final_html = _post_text_with_promo_extra(text_part, promo_info)
-
+            if not has_media:
+                final_html = _post_html_truncate_by_visible_limit(full_text_html, POST_TEXT_LIMIT)
                 ok = _post_send_message_raw(
                     int(channel_id),
                     final_html,
-                    reply_markup=rm
+                    reply_markup=rm,
+                    disable_web_page_preview=disable_preview
                 )
                 return bool(ok), "✅ Пост опубликован." if ok else "❎ Не удалось опубликовать пост."
 
             if media_count == 1:
-                available = max(1, POST_CAPTION_LIMIT - _post_html_visible_len(extra_html) - 2)
-                text_part = _post_html_truncate_by_visible_limit(text_html, available)
-                final_html = _post_text_with_promo_extra(text_part, promo_info)
+                if _post_html_visible_len(full_text_html) <= POST_CAPTION_LIMIT:
+                    final_html = full_text_html
+                    ok = _post_send_media_group_to_chat(int(channel_id), media_items, caption_html=final_html, reply_markup=rm)
+                    return bool(ok), "✅ Пост опубликован." if ok else "❎ Не удалось опубликовать пост."
 
-                ok = _post_send_media_group_to_chat(
-                    int(channel_id),
-                    media_items,
-                    caption_html=final_html,
-                    reply_markup=rm
-                )
-                return bool(ok), "✅ Пост опубликован." if ok else "❎ Не удалось опубликовать пост."
+                final_html = _post_html_truncate_by_visible_limit(full_text_html, POST_TEXT_LIMIT)
+                ok_media = _post_send_media_group_to_chat(int(channel_id), media_items, caption_html="")
+                ok_text = _post_send_message_raw(int(channel_id), final_html, reply_markup=rm)
+                return bool(ok_media and ok_text), "✅ Пост опубликован." if ok_media and ok_text else "❎ Не удалось опубликовать пост."
 
-            text_part = _post_html_truncate_by_visible_limit(text_html, POST_CAPTION_LIMIT)
-            ok_media = _post_send_media_group_to_chat(
-                int(channel_id),
-                media_items,
-                caption_html=text_part
-            )
+            first_caption = _post_html_truncate_by_visible_limit(display_text_html, POST_CAPTION_LIMIT)
+            ok_media = _post_send_media_group_to_chat(int(channel_id), media_items, caption_html=first_caption)
             if not ok_media:
                 return False, "❎ Не удалось опубликовать вложения поста."
 
-            ok_extra = _post_send_message_raw(
-                int(channel_id),
-                extra_html,
-                reply_markup=rm
-            )
-            return bool(ok_extra), "✅ Пост опубликован." if ok_extra else "❎ Не удалось опубликовать экстра-строку."
+            if use_promo and extra_html:
+                ok_extra = _post_send_message_raw(int(channel_id), extra_html, reply_markup=rm)
+                return bool(ok_extra), "✅ Пост опубликован." if ok_extra else "❎ Не удалось опубликовать экстра-строку."
+
+            return True, "✅ Пост опубликован."
 
         if overflow_mode == POST_PUBLISH_PARTS_ACTION:
-            if media_count > 0:
-                first_limit = POST_CAPTION_LIMIT
-                parts = _post_html_split_by_visible_limit(text_html, first_limit)
-
+            if has_media:
+                parts = _post_html_split_by_visible_limit(full_text_html if media_count == 1 else display_text_html, POST_CAPTION_LIMIT)
                 first_caption = parts[0] if parts else ""
-                rest_html = "\n\n".join(parts[1:]).strip()
 
-                ok_media = _post_send_media_group_to_chat(
-                    int(channel_id),
-                    media_items,
-                    caption_html=first_caption
-                )
+                ok_media = _post_send_media_group_to_chat(int(channel_id), media_items, caption_html=first_caption)
                 if not ok_media:
                     return False, "❎ Не удалось опубликовать вложения поста."
 
+                rest_html = "\n\n".join(parts[1:]).strip()
                 if rest_html:
-                    rest_chunks = _post_html_split_by_visible_limit(rest_html, POST_TEXT_LIMIT)
-                    for ch in rest_chunks:
-                        if ch.strip():
-                            if not _post_send_message_raw(int(channel_id), ch):
-                                return False, "❎ Не удалось опубликовать одну из частей поста."
+                    for ch in _post_html_split_by_visible_limit(rest_html, POST_TEXT_LIMIT):
+                        if ch.strip() and not _post_send_message_raw(int(channel_id), ch):
+                            return False, "❎ Не удалось опубликовать одну из частей поста."
 
-                ok_extra = _post_send_message_raw(
-                    int(channel_id),
-                    extra_html,
-                    reply_markup=rm
-                )
-                return bool(ok_extra), "✅ Пост опубликован." if ok_extra else "❎ Не удалось опубликовать экстра-строку."
+                if media_count > 1 and use_promo and extra_html:
+                    ok_extra = _post_send_message_raw(int(channel_id), extra_html, reply_markup=rm)
+                    return bool(ok_extra), "✅ Пост опубликован." if ok_extra else "❎ Не удалось опубликовать экстра-строку."
 
-            parts = _post_html_split_by_visible_limit(text_html, POST_TEXT_LIMIT)
+                return True, "✅ Пост опубликован."
 
+            parts = _post_html_split_by_visible_limit(full_text_html, POST_TEXT_LIMIT)
             if not parts:
-                ok_extra = _post_send_message_raw(
-                    int(channel_id),
-                    extra_html,
-                    reply_markup=rm
-                )
-                return bool(ok_extra), "✅ Пост опубликован." if ok_extra else "❎ Не удалось опубликовать экстра-строку."
+                return False, "❎ Не удалось подготовить текст поста."
 
             for i, ch in enumerate(parts):
                 is_last = i == len(parts) - 1
-                if is_last:
-                    combined = f"{ch}\n\n{extra_html}".strip()
-                    if _post_html_visible_len(combined) <= POST_TEXT_LIMIT:
-                        ok = _post_send_message_raw(
-                            int(channel_id),
-                            combined,
-                            reply_markup=rm
-                        )
-                        return bool(ok), "✅ Пост опубликован." if ok else "❎ Не удалось опубликовать пост."
-
-                    if not _post_send_message_raw(int(channel_id), ch):
-                        return False, "❎ Не удалось опубликовать последнюю часть поста."
-
-                    ok_extra = _post_send_message_raw(
-                        int(channel_id),
-                        extra_html,
-                        reply_markup=rm
-                    )
-                    return bool(ok_extra), "✅ Пост опубликован." if ok_extra else "❎ Не удалось опубликовать экстра-строку."
-
-                if not _post_send_message_raw(int(channel_id), ch):
+                if not _post_send_message_raw(
+                    int(channel_id),
+                    ch,
+                    reply_markup=rm if is_last else None,
+                    disable_web_page_preview=disable_preview
+                ):
                     return False, "❎ Не удалось опубликовать одну из частей поста."
 
             return True, "✅ Пост опубликован."
 
-        # Обычный текстовый пост без вложений.
-        if not media_items:
+        # Нет вложений.
+        if not has_media:
             if full_len <= POST_TEXT_LIMIT:
                 ok = _post_send_message_raw(
                     int(channel_id),
                     full_text_html,
-                    reply_markup=rm
+                    reply_markup=rm,
+                    disable_web_page_preview=disable_preview
                 )
                 return bool(ok), "✅ Пост опубликован." if ok else "❎ Не удалось опубликовать пост."
-
-            if text_len <= POST_TEXT_LIMIT:
-                ok_text = _post_send_message_raw(int(channel_id), text_html)
-                ok_extra = _post_send_message_raw(
-                    int(channel_id),
-                    extra_html,
-                    reply_markup=rm
-                )
-                return bool(ok_text and ok_extra), "✅ Пост опубликован." if ok_text and ok_extra else "❎ Не удалось опубликовать пост."
 
             return False, POST_LIMIT_CHOICE_TOKEN
 
         # Одно вложение.
-        if len(media_items) == 1:
+        if media_count == 1:
             if full_len <= POST_CAPTION_LIMIT:
                 ok = _post_send_media_group_to_chat(
                     int(channel_id),
@@ -14342,40 +15385,37 @@ def _post_publish_draft(user_id: int, overflow_mode: str = "") -> tuple[bool, st
                 )
                 return bool(ok), "✅ Пост опубликован." if ok else "❎ Не удалось опубликовать пост."
 
-            if text_len <= POST_TEXT_LIMIT and full_len <= POST_TEXT_LIMIT:
-                ok_media = _post_send_media_group_to_chat(
-                    int(channel_id),
-                    media_items,
-                    caption_html=""
-                )
+            if full_len <= POST_TEXT_LIMIT:
+                ok_media = _post_send_media_group_to_chat(int(channel_id), media_items, caption_html="")
                 if not ok_media:
                     return False, "❎ Не удалось опубликовать вложение поста."
 
-                ok_text = _post_send_message_raw(
-                    int(channel_id),
-                    full_text_html,
-                    reply_markup=rm
-                )
+                ok_text = _post_send_message_raw(int(channel_id), full_text_html, reply_markup=rm)
                 return bool(ok_text), "✅ Пост опубликован." if ok_text else "❎ Не удалось опубликовать текст поста."
 
             return False, POST_LIMIT_CHOICE_TOKEN
 
-        # Группа вложений
+        # Группа вложений.
         if text_len <= POST_CAPTION_LIMIT:
-            ok_media = _post_send_media_group_to_chat(
-                int(channel_id),
-                media_items,
-                caption_html=text_html
-            )
+            ok_media = _post_send_media_group_to_chat(int(channel_id), media_items, caption_html=display_text_html)
             if not ok_media:
                 return False, "❎ Не удалось опубликовать вложения поста."
 
-            ok_extra = _post_send_message_raw(
-                int(channel_id),
-                extra_html,
-                reply_markup=rm
-            )
-            return bool(ok_extra), "✅ Пост опубликован." if ok_extra else "❎ Не удалось опубликовать экстра-строку."
+            tail_html = ""
+            tail_rm = None
+
+            if use_promo and extra_html:
+                tail_html = extra_html
+                tail_rm = rm
+            elif post_kind in (POST_KIND_PROJECTS, POST_KIND_AD, POST_KIND_OTHER):
+                tail_html = _post_kind_tag_html(post_kind, int(channel_id), source_text_html)
+                tail_rm = rm
+
+            if tail_html:
+                ok_tail = _post_send_message_raw(int(channel_id), tail_html, reply_markup=tail_rm)
+                return bool(ok_tail), "✅ Пост опубликован." if ok_tail else "❎ Не удалось опубликовать завершающую строку."
+
+            return True, "✅ Пост опубликован."
 
         return False, POST_LIMIT_CHOICE_TOKEN
 
@@ -14917,6 +15957,52 @@ def handle_post_agents_command(message):
         reply_markup=kb_post_draft()
     )
 
+def _post_start_common_draft_message(user_id: int, chat_id: int, selected: dict, post_kind: str):
+    kind = str(post_kind or POST_KIND_UPDATE)
+    max_media = POST_MAX_PROJECT_MEDIA if kind in (POST_KIND_PROJECTS, POST_KIND_AD) else POST_MAX_MEDIA
+
+    preview_line = ""
+    if kind == POST_KIND_PROJECTS:
+        preview_line = (
+                        "<blockquote expandable>Отправте текст поста следующим образом:\n"
+                        "・ 1-я строка — ссылка + название для кастомной кнопки (по желанию)\n"
+                        "・ со 2-й строки — текст с HTML-форматированием\n"
+                        "Ссылки внутри текста поста автоматически преобразуются в кнопки со стандартным названием.\n"
+                        "❗Очень важное уточнение: не указывать ссылку первой, если не требуется устанавливать кастомные кнопки. В противном случае бот расценит весь текст, как название для кнопки, и обрежет его!\n\n"
+                        "Максимальное кол-во поддерживаемых для кнопок ссылок: 3.\n"
+                        "#️⃣ Для этого типа поста действуют <b><i>простые</i></b> хештеги.</blockquote>"
+                        )
+    elif kind == POST_KIND_AD:
+        preview_line = (
+                        "<blockquote expandable>Отправте текст поста следующим образом:\n"
+                        "・ 1-я строка — ссылка + название для кастомной кнопки (по желанию)\n"
+                        "・ со 2-й строки — текст с HTML-форматированием\n"
+                        "Ссылки внутри текста поста автоматически преобразуются в кнопки со стандартным названием.\n"
+                        "❗Очень важное уточнение: не указывать ссылку первой, если не требуется устанавливать кастомные кнопки. В противном случае бот расценит весь текст, как название для кнопки, и обрежет его!\n\n"
+                        "Максимальное кол-во поддерживаемых для кнопок ссылок: 3.\n"
+                        "#️⃣ Для этого типа поста действуют <b><i>умные рекламные</i></b> хештеги.</blockquote>"
+                        )
+    elif kind == POST_KIND_OTHER:
+        preview_line = (
+                        "<blockquote expandable>Для этого типа поддерживается публикация с промокодом или без него.\n"
+                        "Стандартный тип черновика.\n"
+                        "#️⃣ Для этого типа поста действуют <b><i>простые</i></b> хештеги.</blockquote>"
+                        )
+
+    bot.send_message(
+        int(chat_id),
+        "📰 Подготовка поста\n\n"
+        f"Тип: <b>{h(post_kind_title(kind))}</b>\n"
+        f"Канал: <b>{h(selected['title'])}</b>\n\n"
+        f"{preview_line}\n\n" 
+        "Отправьте текст поста, фото, видео или файл.\n"
+        f"Можно добавить до {max_media} вложений.\n"
+        f"Когда всё будет готово, нажмите «{POST_SUBMIT_TEXT}».",
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+        reply_markup=kb_post_draft()
+    )
+
 def handle_post_command(message):
     if not _require_private_bot_chat(
         message,
@@ -14935,7 +16021,7 @@ def handle_post_command(message):
         bot.reply_to(
             message,
             "📑 Канал для публикаций не выбран или недоступен.\n"
-            "Используйте /post_chanals.",
+            "Попросите разработчика настроить канал командой /post_chanals.",
             parse_mode="HTML",
             disable_web_page_preview=True
         )
@@ -14947,19 +16033,270 @@ def handle_post_command(message):
         pass
 
     post_state_clear(uid)
-    post_state_set(uid, POST_STAGE_CHANNEL)
 
     bot.reply_to(
         message,
         "📰 Подготовка поста\n\n"
         f"Канал: <b>{h(selected['title'])}</b>\n\n"
-        "Отправьте текст поста, фото или видео.\n"
-        f"Можно добавить до {POST_MAX_MEDIA} вложений.\n"
-        f"Когда всё будет готово, нажмите «{POST_SUBMIT_TEXT}».\n",
+        "Выберите тип публикации:",
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+        reply_markup=kb_post_type_choice(uid)
+    )
+
+def _handle_post_update_version_message(message, raw_plain: str) -> bool:
+    uid = int(message.from_user.id)
+
+    if message.content_type != "text":
+        bot.reply_to(
+            message,
+            "📑 Сначала укажите версию обновления текстом.",
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
+        return True
+
+    low = str(raw_plain or "").strip().casefold()
+
+    if low == str(POST_CANCEL_TEXT).casefold():
+        post_state_clear(uid)
+        bot.reply_to(
+            message,
+            "📰 Подготовка поста отменена.",
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=report_reply_remove_markup()
+        )
+        return True
+
+    version, title_html, err = _post_update_version_parse(raw_plain)
+    if err:
+        bot.reply_to(
+            message,
+            err,
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
+        return True
+
+    post_update_set_version_title(uid, version, title_html)
+    post_state_set(uid, POST_STAGE_UPDATE_CONTENT)
+
+    bot.reply_to(
+        message,
+        "✅ Версия обновления сохранена.\n"
+        "Теперь выберите раздел черновика.",
         parse_mode="HTML",
         disable_web_page_preview=True,
         reply_markup=kb_post_draft()
     )
+
+    bot.send_message(
+        int(message.chat.id),
+        render_post_update_menu_text(uid),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+        reply_markup=kb_post_update_parts(uid)
+    )
+
+    return True
+
+def _post_update_publish_or_warn(message, uid: int) -> bool:
+    ok, msg = _post_publish_draft(uid)
+
+    if not ok and msg == POST_LIMIT_CHOICE_TOKEN:
+        draft = post_draft_get(uid)
+        bot.reply_to(
+            message,
+            _post_limit_warning_text(
+                post_effective_draft_text_html(uid),
+                list(draft.get("media") or [])
+            ),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=kb_post_limit_choice(uid)
+        )
+        return True
+
+    if not ok:
+        bot.reply_to(
+            message,
+            f"{h(msg)}",
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
+        return True
+
+    post_state_clear(uid)
+    bot.reply_to(
+        message,
+        f"{h(msg)}",
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+        reply_markup=report_reply_remove_markup()
+    )
+    return True
+
+def _handle_post_update_content_message(message) -> bool:
+    uid = int(message.from_user.id)
+    data = post_update_get(uid)
+    active = str(data.get("active_part") or "")
+
+    raw_plain = ""
+    if message.content_type == "text":
+        raw_plain = (getattr(message, "text", None) or "").strip()
+    else:
+        raw_plain = (getattr(message, "caption", None) or "").strip()
+
+    if message.content_type == "text":
+        low = str(raw_plain or "").strip().casefold()
+
+        if low == str(POST_CANCEL_TEXT).casefold():
+            post_state_clear(uid)
+            bot.reply_to(
+                message,
+                "📰 Подготовка поста отменена.",
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=report_reply_remove_markup()
+            )
+            return True
+
+        if low == str(POST_SUBMIT_TEXT).casefold():
+            return _post_update_publish_or_warn(message, uid)
+
+        if active == POST_UPDATE_PART_MEDIA:
+            bot.reply_to(
+                message,
+                "📎 Сейчас выбран раздел «Медиа». Отправьте вложение или выберите текстовый раздел.",
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=kb_post_update_parts(uid)
+            )
+            return True
+
+        if active not in POST_UPDATE_TEXT_PARTS:
+            bot.reply_to(
+                message,
+                "📑 Сначала выберите раздел черновика.",
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=kb_post_update_parts(uid)
+            )
+            return True
+
+        html_text = _post_message_html_payload(message)
+        if not html_text:
+            bot.reply_to(
+                message,
+                "📑 Пустое сообщение. Отправьте текст или выберите другой раздел.",
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=kb_post_update_parts(uid)
+            )
+            return True
+
+        post_update_append_part(uid, active, html_text)
+
+        bot.reply_to(
+            message,
+            f"✅ Текст добавлен в раздел «{h(post_update_part_label(active))}».",
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
+
+        bot.send_message(
+            int(message.chat.id),
+            render_post_update_menu_text(uid),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=kb_post_update_parts(uid)
+        )
+        return True
+
+    if message.content_type in ("photo", "video", "document", "audio", "voice", "animation", "video_note"):
+        if active != POST_UPDATE_PART_MEDIA:
+            bot.reply_to(
+                message,
+                "📎 Для добавления вложения сначала выберите раздел «Медиа».",
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=kb_post_update_parts(uid)
+            )
+            return True
+
+        media_group_id = str(getattr(message, "media_group_id", "") or "").strip()
+        msg_id = int(getattr(message, "message_id", 0) or 0)
+        media_type, media_file_id, file_size = _post_extract_media_from_message(message)
+
+        if not media_type or not media_file_id:
+            bot.reply_to(
+                message,
+                "📑 Не удалось обработать вложение.",
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
+            return True
+
+        added, count = post_draft_add_media(
+            uid,
+            media_type,
+            media_file_id,
+            media_group_id=media_group_id,
+            message_id=msg_id,
+            file_size=file_size
+        )
+
+        if not added:
+            media_limit = post_media_limit_for_user(uid)
+
+            if media_group_id:
+                _post_schedule_media_group_ack(uid, media_group_id, message)
+                return True
+
+            if count >= media_limit:
+                warn_text = (
+                    f"⚠️ Достигнут лимит вложений: {count}/{media_limit}.\n"
+                    "Новое вложение не добавлено.\n"
+                    f"Можно отправить дополнительный текст, после нажать «{POST_SUBMIT_TEXT}»."
+                )
+            else:
+                warn_text = "⚠️ Не удалось добавить вложение."
+
+            bot.reply_to(
+                message,
+                warn_text,
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
+            return True
+
+        if media_group_id:
+            _post_schedule_media_group_ack(uid, media_group_id, message)
+            return True
+
+        media_limit = post_media_limit_for_user(uid)
+
+        if count >= media_limit:
+            suffix = (
+                f"✅ Вложение добавлено ({count}/{media_limit}).\n"
+                "⚠️ Достигнут лимит вложений. Новые вложения больше не добавятся."
+            )
+        else:
+            suffix = (
+                f"✅ Вложение добавлено ({count}/{media_limit}).\n"
+                "Можно добавить ещё вложения или выбрать текстовый раздел."
+            )
+
+        bot.reply_to(
+            message,
+            suffix,
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
+        return True
+
+    return False
 
 def _handle_post_content_message(message) -> bool:
     uid = int(message.from_user.id)
@@ -14975,6 +16312,12 @@ def _handle_post_content_message(message) -> bool:
         raw_plain = (getattr(message, "text", None) or "").strip()
     else:
         raw_plain = (getattr(message, "caption", None) or "").strip()
+
+    if stage == POST_STAGE_UPDATE_VERSION:
+        return _handle_post_update_version_message(message, raw_plain)
+
+    if stage == POST_STAGE_UPDATE_CONTENT:
+        return _handle_post_update_content_message(message)
 
     if message.content_type == "text":
         low = str(raw_plain or "").strip().casefold()
@@ -15001,7 +16344,7 @@ def _handle_post_content_message(message) -> bool:
                 bot.reply_to(
                     message,
                     _post_limit_warning_text(
-                        str(draft.get("text_html") or ""),
+                        post_effective_draft_text_html(uid),
                         list(draft.get("media") or [])
                     ),
                     parse_mode="HTML",
@@ -15042,8 +16385,9 @@ def _handle_post_content_message(message) -> bool:
         post_draft_append_text(uid, html_text)
         draft = post_draft_get(uid)
         media_count = len(draft.get("media") or [])
+        media_limit = post_media_limit_for_user(uid)
 
-        if media_count >= POST_MAX_MEDIA:
+        if media_count >= media_limit:
             next_hint = (
                 "⚠️ Лимит вложений уже достигнут. Новые вложения больше не добавятся.\n"
                 f"Можно отправить ещё текст или нажать «{POST_SUBMIT_TEXT}»."
@@ -15051,32 +16395,28 @@ def _handle_post_content_message(message) -> bool:
         else:
             next_hint = f"Можно добавить фото или видео и затем нажать «{POST_SUBMIT_TEXT}»."
 
+        link_notice = ""
+        kind = post_meta_kind(uid)
+        if kind in (POST_KIND_PROJECTS, POST_KIND_AD):
+            link_notice = _post_link_notice_html(str(draft.get("text_html") or ""))
+
+        extra_notice = f"\n{link_notice}" if link_notice else ""
+
         bot.reply_to(
             message,
             f"✅ Текст добавлен к черновику.\n"
-            f"Вложений: {media_count}/{POST_MAX_MEDIA}\n"
-            f"{next_hint}",
+            f"Вложений: {media_count}/{media_limit}\n"
+            f"{next_hint}"
+            f"{extra_notice}",
             parse_mode="HTML",
             disable_web_page_preview=True
         )
         return True
 
-    if message.content_type in ("photo", "video"):
-        media_type = ""
-        media_file_id = ""
+    if message.content_type in ("photo", "video", "document", "audio", "voice", "animation", "video_note"):
         media_group_id = str(getattr(message, "media_group_id", "") or "").strip()
         msg_id = int(getattr(message, "message_id", 0) or 0)
-
-        try:
-            if message.content_type == "photo" and message.photo:
-                media_type = "photo"
-                media_file_id = message.photo[-1].file_id
-            elif message.content_type == "video" and message.video:
-                media_type = "video"
-                media_file_id = message.video.file_id
-        except Exception:
-            media_type = ""
-            media_file_id = ""
+        media_type, media_file_id, file_size = _post_extract_media_from_message(message)
 
         if not media_type or not media_file_id:
             bot.reply_to(
@@ -15096,17 +16436,20 @@ def _handle_post_content_message(message) -> bool:
             media_type,
             media_file_id,
             media_group_id=media_group_id,
-            message_id=msg_id
+            message_id=msg_id,
+            file_size=file_size
         )
 
         if not added:
+            media_limit = post_media_limit_for_user(uid)
+
             if media_group_id:
                 _post_schedule_media_group_ack(uid, media_group_id, message)
                 return True
 
-            if count >= POST_MAX_MEDIA:
+            if count >= media_limit:
                 warn_text = (
-                    f"⚠️ Достигнут лимит вложений: {count}/{POST_MAX_MEDIA}.\n"
+                    f"⚠️ Достигнут лимит вложений: {count}/{media_limit}.\n"
                     "Новое вложение не добавлено.\n"
                     f"Можно отправить дополнительный текст, после нажать «{POST_SUBMIT_TEXT}»."
                 )
@@ -15125,16 +16468,18 @@ def _handle_post_content_message(message) -> bool:
             _post_schedule_media_group_ack(uid, media_group_id, message)
             return True
 
-        if count >= POST_MAX_MEDIA:
+        media_limit = post_media_limit_for_user(uid)
+
+        if count >= media_limit:
             suffix = (
-                f"✅ Одиночное вложение добавлено ({count}/{POST_MAX_MEDIA}).\n"
+                f"✅ Одиночное вложение добавлено ({count}/{media_limit}).\n"
                 "⚠️ Достигнут лимит вложений. Новые вложения больше не добавятся.\n"
                 f"Теперь нажмите «{POST_SUBMIT_TEXT}» или отправьте дополнительный текст."
             )
         else:
             suffix = (
-                f"✅ Одиночное вложение добавлено ({count}/{POST_MAX_MEDIA}).\n"
-                "При отправке все вложения будут сгруппированы.\n"
+                f"✅ Одиночное вложение добавлено ({count}/{media_limit}).\n"
+                "При отправке все подходящие вложения будут сгруппированы.\n"
                 f"Теперь нажмите «{POST_SUBMIT_TEXT}» или добавьте ещё вложения."
             )
 
@@ -15774,10 +17119,10 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
             rest = parts[1].strip()
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="agent_status", args=rest)
 
-    if low in ("report", "репорт", "📠 репорт"):
+    if low in ("contact", "обращение", "👨‍⚕️ тех.поддержка"):
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="report", args="")
 
-    if low in ("agents", "агенты", "🧑‍🔬 тех.команды", "техкоманды"):
+    if low in ("agents", "агенты", "🥼 тех.команды", "техкоманды"):
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="agents_panel", args="")
 
     # кнопки быстрого доступа
@@ -16706,10 +18051,10 @@ def build_start_text(user) -> str:
     lines.append(f'Я создан на основе старой игры бота <a href="{h(IRIS_BOT_LINK)}">Iris | Чат-менеджер</a> с некоторыми доработками.\n')
     lines.append("Что вас интересует?")
     lines.append(f'1. <code>Био настройки</code> — более гибкая настройка параметров уведомлений и прочего.')
-    lines.append(f'2. <code>Био репорт</code> — если заметили, что в моей работе что-то не так, уведомите тех.поддержку.\n')
-    lines.append(f'⚠️ Если у вас произошла ошибка в работе бота, пожалуйста, сообщите об этом в тех.поддержку.\n')
+    lines.append(f'2. <code>Био обращение</code> — если заметили, что в моей работе что-то не так, или появились вопросы по игре и моей работе впринципе, обратитесь в тех.поддержку.\n')
+    lines.append(f'⚠️ Если у вас произошла ошибка в моей работе, пожалуйста, срочно сообщите об этом в тех.поддержку.\n')
 
-    lines.append('👨‍⚕️ <b>Агенты поддержки</b>, которые могут ответить на ваши вопросы')
+    lines.append('👨‍⚕️ <b>Агенты поддержки</b>, которые могут ответить на ваши вопросы:')
 
     if not primary_rows and not secondary_rows:
         lines.append("Список пока пуст.")
@@ -16731,7 +18076,8 @@ def build_start_text(user) -> str:
     lines.append(f'📑 Список всех команд <a href="{h(URL_COMMANDS)}">с их описанием</a>')
     lines.append(f'📑 Чат <a href="{h(URL_SUPPORT_CHAT)}">тех.поддержки</a>')
     lines.append(f'📑 Основной <a href="{h(URL_DEV_CHANNEL)}">канал разработки бота</a>')
-    lines.append(f'💬 Для повторного вызова агент-листа, введите в чат \"<code>.помощь</code>\". Для повторной активации клавиатуры помощи, введите \"/start\"')
+    lines.append(f'💬 Для повторного вызова агент-листа, введите в чат \"<code>.помощь</code>\".')
+    lines.append(f'Для повторной активации клавиатуры помощи, введите \"/start\".')
 
     return "\n".join(lines)
 
@@ -16751,7 +18097,7 @@ def kb_quick_nav(user_id: int) -> ReplyKeyboardMarkup:
 
     kb.row(
         KeyboardButton("ℹ️ Помощь"),
-        KeyboardButton("📠 Репорт"),
+        KeyboardButton("👨‍⚕️ Тех.поддержка"),
         KeyboardButton("📚 Быстрый поиск")
     )
 
@@ -16762,7 +18108,7 @@ def kb_quick_nav(user_id: int) -> ReplyKeyboardMarkup:
 
     if is_creator(uid) or is_support(uid):
         kb.row(
-            KeyboardButton("🧑‍🔬 Тех.команды"),
+            KeyboardButton("🥼 Тех.команды"),
             KeyboardButton("👥 Пользователи")
         )
 
@@ -16783,12 +18129,12 @@ def _quick_nav_button_text_is_private_only(text: str) -> bool:
 
     return low in {
         "ℹ️ помощь",
-        "📠 репорт",
+        "👨‍⚕️ Тех.поддержка",
         "📚 быстрый поиск",
         "⚙️ параметры",
         "⚙️параметры",
         "🔗 команды",
-        "🧑‍🔬 тех.команды",
+        "🥼 тех.команды",
         "👥 пользователи",
         "скрыть клавиатуру",
     }
@@ -19675,6 +21021,9 @@ USERSUI_TAG = "US"
 CHATSUI_TAG = "UC"
 POSTCHUI_TAG = "PCH"
 POSTPUBUI_TAG = "PP"
+POSTTYPEUI_TAG = "PTY"
+POSTPROMOUI_TAG = "PPR"
+POSTUPDUI_TAG = "PUP"
 AGENTSUI_TAG = "AGP"
 EMPACKUI_TAG = "EP"
 PROMOUI_TAG = "PR"
@@ -19717,6 +21066,29 @@ POST_PUBLISH_TRUNCATE_ACTION = "cut"
 POST_PUBLISH_CANCEL_ACTION = "cancel"
 POST_STAGE_CHANNEL = "await_content"
 POST_STAGE_AGENTS = "await_agents_content"
+POST_STAGE_UPDATE_VERSION = "await_update_version"
+POST_STAGE_UPDATE_CONTENT = "await_update_content"
+POST_UPDATE_PART_MEDIA = "media"
+POST_UPDATE_PART_INTRO = "intro"
+POST_UPDATE_PART_FIXES = "fixes"
+POST_UPDATE_PART_CHANGES = "changes"
+POST_UPDATE_PART_NEW = "new"
+POST_UPDATE_TEXT_PARTS = {
+    POST_UPDATE_PART_INTRO,
+    POST_UPDATE_PART_FIXES,
+    POST_UPDATE_PART_CHANGES,
+    POST_UPDATE_PART_NEW,
+}
+POST_KIND_UPDATE = "update"
+POST_KIND_PROJECTS = "projects"
+POST_KIND_OTHER = "other"
+POST_KIND_AD = "ad"
+POST_PROMO_AUTO = -1
+POST_PROMO_OFF = 0
+POST_PROMO_ON = 1
+POST_MAX_LINK_BUTTONS = 3
+POST_MAX_PROJECT_MEDIA = 1
+POST_FILE_MAX_BYTES = 100 * 1024 * 1024
 POST_PROMO_TTL_SEC = 3 * 86400 # время пост промокода
 POST_MEDIA_GROUP_ACK_DELAY_SEC = REPORT_MEDIA_GROUP_ACK_DELAY_SEC
 _POST_MEDIA_GROUP_ACK_STATE: Dict[str, int] = {}
@@ -19891,19 +21263,87 @@ def _promo_activation_url(code: str) -> str:
 
     return f"https://t.me/{BOT_USERNAME}?start={payload}"
 
+def _promo_create_params_help_text() -> str:
+    return (
+        "📑 Укажите тип промокода.\n\n"
+        "Доступные параметры:\n"
+        "<blockquote>"
+        "<code>постоянный</code> — промокод без срока действия\n"
+        "<code>временный</code> — промокод до указанной даты"
+        "</blockquote>\n"
+        "Пример:\n"
+        "<code>/promocode_create постоянный TEST</code>\n"
+        "<code>/promocode_create временный 31.12.2026 TEST</code>"
+    )
+
+def _promo_create_need_code_text(is_permanent: int, expires_ts: int = 0) -> str:
+    if int(is_permanent) == 1:
+        return (
+            "📑 Укажите название постоянного промокода.\n\n"
+            "Пример:\n"
+            "<code>/promocode_create постоянный TEST</code>"
+        )
+
+    return (
+        "📑 Укажите название временного промокода после срока действия.\n\n"
+        "Пример:\n"
+        "<code>/promocode_create временный 31.12.2026 TEST</code>"
+    )
+
+def _promo_create_need_period_text() -> str:
+    return (
+        "📑 Укажите срок действия временного промокода.\n\n"
+        f"{_TIMER_ABS_FORMATS_HELP}\n"
+        "Пример:\n"
+        "<code>/promocode_create временный 31.12.2026 TEST</code>"
+    )
+
+def _promo_create_bonus_help_text() -> str:
+    return (
+        "📑 Укажите бонусы с новой строки.\n"
+        "Поддерживаемые форматы:\n"
+        "<blockquote expandable>\n"
+        "заразность n\n"
+        "синтез n\n"
+        "ускорение n\n"
+        "очков навыка n\n"
+        "био-ресурсы n\n"
+        "био-материалы n\n"
+        "</blockquote>\n"
+        "Пример:\n"
+        "<code>/promocode_create постоянный TEST\n"
+        "био-ресурсы 100\n"
+        "заразность 2</code>"
+    )
+
+def _promo_create_bonus_bad_format_text() -> str:
+    return (
+        "📑 Неверный формат бонусов.\n"
+        "Поддерживаемые форматы:\n"
+        "<blockquote expandable>\n"
+        "заразность n\n"
+        "синтез n\n"
+        "ускорение n\n"
+        "очков навыка n\n"
+        "био-ресурсы n\n"
+        "био-материалы n\n"
+        "</blockquote>"
+    )
+
 def _promo_parse_create_message(message_text: str):
     raw = strip_bio_prefix((message_text or "").strip())
     if not raw:
-        return None, "📑 Неверный формат команды."
+        return None, _promo_create_params_help_text()
 
     first_line, body = _timer_first_line_and_body(raw)
     fl = first_line.strip()
+
     if fl.startswith("/") or fl.startswith("."):
         fl = fl[1:].strip()
 
     parts = fl.split(None, 1)
     if len(parts) < 2:
-        return None, "📑 Неверный формат команды."
+        return None, _promo_create_params_help_text()
 
     header = parts[1].strip()
     low = header.lower()
@@ -19912,13 +21352,32 @@ def _promo_parse_create_message(message_text: str):
     expires_ts = 0
     code = ""
 
+    if not header:
+        return None, _promo_create_params_help_text()
+
+    if low == "постоянный":
+        return None, _promo_create_need_code_text(1)
+
     if low.startswith("постоянный "):
         is_permanent = 1
         code = header[len("постоянный "):].strip()
+
+        if not code:
+            return None, _promo_create_need_code_text(1)
+
+    elif low == "временный":
+        return None, _promo_create_need_period_text()
+
     elif low.startswith("временный "):
         tail = header[len("временный "):].strip()
         toks = tail.split()
+
+        if not toks:
+            return None, _promo_create_need_period_text()
+
         parsed = False
+        last_period_err = ""
+
         for take in (2, 1):
             if len(toks) >= take:
                 ts, err = _timer_parse_absolute_spec(" ".join(toks[:take]))
@@ -19927,45 +21386,32 @@ def _promo_parse_create_message(message_text: str):
                     code = " ".join(toks[take:]).strip()
                     parsed = True
                     break
+                if err:
+                    last_period_err = err
+
         if not parsed:
-            return None, f"📑 Неверный формат периода промокода.\n{_TIMER_ABS_FORMATS_HELP}"
+            if last_period_err:
+                return None, f"📑 Неверный формат периода промокода.\n{last_period_err}"
+            return None, _promo_create_need_period_text()
+
+        if not code:
+            return None, _promo_create_need_code_text(0, expires_ts)
+
     else:
-        return None, "📑 Укажите параметр <code>постоянный</code> или <code>временный</code>."
+        return None, _promo_create_params_help_text()
 
     if not code:
-        return None, "📑 Укажите название промокода."
+        return None, _promo_create_need_code_text(is_permanent, expires_ts)
 
     bonus_lines = [x.strip() for x in body.splitlines() if x.strip()]
     if not bonus_lines:
-        return None, (
-            "📑 Укажите бонусы с новой строки.\n"
-            "Поддерживаемые форматы:\n"
-            "<blockquote expandable>\n"
-            "заразность n\n"
-            "синтез n\n"
-            "ускорение n\n"
-            "очков навыка n\n"
-            "био-ресурсы n\n"
-            "био-материалы n\n"
-            "</blockquote>"
-        )
+        return None, _promo_create_bonus_help_text()
 
     bonuses = []
     for line in bonus_lines:
         b = _promo_parse_bonus_line(line)
         if not b or int(b["amount"]) <= 0:
-            return None, (
-                "📑 Неверный формат бонусов.\n"
-                "Поддерживаемые форматы:\n"
-                "<blockquote expandable>\n"
-                "заразность n\n"
-                "синтез n\n"
-                "ускорение n\n"
-                "очков навыка n\n"
-                "био-ресурсы n\n"
-                "био-материалы n\n"
-                "</blockquote>"
-            )
+            return None, _promo_create_bonus_bad_format_text()
         bonuses.append(b)
 
     return {
@@ -25503,6 +26949,180 @@ def cb_agents_panel_ui(cq):
         except Exception:
             pass
 
+@bot.callback_query_handler(func=lambda cq: (cq.data or "").startswith(f"{POSTUPDUI_TAG}:"))
+def cb_post_update_part_choice(cq):
+    try:
+        uid, part = _post_update_part_parse_cb(cq.data or "")
+        if uid is None:
+            bot.answer_callback_query(cq.id)
+            return
+
+        actor_uid = int(cq.from_user.id)
+        if actor_uid != int(uid):
+            bot.answer_callback_query(cq.id)
+            return
+
+        stage, _created_ts = post_state_get(actor_uid)
+        if stage != POST_STAGE_UPDATE_CONTENT:
+            bot.answer_callback_query(cq.id)
+            return
+
+        if part not in (
+            POST_UPDATE_PART_MEDIA,
+            POST_UPDATE_PART_INTRO,
+            POST_UPDATE_PART_FIXES,
+            POST_UPDATE_PART_CHANGES,
+            POST_UPDATE_PART_NEW,
+        ):
+            bot.answer_callback_query(cq.id)
+            return
+
+        post_update_set_active_part(actor_uid, part)
+
+        if cq.message:
+            limited_edit_message_text(
+                text=render_post_update_menu_text(actor_uid),
+                chat_id=cq.message.chat.id,
+                msg_id=cq.message.message_id,
+                parse_mode="HTML",
+                reply_markup=kb_post_update_parts(actor_uid),
+                disable_web_page_preview=True
+            )
+
+        bot.answer_callback_query(cq.id, f"Раздел: {post_update_part_label(part)}")
+    except Exception as e:
+        send_error_report("cb_post_update_part_choice", e)
+        try:
+            bot.answer_callback_query(cq.id)
+        except Exception:
+            pass
+
+@bot.callback_query_handler(func=lambda cq: (cq.data or "").startswith(f"{POSTTYPEUI_TAG}:"))
+def cb_post_type_choice(cq):
+    try:
+        uid, kind = _post_type_parse_cb(cq.data or "")
+        if uid is None:
+            bot.answer_callback_query(cq.id)
+            return
+
+        actor_uid = int(cq.from_user.id)
+        if actor_uid != int(uid):
+            bot.answer_callback_query(cq.id)
+            return
+
+        if not _post_channel_actor_can_use(actor_uid):
+            bot.answer_callback_query(cq.id)
+            return
+
+        selected = _post_channel_selected_row(actor_uid)
+        if not selected:
+            bot.answer_callback_query(cq.id, "Канал для публикаций не выбран.", show_alert=True)
+            return
+
+        if kind not in (POST_KIND_UPDATE, POST_KIND_PROJECTS, POST_KIND_OTHER, POST_KIND_AD):
+            bot.answer_callback_query(cq.id)
+            return
+
+        post_state_clear(actor_uid)
+
+        if kind == POST_KIND_UPDATE:
+            post_meta_set(actor_uid, POST_KIND_UPDATE, promo_enabled=POST_PROMO_ON)
+            post_state_set(actor_uid, POST_STAGE_UPDATE_VERSION)
+
+            bot.send_message(
+                int(actor_uid),
+                "📰 Подготовка поста\n"
+                "Тип: <b>Обновление</b>\n\n"
+                "<blockquote expandable>Сначала укажите версию обновления.\n"
+                "Формат: <b>«версия» «название обновления»</b>\n\n"
+                "Пример:\n"
+                "<code>1.1.A Название обновления</code>\n\n"
+                "ℹ️Название указывать не обязательно.</blockquote>",
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=kb_post_draft()
+            )
+        elif kind == POST_KIND_OTHER:
+            post_meta_set(actor_uid, POST_KIND_OTHER, promo_enabled=POST_PROMO_OFF)
+            text = (
+                "📰 Подготовка поста\n"
+                "Тип: <b>Прочее</b>\n\n"
+                "ℹ️ Перед тем, как продолжить, выберите следующее:"
+            )
+            bot.send_message(
+                int(actor_uid),
+                text,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=kb_post_other_promo_choice(actor_uid)
+            )
+        else:
+            post_meta_set(actor_uid, kind, promo_enabled=POST_PROMO_OFF)
+            post_state_set(actor_uid, POST_STAGE_CHANNEL)
+            _post_start_common_draft_message(actor_uid, actor_uid, selected, kind)
+
+        if cq.message:
+            limited_edit_message_text(
+                text=f"📰 Тип поста выбран: <b>{h(post_kind_title(kind))}</b>",
+                chat_id=cq.message.chat.id,
+                msg_id=cq.message.message_id,
+                parse_mode="HTML",
+                reply_markup=None,
+                disable_web_page_preview=True
+            )
+
+        bot.answer_callback_query(cq.id)
+    except Exception as e:
+        send_error_report("cb_post_type_choice", e)
+        try:
+            bot.answer_callback_query(cq.id)
+        except Exception:
+            pass
+
+@bot.callback_query_handler(func=lambda cq: (cq.data or "").startswith(f"{POSTPROMOUI_TAG}:"))
+def cb_post_other_promo_choice(cq):
+    try:
+        uid, promo_enabled = _post_promo_choice_parse_cb(cq.data or "")
+        if uid is None:
+            bot.answer_callback_query(cq.id)
+            return
+
+        actor_uid = int(cq.from_user.id)
+        if actor_uid != int(uid):
+            bot.answer_callback_query(cq.id)
+            return
+
+        selected = _post_channel_selected_row(actor_uid)
+        if not selected:
+            bot.answer_callback_query(cq.id, "Канал для публикаций не выбран.", show_alert=True)
+            return
+
+        post_meta_set(actor_uid, POST_KIND_OTHER, promo_enabled=int(promo_enabled))
+        post_state_set(actor_uid, POST_STAGE_CHANNEL)
+
+        _post_start_common_draft_message(actor_uid, actor_uid, selected, POST_KIND_OTHER)
+
+        if cq.message:
+            limited_edit_message_text(
+                text=(
+                    "📰 Тип поста выбран: <b>Прочее</b>\n"
+                    f"Промокод: <b>{'включён' if int(promo_enabled) == POST_PROMO_ON else 'выключен'}</b>"
+                ),
+                chat_id=cq.message.chat.id,
+                msg_id=cq.message.message_id,
+                parse_mode="HTML",
+                reply_markup=None,
+                disable_web_page_preview=True
+            )
+
+        bot.answer_callback_query(cq.id)
+    except Exception as e:
+        send_error_report("cb_post_other_promo_choice", e)
+        try:
+            bot.answer_callback_query(cq.id)
+        except Exception:
+            pass
+
 @bot.callback_query_handler(func=lambda cq: (cq.data or "").startswith(f"{POSTPUBUI_TAG}:"))
 def cb_post_publish_choice(cq):
     try:
@@ -25920,7 +27540,7 @@ def cb_report_answer_ui(cq):
         if int(actor_uid) == int(target_uid):
             bot.answer_callback_query(
                 cq.id,
-                "Нельзя отвечать на собственный репорт.",
+                "Нельзя отвечать на собственное обращение.",
                 show_alert=True
             )
             return
@@ -33117,7 +34737,7 @@ def inline_query_handler(inline_query):
         clear_chat_name_context()
 
 @bot.message_handler(
-    content_types=["photo", "video"],
+    content_types=["photo", "video", "document", "audio", "voice", "animation", "video_note"],
     func=lambda m: (
         getattr(getattr(m, "chat", None), "type", "") == "private"
         and getattr(m, "from_user", None) is not None
