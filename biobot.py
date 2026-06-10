@@ -1460,7 +1460,7 @@ def _report_notify_user_ids() -> List[int]:
 
     return ids
 
-def _report_notify_user_ids_filtered(exclude_user_id: int = 0) -> List[int]:
+def _report_notify_user_ids_filtered(exclude_user_id: int = 0, *, skip_inactive: bool = False) -> List[int]:
     exclude = int(exclude_user_id or 0)
     ids: List[int] = []
 
@@ -1473,10 +1473,199 @@ def _report_notify_user_ids_filtered(exclude_user_id: int = 0) -> List[int]:
         if exclude > 0 and u == exclude:
             continue
 
+        if bool(skip_inactive):
+            try:
+                if agent_status_get(u) == AGENT_STATUS_INACTIVE:
+                    continue
+            except Exception:
+                pass
+
         if u not in ids:
             ids.append(u)
 
     return ids
+
+def _report_answer_notice_remember(
+    reporter_user_id: int,
+    report_ts: int,
+    agent_user_id: int,
+    chat_id: int,
+    message_id: int
+):
+    if int(reporter_user_id or 0) <= 0 or int(report_ts or 0) <= 0:
+        return
+
+    db_exec(
+        "INSERT INTO report_answer_notices("
+        "reporter_user_id, report_ts, agent_user_id, chat_id, message_id, status, answered_by, created_at, updated_at"
+        ") VALUES (?,?,?,?,?,'open',0,?,?) "
+        "ON CONFLICT(reporter_user_id, report_ts, agent_user_id) DO UPDATE SET "
+        "chat_id=excluded.chat_id, "
+        "message_id=excluded.message_id, "
+        "status='open', "
+        "answered_by=0, "
+        "updated_at=excluded.updated_at",
+        (
+            int(reporter_user_id),
+            int(report_ts),
+            int(agent_user_id),
+            int(chat_id),
+            int(message_id),
+            int(now_ts()),
+            int(now_ts())
+        ),
+        commit=True
+    )
+
+def _report_answer_notice_is_taken(reporter_user_id: int, report_ts: int) -> bool:
+    row = db_one(
+        "SELECT 1 FROM report_answer_notices "
+        "WHERE reporter_user_id=? AND report_ts=? AND status='taken' LIMIT 1",
+        (int(reporter_user_id), int(report_ts))
+    )
+    return bool(row)
+
+def _report_answer_notice_rows(reporter_user_id: int, report_ts: int) -> list:
+    return db_all(
+        "SELECT reporter_user_id, report_ts, agent_user_id, chat_id, message_id, status, answered_by "
+        "FROM report_answer_notices "
+        "WHERE reporter_user_id=? AND report_ts=?",
+        (int(reporter_user_id), int(report_ts))
+    ) or []
+
+def _report_agent_took_notice_text(agent_user_id: int, answer_plain_text: str = "") -> str:
+    uid = int(agent_user_id)
+
+    row = get_user_row(uid)
+    if row:
+        fn = str(row["first_name"] or "")
+        ln = str(row["last_name"] or "")
+        un = str(row["username"] or "")
+        name = standard_display_name(fn, ln, un, uid)
+        try:
+            agent_tag = _agent_bold_mention(uid, name, username=un)
+        except Exception:
+            agent_tag = tg_mention(uid, name, username=un)
+    else:
+        agent_tag = f"<code>{uid}</code>"
+
+    role = _agent_hierarchy_label(uid)
+    busy_word = _gender_pick(uid, "report_agent_took")
+
+    text = f"👨‍⚕️ {h(role)} {agent_tag} {busy_word} этим обращением."
+
+    answer = str(answer_plain_text or "").strip()
+    if answer:
+        text += f"\n\nТекст ответа агента:\n<i>{h(answer)}</i>"
+
+    return text
+
+def _report_close_answer_notices(
+    reporter_user_id: int,
+    report_ts: int,
+    answered_by: int,
+    *,
+    answer_plain_text: str = "",
+    media_items: Optional[list[dict]] = None
+):
+    reporter_uid = int(reporter_user_id)
+    report_time = int(report_ts)
+    agent_uid = int(answered_by)
+
+    if reporter_uid <= 0 or report_time <= 0 or agent_uid <= 0:
+        return
+
+    notice_text = _report_agent_took_notice_text(agent_uid, answer_plain_text)
+    rows = _report_answer_notice_rows(reporter_uid, report_time)
+
+    for row in rows:
+        chat_id = int(row["chat_id"] or 0)
+        message_id = int(row["message_id"] or 0)
+
+        if chat_id == 0 or message_id <= 0:
+            continue
+
+        try:
+            limited_edit_message_text(
+                text=notice_text,
+                chat_id=chat_id,
+                msg_id=message_id,
+                parse_mode="HTML",
+                reply_markup=None,
+                disable_web_page_preview=True
+            )
+        except Exception:
+            try:
+                bot.edit_message_caption(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    caption=notice_text,
+                    parse_mode="HTML",
+                    reply_markup=None
+                )
+            except Exception:
+                pass
+
+        try:
+            agent_target_id = int(row["agent_user_id"] or 0)
+            if agent_target_id > 0 and media_items:
+                _report_send_media_group_to_chat(
+                    int(agent_target_id),
+                    list(media_items or []),
+                    caption="Вложения ответа агента:",
+                    parse_mode="HTML"
+                )
+        except Exception:
+            pass
+
+    db_exec(
+        "UPDATE report_answer_notices "
+        "SET status='taken', answered_by=?, updated_at=? "
+        "WHERE reporter_user_id=? AND report_ts=?",
+        (agent_uid, int(now_ts()), reporter_uid, report_time),
+        commit=True
+    )
+
+def _send_report_answer_notice_to_team(
+    reporter_user_id: int,
+    report_ts: int,
+    *,
+    exclude_user_id: int = 0
+) -> bool:
+    reporter_uid = int(reporter_user_id or 0)
+    report_time = int(report_ts or 0)
+
+    if reporter_uid <= 0 or report_time <= 0:
+        return False
+
+    rm = kb_report_answer(reporter_uid, report_time)
+    text = _report_answer_button_notice_text(report_time)
+
+    ok = False
+
+    for uid in _report_notify_user_ids_filtered(exclude_user_id, skip_inactive=True):
+        try:
+            msg = bot.send_message(
+                int(uid),
+                text,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=rm
+            )
+
+            _report_answer_notice_remember(
+                reporter_uid,
+                report_time,
+                int(uid),
+                int(msg.chat.id),
+                int(msg.message_id)
+            )
+
+            ok = True
+        except Exception:
+            pass
+
+    return ok
 
 def _send_message_to_report_recipients(
     text: str,
@@ -1488,7 +1677,7 @@ def _send_message_to_report_recipients(
 ) -> bool:
     ok = False
 
-    for uid in _report_notify_user_ids_filtered(exclude_user_id):
+    for uid in _report_notify_user_ids_filtered(exclude_user_id, skip_inactive=True):
         try:
             bot.send_message(
                 int(uid),
@@ -1519,7 +1708,7 @@ def _send_media_to_report_recipients(
     if not fid or mtype not in ("photo", "video"):
         return False
 
-    for uid in _report_notify_user_ids_filtered(exclude_user_id):
+    for uid in _report_notify_user_ids_filtered(exclude_user_id, skip_inactive=True):
         try:
             if mtype == "photo":
                 if caption:
@@ -3547,6 +3736,30 @@ def init_db():
     """, commit=True)
 
     db_exec("""
+    CREATE TABLE IF NOT EXISTS report_answer_notices (
+        reporter_user_id INTEGER NOT NULL DEFAULT 0,
+        report_ts        INTEGER NOT NULL DEFAULT 0,
+        agent_user_id    INTEGER NOT NULL DEFAULT 0,
+        chat_id          INTEGER NOT NULL DEFAULT 0,
+        message_id       INTEGER NOT NULL DEFAULT 0,
+        status           TEXT NOT NULL DEFAULT 'open',
+        answered_by      INTEGER NOT NULL DEFAULT 0,
+        created_at       INTEGER NOT NULL DEFAULT 0,
+        updated_at       INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY(reporter_user_id, report_ts, agent_user_id)
+    );
+    """, commit=True)
+
+    try:
+        db_exec(
+            "CREATE INDEX IF NOT EXISTS idx_report_answer_notices_report "
+            "ON report_answer_notices(reporter_user_id, report_ts, status)",
+            commit=True
+        )
+    except Exception:
+        pass
+
+    db_exec("""
     CREATE TABLE IF NOT EXISTS post_channel_prefs (
         user_id      INTEGER PRIMARY KEY,
         channel_id   INTEGER NOT NULL DEFAULT 0,
@@ -3582,17 +3795,28 @@ def init_db():
 
     db_exec("""
     CREATE TABLE IF NOT EXISTS post_update_drafts (
-        user_id      INTEGER PRIMARY KEY,
-        version      TEXT NOT NULL DEFAULT '',
-        title_html   TEXT NOT NULL DEFAULT '',
-        intro_html   TEXT NOT NULL DEFAULT '',
-        fixes_html   TEXT NOT NULL DEFAULT '',
-        changes_html TEXT NOT NULL DEFAULT '',
-        new_html     TEXT NOT NULL DEFAULT '',
-        active_part  TEXT NOT NULL DEFAULT '',
-        updated_at   INTEGER NOT NULL DEFAULT 0
+        user_id         INTEGER PRIMARY KEY,
+        version         TEXT NOT NULL DEFAULT '',
+        title_html      TEXT NOT NULL DEFAULT '',
+        intro_html      TEXT NOT NULL DEFAULT '',
+        fixes_html      TEXT NOT NULL DEFAULT '',
+        changes_html    TEXT NOT NULL DEFAULT '',
+        new_html        TEXT NOT NULL DEFAULT '',
+        active_part     TEXT NOT NULL DEFAULT '',
+        menu_chat_id    INTEGER NOT NULL DEFAULT 0,
+        menu_message_id INTEGER NOT NULL DEFAULT 0,
+        updated_at      INTEGER NOT NULL DEFAULT 0
     );
     """, commit=True)
+
+    for sql in (
+        "ALTER TABLE post_update_drafts ADD COLUMN menu_chat_id INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE post_update_drafts ADD COLUMN menu_message_id INTEGER NOT NULL DEFAULT 0",
+    ):
+        try:
+            db_exec(sql, commit=True)
+        except Exception:
+            pass
 
     db_exec("""
     CREATE TABLE IF NOT EXISTS statpost_settings (
@@ -3602,6 +3826,73 @@ def init_db():
         updated_at   INTEGER NOT NULL DEFAULT 0
     );
     """, commit=True)
+
+    db_exec("""
+    CREATE TABLE IF NOT EXISTS statpost_history (
+        channel_id        INTEGER PRIMARY KEY,
+        users_total       INTEGER NOT NULL DEFAULT 0,
+        labs_total        INTEGER NOT NULL DEFAULT 0,
+        bio_exp_total     INTEGER NOT NULL DEFAULT 0,
+        bio_res_total     INTEGER NOT NULL DEFAULT 0,
+        bio_mater_total   INTEGER NOT NULL DEFAULT 0,
+        updated_at        INTEGER NOT NULL DEFAULT 0
+    );
+    """, commit=True)
+
+    db_exec("""
+    CREATE TABLE IF NOT EXISTS economy_totals (
+        stats_id              INTEGER PRIMARY KEY CHECK(stats_id=1),
+        bio_exp_gain          INTEGER NOT NULL DEFAULT 0,
+        bio_exp_spent         INTEGER NOT NULL DEFAULT 0,
+        bio_res_gain          INTEGER NOT NULL DEFAULT 0,
+        bio_res_spent         INTEGER NOT NULL DEFAULT 0,
+        bio_mater_gain        INTEGER NOT NULL DEFAULT 0,
+        bio_mater_spent       INTEGER NOT NULL DEFAULT 0,
+        initialized           INTEGER NOT NULL DEFAULT 0,
+        real_income_mode      INTEGER NOT NULL DEFAULT 0,
+        statpost_period_mode  INTEGER NOT NULL DEFAULT 0,
+        updated_at            INTEGER NOT NULL DEFAULT 0
+    );
+    """, commit=True)
+
+    db_exec(
+        "INSERT OR IGNORE INTO economy_totals(stats_id, initialized, updated_at) VALUES (1,0,?)",
+        (int(now_ts()),),
+        commit=True
+    )
+
+    try:
+        db_exec(
+            "ALTER TABLE economy_totals ADD COLUMN real_income_mode INTEGER NOT NULL DEFAULT 0",
+            commit=True
+        )
+    except Exception:
+        pass
+
+    try:
+        db_exec(
+            "ALTER TABLE economy_totals ADD COLUMN statpost_period_mode INTEGER NOT NULL DEFAULT 0",
+            commit=True
+        )
+    except Exception:
+        pass
+
+    db_exec(
+        "UPDATE economy_totals SET "
+        "bio_exp_gain=0, "
+        "bio_exp_spent=0, "
+        "bio_res_gain=0, "
+        "bio_res_spent=0, "
+        "bio_mater_gain=0, "
+        "bio_mater_spent=0, "
+        "initialized=1, "
+        "real_income_mode=1, "
+        "statpost_period_mode=1, "
+        "updated_at=? "
+        "WHERE stats_id=1 AND COALESCE(statpost_period_mode,0)=0",
+        (int(now_ts()),),
+        commit=True
+    )
 
     db_exec("""
     CREATE TABLE IF NOT EXISTS balance_chain_state (
@@ -3785,6 +4076,65 @@ def init_db():
         db_exec("ALTER TABLE labs ADD COLUMN skill_points INTEGER DEFAULT 0", commit=True)
     except Exception:
         pass
+
+    db_exec("DROP TRIGGER IF EXISTS trg_economy_labs_insert", commit=True)
+    db_exec("DROP TRIGGER IF EXISTS trg_economy_labs_update", commit=True)
+
+    db_exec("""
+    CREATE TRIGGER IF NOT EXISTS trg_economy_labs_insert
+    AFTER INSERT ON labs
+    BEGIN
+        UPDATE economy_totals SET
+            bio_exp_gain=bio_exp_gain + CASE WHEN COALESCE(NEW.bio_exp,0)>0 THEN COALESCE(NEW.bio_exp,0) ELSE 0 END,
+            bio_res_gain=bio_res_gain + CASE WHEN COALESCE(NEW.all_bio_res,0)>0 THEN COALESCE(NEW.all_bio_res,0) ELSE 0 END,
+            bio_mater_gain=bio_mater_gain + CASE WHEN COALESCE(NEW.all_bio_mater,0)>0 THEN COALESCE(NEW.all_bio_mater,0) ELSE 0 END,
+            updated_at=strftime('%s','now')
+        WHERE stats_id=1;
+    END;
+    """, commit=True)
+
+    db_exec("""
+    CREATE TRIGGER IF NOT EXISTS trg_economy_labs_update
+    AFTER UPDATE OF bio_exp, all_bio_res, all_bio_mater ON labs
+    BEGIN
+        UPDATE economy_totals SET
+            bio_exp_gain=bio_exp_gain + CASE
+                WHEN COALESCE(NEW.bio_exp,0)>COALESCE(OLD.bio_exp,0)
+                THEN COALESCE(NEW.bio_exp,0)-COALESCE(OLD.bio_exp,0)
+                ELSE 0
+            END,
+            bio_exp_spent=bio_exp_spent + CASE
+                WHEN COALESCE(NEW.bio_exp,0)<COALESCE(OLD.bio_exp,0)
+                THEN COALESCE(OLD.bio_exp,0)-COALESCE(NEW.bio_exp,0)
+                ELSE 0
+            END,
+
+            bio_res_gain=bio_res_gain + CASE
+                WHEN COALESCE(NEW.all_bio_res,0)>COALESCE(OLD.all_bio_res,0)
+                THEN COALESCE(NEW.all_bio_res,0)-COALESCE(OLD.all_bio_res,0)
+                ELSE 0
+            END,
+            bio_res_spent=bio_res_spent + CASE
+                WHEN COALESCE(NEW.all_bio_res,0)<COALESCE(OLD.all_bio_res,0)
+                THEN COALESCE(OLD.all_bio_res,0)-COALESCE(NEW.all_bio_res,0)
+                ELSE 0
+            END,
+
+            bio_mater_gain=bio_mater_gain + CASE
+                WHEN COALESCE(NEW.all_bio_mater,0)>COALESCE(OLD.all_bio_mater,0)
+                THEN COALESCE(NEW.all_bio_mater,0)-COALESCE(OLD.all_bio_mater,0)
+                ELSE 0
+            END,
+            bio_mater_spent=bio_mater_spent + CASE
+                WHEN COALESCE(NEW.all_bio_mater,0)<COALESCE(OLD.all_bio_mater,0)
+                THEN COALESCE(OLD.all_bio_mater,0)-COALESCE(NEW.all_bio_mater,0)
+                ELSE 0
+            END,
+
+            updated_at=strftime('%s','now')
+        WHERE stats_id=1;
+    END;
+    """, commit=True)
 
     # промокоды
     db_exec("""
@@ -6018,7 +6368,7 @@ def _corp_request_resolve(request_id: int, actor_id: int, approved: bool) -> tup
     user_id = int(req["user_id"])
 
     if not corp_is_owner_or_deputy(corp_id, int(actor_id)):
-        return False, "📑 Решение по заявке могут принимать только агенты тех.поддержки."
+        return False, "📑 Решение по заявке могут принимать только агенты техподдержки."
 
     corp = corp_by_id(corp_id)
     if not corp:
@@ -6527,8 +6877,8 @@ def _topui_parse(data: str):
 def kb_top_switch(kind: str, chat_id: int, limit: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup(row_width=3)
     kb.row(
-        _ikb("Опыт", callback_data=_topui_data("U", int(chat_id), int(limit)), style="primary"),
-        _ikb("Болезни", callback_data=_topui_data("D", int(chat_id), int(limit)), style="success"),
+        _ikb("Опыт", callback_data=_topui_data("U", int(chat_id), int(limit)), style=("primary" if (kind or "") == "U" else None)),
+        _ikb("Болезни", callback_data=_topui_data("D", int(chat_id), int(limit)), style=("success" if (kind or "") == "D" else None)),
         _ikb("Корпорации", callback_data=_topui_data("C", int(chat_id), int(limit)), style=("primary" if (kind or "") == "C" else None)),
     )
     return kb
@@ -6653,8 +7003,14 @@ def render_top_diseases(limit: int, chat_id: int = 0) -> tuple[str, InlineKeyboa
         owner_un = (r["username"] or "")
         pname = (r["pname"] or "").strip()
         disease_name = f"«{h(pname)}»" if pname else "неизвестный патоген"
-        clickable_disease = tg_mention(owner_id, disease_name, username=owner_un)
-        lines.append(f"{i}. {clickable_disease} | {_fmt_k(int(r['sick'] or 0))} бол")
+
+        _hb, hide_lab = get_privacy_flags(owner_id)
+        if int(hide_lab or 0) == 1:
+            disease_tag = disease_name
+        else:
+            disease_tag = tg_mention(owner_id, disease_name, username=owner_un)
+
+        lines.append(f"{i}. {disease_tag} | {_fmt_k(int(r['sick'] or 0))} бол")
     lines.append("</blockquote>")
     return "\n".join(lines), kb_top_switch("D", int(chat_id), int(limit))
 
@@ -7817,7 +8173,7 @@ def _users_normalize_filters(view="overall", kind="all", lab="all", new_only=Fal
     kind = str(kind or "all").strip().lower()
     lab = str(lab or "all").strip().lower()
 
-    if view not in ("overall", "chats"):
+    if view not in ("overall", "chats", "channels"):
         view = "overall"
 
     if kind not in ("all", "bots", "users"):
@@ -7832,7 +8188,7 @@ def _users_normalize_filters(view="overall", kind="all", lab="all", new_only=Fal
         lab = "all"
         new_only = False
 
-    if view == "chats":
+    if view in ("chats", "channels"):
         kind = "all"
         lab = "all"
         new_only = False
@@ -7856,6 +8212,9 @@ def _parse_users_filters_from_args(args_text: str) -> dict:
 
     if toks[0] == "чаты":
         return _users_normalize_filters(view="chats")
+
+    if toks[0] in ("каналы", "channels", "chan"):
+        return _users_normalize_filters(view="channels")
 
     if toks[0] == "общий":
         toks = toks[1:]
@@ -8052,36 +8411,26 @@ def _known_chats_parse_cb(data: str) -> Optional[int]:
 
 def _known_chats_collect_rows() -> list[dict]:
     rows = db_all(
-        "SELECT q.chat_id, "
-        "COALESCE(bg.title, '') AS title, "
-        "COALESCE(bg.owner_id, 0) AS owner_id, "
-        "COALESCE(bg.updated_at, 0) AS updated_at "
-        "FROM ("
-        "  SELECT chat_id FROM bot_group_chats "
-        "  WHERE COALESCE(is_active,0)=1 "
-        "    AND lower(COALESCE(chat_type,'')) IN ('group','supergroup') "
-        "  UNION "
-        "  SELECT chat_id FROM chat_members "
-        ") q "
-        "LEFT JOIN bot_group_chats bg ON bg.chat_id=q.chat_id "
-        "WHERE lower(COALESCE(bg.chat_type,'group')) IN ('group','supergroup','') "
-        "ORDER BY COALESCE(bg.updated_at,0) DESC, q.chat_id ASC"
+        "SELECT chat_id, "
+        "COALESCE(title, '') AS title, "
+        "lower(COALESCE(chat_type,'')) AS chat_type, "
+        "COALESCE(owner_id, 0) AS owner_id, "
+        "COALESCE(updated_at, 0) AS updated_at "
+        "FROM bot_group_chats "
+        "WHERE COALESCE(is_active,0)=1 "
+        "  AND lower(COALESCE(chat_type,'')) IN ('group','supergroup') "
+        "ORDER BY COALESCE(updated_at,0) DESC, chat_id ASC"
     ) or []
 
     out = []
+
     for r in rows:
         chat_id = int(r["chat_id"])
+        stored_type = str(r["chat_type"] or "").strip().lower()
+        actual_type = _known_refresh_chat_type(chat_id, stored_type)
 
-        type_row = db_one(
-            "SELECT lower(COALESCE(chat_type,'')) AS chat_type, COALESCE(is_active,0) AS is_active "
-            "FROM bot_group_chats WHERE chat_id=? LIMIT 1",
-            (int(chat_id),)
-        )
-
-        if type_row:
-            chat_type = str(type_row["chat_type"] or "").strip().lower()
-            if chat_type == "channel":
-                continue
+        if actual_type not in ("group", "supergroup"):
+            continue
 
         title = (r["title"] or "").strip() or f"Чат {chat_id}"
         owner_id = int(r["owner_id"] or 0)
@@ -8091,15 +8440,29 @@ def _known_chats_collect_rows() -> list[dict]:
                 sync_chat_admins(chat_id)
             except Exception:
                 pass
-            rr = db_one("SELECT COALESCE(owner_id,0) AS owner_id FROM bot_group_chats WHERE chat_id=?", (chat_id,))
-            owner_id = int(rr["owner_id"] or 0) if rr else 0
+
+            rr = db_one(
+                "SELECT COALESCE(owner_id,0) AS owner_id, COALESCE(title,'') AS title "
+                "FROM bot_group_chats WHERE chat_id=? LIMIT 1",
+                (chat_id,)
+            )
+
+            if rr:
+                owner_id = int(rr["owner_id"] or 0)
+                db_title = str(rr["title"] or "").strip()
+                if db_title:
+                    title = db_title
 
         owner_tag = public_user_tag(owner_id, force_standard=True) if owner_id > 0 else "неизвестно"
+        users_count = _known_chat_user_count(chat_id)
+        admin_mark = _known_bot_admin_mark(chat_id)
 
         out.append({
             "chat_id": chat_id,
             "title": title,
             "owner_tag": owner_tag,
+            "users_count": int(users_count),
+            "admin_mark": admin_mark,
         })
 
     return out
@@ -8110,8 +8473,15 @@ def render_known_chats_text(page: int) -> tuple[str, Optional[InlineKeyboardMark
 
     if total <= 0:
         kb = InlineKeyboardMarkup()
-        kb.row(InlineKeyboardButton("Пользователи", callback_data=_users_cb(1, view="overall", kind="all", lab="all", new_only=False)))
-        return "📑 Список известных чатов пуст.", kb
+        kb.row(
+            InlineKeyboardButton("Пользователи", callback_data=_users_cb(1, view="overall", kind="all", lab="all", new_only=False)),
+            InlineKeyboardButton("Известные каналы", callback_data=_known_channels_cb(1))
+        )
+        return (
+            "📑 Список известных чатов пуст.\n\n"
+            "🗨️ Кол-во чатов: 0\n\n"
+            "<blockquote>❇️ — бот является администратором чата.</blockquote>"
+        ), kb
 
     total_pages = max(1, (total + USERS_PAGE_SIZE - 1) // USERS_PAGE_SIZE)
     page = max(1, min(int(page), total_pages))
@@ -8121,10 +8491,16 @@ def render_known_chats_text(page: int) -> tuple[str, Optional[InlineKeyboardMark
     lines = []
     lines.append("📑 Список известных чатов")
     lines.append("")
+    lines.append(f"🗨️ Кол-во чатов: {total}")
+    lines.append("")
     lines.append("<blockquote expandable>")
     for idx, row in enumerate(part, start + 1):
-        lines.append(f"{idx}. <b>{h(row['title'])}</b> | {row['owner_tag']}")
+        lines.append(
+            f"{idx}. {row.get('admin_mark') or ''}<b>{h(row['title'])}</b> "
+            f"{_fmt_k(int(row.get('users_count') or 0))} | {row['owner_tag']}"
+        )
     lines.append("</blockquote>")
+    lines.append("<blockquote>❇️ — бот является администратором чата.</blockquote>")
 
     kb = InlineKeyboardMarkup(row_width=8)
     row_btns = []
@@ -8159,7 +8535,159 @@ def render_known_chats_text(page: int) -> tuple[str, Optional[InlineKeyboardMark
 
         kb.row(*row_btns)
 
-    kb.row(InlineKeyboardButton("Пользователи", callback_data=_users_cb(1, view="overall", kind="all", lab="all", new_only=False)))
+    kb.row(
+        InlineKeyboardButton("Пользователи", callback_data=_users_cb(1, view="overall", kind="all", lab="all", new_only=False)),
+        InlineKeyboardButton("Известные каналы", callback_data=_known_channels_cb(1))
+    )
+    return "\n".join(lines), kb
+
+def _known_channels_cb(page: int) -> str:
+    return f"{CHANNELSUI_TAG}:{int(page)}"
+
+def _known_channels_parse_cb(data: str) -> Optional[int]:
+    try:
+        p = (data or "").split(":")
+        if len(p) != 2 or p[0] != CHANNELSUI_TAG:
+            return None
+        return int(p[1])
+    except Exception:
+        return None
+
+def _known_channels_collect_rows() -> list[dict]:
+    rows = db_all(
+        "SELECT chat_id, "
+        "COALESCE(title,'') AS title, "
+        "lower(COALESCE(chat_type,'')) AS chat_type, "
+        "COALESCE(owner_id,0) AS owner_id, "
+        "COALESCE(updated_at,0) AS updated_at "
+        "FROM bot_group_chats "
+        "WHERE COALESCE(is_active,0)=1 "
+        "  AND lower(COALESCE(chat_type,''))='channel' "
+        "ORDER BY COALESCE(updated_at,0) DESC, chat_id ASC"
+    ) or []
+
+    out = []
+
+    for r in rows:
+        channel_id = int(r["chat_id"])
+        stored_type = str(r["chat_type"] or "").strip().lower()
+        actual_type = _known_refresh_chat_type(channel_id, stored_type)
+
+        if actual_type != "channel":
+            continue
+
+        title = (r["title"] or "").strip() or f"Канал {channel_id}"
+        owner_id = int(r["owner_id"] or 0)
+
+        if owner_id <= 0:
+            try:
+                owner_id = int(_post_channel_owner_id(channel_id) or 0)
+            except Exception:
+                owner_id = 0
+
+            rr = db_one(
+                "SELECT COALESCE(owner_id,0) AS owner_id, COALESCE(title,'') AS title "
+                "FROM bot_group_chats WHERE chat_id=? LIMIT 1",
+                (channel_id,)
+            )
+
+            if rr:
+                if owner_id <= 0:
+                    owner_id = int(rr["owner_id"] or 0)
+
+                db_title = str(rr["title"] or "").strip()
+                if db_title:
+                    title = db_title
+
+        owner_tag = public_user_tag(owner_id, force_standard=True) if owner_id > 0 else "неизвестно"
+        users_count = _known_chat_user_count(channel_id)
+        admin_mark = _known_bot_admin_mark(channel_id)
+
+        out.append({
+            "channel_id": channel_id,
+            "title": title,
+            "owner_tag": owner_tag,
+            "users_count": int(users_count),
+            "admin_mark": admin_mark,
+        })
+
+    return out
+
+def render_known_channels_text(page: int) -> tuple[str, Optional[InlineKeyboardMarkup]]:
+    rows = _known_channels_collect_rows()
+    total = len(rows)
+
+    if total <= 0:
+        kb = InlineKeyboardMarkup()
+        kb.row(
+            InlineKeyboardButton("Пользователи", callback_data=_users_cb(1, view="overall", kind="all", lab="all", new_only=False)),
+            InlineKeyboardButton("Известные чаты", callback_data=_known_chats_cb(1))
+        )
+        return (
+            "📑 Список известных каналов пуст.\n\n"
+            "🗨️ Кол-во каналов: 0\n\n"
+            "<blockquote>❇️ — бот является администратором канала.</blockquote>"
+        ), kb
+
+    total_pages = max(1, (total + USERS_PAGE_SIZE - 1) // USERS_PAGE_SIZE)
+    page = max(1, min(int(page), total_pages))
+    start = (page - 1) * USERS_PAGE_SIZE
+    part = rows[start:start + USERS_PAGE_SIZE]
+
+    lines = []
+    lines.append("📑 Список известных каналов")
+    lines.append("")
+    lines.append(f"🗨️ Кол-во каналов: {total}")
+    lines.append("")
+    lines.append("<blockquote expandable>")
+
+    for idx, row in enumerate(part, start + 1):
+        lines.append(
+            f"{idx}. {row.get('admin_mark') or ''}<b>{h(row['title'])}</b> "
+            f"{_fmt_k(int(row.get('users_count') or 0))} | {row['owner_tag']}"
+        )
+
+    lines.append("</blockquote>")
+    lines.append("<blockquote>❇️ — бот является администратором канала.</blockquote>")
+
+    kb = InlineKeyboardMarkup(row_width=8)
+    row_btns = []
+
+    if total_pages > 1:
+        if page > 2:
+            row_btns.append(InlineKeyboardButton("<<", callback_data=_known_channels_cb(1)))
+        if page > 1:
+            row_btns.append(InlineKeyboardButton("<", callback_data=_known_channels_cb(page - 1)))
+
+        page_nums = []
+        if total_pages <= 4:
+            page_nums = list(range(1, total_pages + 1))
+        elif page == 1:
+            page_nums = [1, 2, 3, 4]
+        elif page == total_pages:
+            page_nums = [total_pages - 3, total_pages - 2, total_pages - 1, total_pages]
+        else:
+            page_nums = [max(1, page - 1), page, min(total_pages, page + 1), min(total_pages, page + 2)]
+            page_nums = sorted(dict.fromkeys([p for p in page_nums if 1 <= p <= total_pages]))
+
+        for p in page_nums:
+            if p == page:
+                row_btns.append(InlineKeyboardButton(f"·{p}·", callback_data=_known_channels_cb(page)))
+            else:
+                row_btns.append(InlineKeyboardButton(str(p), callback_data=_known_channels_cb(p)))
+
+        if page < total_pages:
+            row_btns.append(InlineKeyboardButton(">", callback_data=_known_channels_cb(page + 1)))
+        if page < total_pages - 1:
+            row_btns.append(InlineKeyboardButton(">>", callback_data=_known_channels_cb(total_pages)))
+
+        kb.row(*row_btns)
+
+    kb.row(
+        InlineKeyboardButton("Пользователи", callback_data=_users_cb(1, view="overall", kind="all", lab="all", new_only=False)),
+        InlineKeyboardButton("Известные чаты", callback_data=_known_chats_cb(1))
+    )
+
     return "\n".join(lines), kb
 
 def _users_collect_rows(filters: Optional[dict] = None) -> list[dict]:
@@ -8171,6 +8699,7 @@ def _users_collect_rows(filters: Optional[dict] = None) -> list[dict]:
         "COALESCE(u.first_seen_verified,0) AS first_seen_verified, "
         "COALESCE(u.last_seen,0) AS last_seen, "
         "COALESCE(u.is_placeholder,0) AS is_placeholder, "
+        "COALESCE(u.pm_opened,0) AS pm_opened, "
         "COALESCE(u.is_bot,0) AS is_bot, "
         "COALESCE(l.lab_active,0) AS lab_active "
         "FROM users u "
@@ -8189,6 +8718,7 @@ def _users_collect_rows(filters: Optional[dict] = None) -> list[dict]:
         is_new = _users_is_new(int(r["first_seen"] or 0), int(r["first_seen_verified"] or 0))
         safe_seen = activity_last_seen_ts(int(r["user_id"]), fallback=int(r["last_seen"] or 0))
         is_recent = _users_is_recent(int(safe_seen or 0))
+        pm_opened = int(r["pm_opened"] or 0)
 
         if f["kind"] == "bots" and is_bot != 1:
             continue
@@ -8222,6 +8752,7 @@ def _users_collect_rows(filters: Optional[dict] = None) -> list[dict]:
             "is_bot": is_bot,
             "is_new": bool(is_new),
             "is_recent": bool(is_recent),
+            "pm_opened": int(pm_opened),
             "lab_active": int(lab_active),
         })
 
@@ -8235,7 +8766,10 @@ def render_users_text(page: int, filters: Optional[dict] = None) -> tuple[str, O
     if total <= 0:
         kb = InlineKeyboardMarkup()
         kb = _users_append_filter_rows(kb, f)
-        kb.row(InlineKeyboardButton("Известные чаты", callback_data=_known_chats_cb(1)))
+        kb.row(
+            InlineKeyboardButton("Известные чаты", callback_data=_known_chats_cb(1)),
+            InlineKeyboardButton("Известные каналы", callback_data=_known_channels_cb(1))
+        )
         return "📑 Список пользователей пуст.", kb
 
     total_pages = max(1, (total + USERS_PAGE_SIZE - 1) // USERS_PAGE_SIZE)
@@ -8246,6 +8780,7 @@ def render_users_text(page: int, filters: Optional[dict] = None) -> tuple[str, O
     total_users = _users_total_count()
     total_bots = _users_bot_count()
     total_chats = _bot_group_chat_count()
+    total_channels = _bot_channel_count()
 
     if f["kind"] == "bots":
         title = "📑 Список известных ботов"
@@ -8280,11 +8815,14 @@ def render_users_text(page: int, filters: Optional[dict] = None) -> tuple[str, O
         lines.append(f"🤖 Кол-во ботов: {shown_bots_count}")
 
     lines.append(f"🗨️ Кол-во чатов: {total_chats}")
+    lines.append(f"🗨️ Кол-во каналов: {total_channels}")
     lines.append("")
     lines.append("<blockquote expandable>")
 
     for idx, row in enumerate(part, start + 1):
         marks = []
+        if int(row.get("pm_opened") or 0) == 1:
+            marks.append("💭")
         if bool(row["is_new"]):
             marks.append("🆕")
         if bool(row["is_recent"]):
@@ -8297,6 +8835,13 @@ def render_users_text(page: int, filters: Optional[dict] = None) -> tuple[str, O
         )
 
     lines.append("</blockquote>")
+    lines.append(
+        "<blockquote>"
+        "💭 — пользователь открывал личные сообщения с ботом.\n"
+        "🆕 — новый пользователь.\n"
+        "🆙 — активность за последние 30 минут."
+        "</blockquote>"
+    )
 
     kb = InlineKeyboardMarkup(row_width=8)
     kb = _users_append_filter_rows(kb, f)
@@ -8333,7 +8878,10 @@ def render_users_text(page: int, filters: Optional[dict] = None) -> tuple[str, O
 
         kb.row(*row_btns)
 
-    kb.row(InlineKeyboardButton("Известные чаты", callback_data=_known_chats_cb(1)))
+    kb.row(
+        InlineKeyboardButton("Известные чаты", callback_data=_known_chats_cb(1)),
+        InlineKeyboardButton("Известные каналы", callback_data=_known_channels_cb(1))
+    )
     return "\n".join(lines), kb
 
 def _agents_panel_section_cb(user_id: int, section: str) -> str:
@@ -8578,7 +9126,9 @@ def _agents_panel_agent_section_lines(chat_type: str) -> list[str]:
 
     if not is_group:
         lines.append("/users — список всех пользователей")
-
+        lines.append("/users_cof — коэффициенты списков")
+        lines.append("/status — статус онлайна/офлайна агента")
+        
     lines.append("</blockquote>")
     return lines
 
@@ -8648,10 +9198,9 @@ def _agents_panel_creator_section_lines() -> list[str]:
     lines.append("/my_owner_remove — снять с себя права старшего агента")
     lines.append("/owner — назначить старшего агента")
     lines.append("/owner_remove — снять права старшего агента")
-    lines.append("/post_agents — сообщение всем агентам техподдержки")
     lines.append("")
-
     lines.extend(render_creator_post_config_section())
+    lines.append("/post_agents — сообщение всем агентам техподдержки")
     lines.append("</blockquote>")
     return lines
 
@@ -10406,6 +10955,12 @@ GENDER_TEXTS = {
         "male": "больше не является заместителем Корпорации",
         "female": "больше не является заместительницей Корпорации",
     },
+
+    # словарь репорта
+    "report_agent_took": {
+        "male": "занялся",
+        "female": "занялась",
+    },
 }
 
 def _gender_pick(user_id: int, key: str, **fmt) -> str:
@@ -10809,12 +11364,16 @@ def render_agent_status_menu_text(user_id: int) -> str:
         "Выберите параметр:"
     )
 
-def _agent_status_setting_cb(user_id: int, code: str) -> str:
+def _agent_status_setting_cb(user_id: int, code: str, show_back: bool = True) -> str:
     code = str(code or "").strip().upper()
+    if not bool(show_back):
+        code = f"{code}_NB"
     return _settings_cb(int(user_id), f"ST_{code}")
 
 def _agent_status_code_from_settings_action(act: str) -> Optional[str]:
     a = str(act or "").strip().upper()
+    if a.endswith("_NB"):
+        a = a[:-3]
 
     if a == "ST_AUTO":
         return AGENT_STATUS_AUTO
@@ -10831,14 +11390,14 @@ def _agent_status_code_from_settings_action(act: str) -> Optional[str]:
 
     return None
 
-def kb_agent_status_settings(user_id: int) -> InlineKeyboardMarkup:
+def kb_agent_status_settings(user_id: int, show_back: bool = True) -> InlineKeyboardMarkup:
     uid = int(user_id)
     current = agent_status_get(uid)
 
     def btn(text: str, action_code: str, status_code: str):
         return _ikb(
             text,
-            callback_data=_agent_status_setting_cb(uid, action_code),
+            callback_data=_agent_status_setting_cb(uid, action_code, show_back=show_back),
             style=("success" if current == status_code else None)
         )
 
@@ -10858,16 +11417,17 @@ def kb_agent_status_settings(user_id: int) -> InlineKeyboardMarkup:
     kb.row(
         _ikb(
             "Сбросить выбор",
-            callback_data=_agent_status_setting_cb(uid, "AUTO"),
+            callback_data=_agent_status_setting_cb(uid, "AUTO", show_back=show_back),
             style="danger"
         )
     )
-    kb.row(
-        _ikb(
-            "❰ К параметрам",
-            callback_data=_settings_cb(uid, "ST_BACK")
+    if show_back:
+        kb.row(
+            _ikb(
+                "❰  К параметрам",
+                callback_data=_settings_cb(uid, "ST_BACK")
+            )
         )
-    )
 
     return kb
 
@@ -10977,7 +11537,7 @@ def render_settings_text(user_id: int, current_chat_id: int = 0) -> str:
 
     if deleted_row:
         lines.append("")
-        lines.append("⌛ Восстановление лаборатории:")
+        lines.append("⌛ Восстановление лаборатории")
         lines.append(f"{_settings_restore_timer_text(uid)}")
 
     return "\n".join(lines)
@@ -11127,7 +11687,7 @@ def handle_agent_status_command(message, parsed: "Parsed"):
             render_agent_status_menu_text(uid),
             parse_mode="HTML",
             disable_web_page_preview=True,
-            reply_markup=kb_agent_status_settings(uid)
+            reply_markup=kb_agent_status_settings(uid, show_back=False)
         )
         return
 
@@ -11772,7 +12332,7 @@ def _send_media_group_to_report_recipients(
     if not items:
         return False
 
-    for uid in _report_notify_user_ids_filtered(exclude_user_id):
+    for uid in _report_notify_user_ids_filtered(exclude_user_id, skip_inactive=True):
         if _report_send_media_group_to_chat(
             int(uid),
             items,
@@ -11843,10 +12403,7 @@ def _send_report_to_service_team(
 ) -> bool:
     try:
         reporter_uid = int(reporter_user_id or 0)
-
-        rm = None
-        if reporter_uid > 0 and int(report_ts or 0) > 0:
-            rm = kb_report_answer(reporter_uid, int(report_ts))
+        report_time = int(report_ts or 0)
 
         items = _report_normalize_media_items(
             media_items,
@@ -11854,71 +12411,74 @@ def _send_report_to_service_team(
             media_file_id=media_file_id
         )
 
+        ok_content = False
+
         if not items:
-            return _send_message_to_report_recipients(
+            ok_content = _send_message_to_report_recipients(
                 admin_text,
                 parse_mode="HTML",
                 disable_web_page_preview=True,
-                reply_markup=rm,
-                exclude_user_id=reporter_uid
+                reply_markup=None,
+                exclude_user_id=reporter_uid,
             )
+        else:
+            caption = admin_text if len(admin_text or "") <= 1000 else ""
 
-        caption = admin_text if len(admin_text or "") <= 1000 else ""
+            if len(items) == 1:
+                first = items[0]
 
-        if len(items) == 1:
-            first = items[0]
-
-            if caption:
-                return _send_media_to_report_recipients(
-                    first["type"],
-                    first["file_id"],
-                    caption=admin_text,
+                if caption:
+                    ok_content = _send_media_to_report_recipients(
+                        first["type"],
+                        first["file_id"],
+                        caption=admin_text,
+                        parse_mode="HTML",
+                        reply_markup=None,
+                        exclude_user_id=reporter_uid
+                    )
+                else:
+                    ok_text = _send_message_to_report_recipients(
+                        admin_text,
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                        reply_markup=None,
+                        exclude_user_id=reporter_uid
+                    )
+                    ok_media = _send_media_to_report_recipients(
+                        first["type"],
+                        first["file_id"],
+                        exclude_user_id=reporter_uid
+                    )
+                    ok_content = bool(ok_text or ok_media)
+            else:
+                ok_media = _send_media_group_to_report_recipients(
+                    items,
+                    caption=caption,
                     parse_mode="HTML",
-                    reply_markup=rm,
                     exclude_user_id=reporter_uid
                 )
 
-            ok_text = _send_message_to_report_recipients(
-                admin_text,
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-                reply_markup=rm,
-                exclude_user_id=reporter_uid
-            )
-            ok_media = _send_media_to_report_recipients(
-                first["type"],
-                first["file_id"],
-                exclude_user_id=reporter_uid
-            )
-            return bool(ok_text or ok_media)
+                if not caption:
+                    ok_text = _send_message_to_report_recipients(
+                        admin_text,
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                        reply_markup=None,
+                        exclude_user_id=reporter_uid
+                    )
+                    ok_content = bool(ok_text or ok_media)
+                else:
+                    ok_content = bool(ok_media)
 
-        ok_media = _send_media_group_to_report_recipients(
-            items,
-            caption=caption,
-            parse_mode="HTML",
-            exclude_user_id=reporter_uid
-        )
-
-        if not caption:
-            ok_text = _send_message_to_report_recipients(
-                admin_text,
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-                reply_markup=rm,
-                exclude_user_id=reporter_uid
-            )
-            return bool(ok_text or ok_media)
-
-        if rm is not None:
-            _send_message_to_report_recipients(
-                _report_answer_button_notice_text(int(report_ts)),
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-                reply_markup=rm,
+        ok_notice = False
+        if ok_content and reporter_uid > 0 and report_time > 0:
+            ok_notice = _send_report_answer_notice_to_team(
+                reporter_uid,
+                report_time,
                 exclude_user_id=reporter_uid
             )
 
-        return bool(ok_media)
+        return bool(ok_content and ok_notice)
     except Exception:
         return False
 
@@ -12007,6 +12567,16 @@ def _handle_report_content_message(message) -> bool:
                     answer_text,
                     media_items=media_items
                 )
+
+                if ok:
+                    _report_close_answer_notices(
+                        int(answer_target_id),
+                        int(answer_report_ts or 0),
+                        int(uid),
+                        answer_plain_text=draft_text,
+                        media_items=media_items
+                    )
+
                 if not ok:
                     bot.reply_to(
                         message,
@@ -12124,7 +12694,7 @@ def _handle_report_content_message(message) -> bool:
             else:
                 bot.reply_to(
                     message,
-                    _report_text_for_user(report_notice_user_id, "📨 Обращение отправлено тех.поддержке на рассмотрение. Благодарим вас за поддержку проекта."),
+                    _report_text_for_user(report_notice_user_id, "📨 Обращение отправлено техподдержке на рассмотрение. Благодарим вас за поддержку проекта."),
                     parse_mode="HTML",
                     disable_web_page_preview=True,
                     reply_markup=report_reply_remove_markup()
@@ -12636,6 +13206,8 @@ def _activity_track_callback_query(cq):
 
         if chat and chat_type in ("group", "supergroup"):
             remember_chat_member(chat_id, user, activity=True)
+
+        autodelete_refresh_inline_button_message(cq)
     except Exception:
         pass
 
@@ -12998,13 +13570,19 @@ def _users_bot_count() -> int:
 
 def _bot_group_chat_count() -> int:
     row = db_one(
-        "SELECT COUNT(DISTINCT chat_id) AS c FROM ("
-        "  SELECT chat_id FROM bot_group_chats "
-        "  WHERE COALESCE(is_active,0)=1 "
-        "    AND lower(COALESCE(chat_type,'')) IN ('group','supergroup') "
-        "  UNION "
-        "  SELECT chat_id FROM chat_members "
-        ") t"
+        "SELECT COUNT(DISTINCT chat_id) AS c "
+        "FROM bot_group_chats "
+        "WHERE COALESCE(is_active,0)=1 "
+        "  AND lower(COALESCE(chat_type,'')) IN ('group','supergroup')"
+    )
+    return int(row["c"] or 0) if row else 0
+
+def _bot_channel_count() -> int:
+    row = db_one(
+        "SELECT COUNT(DISTINCT chat_id) AS c "
+        "FROM bot_group_chats "
+        "WHERE COALESCE(is_active,0)=1 "
+        "  AND lower(COALESCE(chat_type,''))='channel'"
     )
     return int(row["c"] or 0) if row else 0
 
@@ -13328,14 +13906,50 @@ def post_draft_clear(user_id: int):
 def post_meta_clear(user_id: int):
     db_exec("DELETE FROM post_meta WHERE user_id=?", (int(user_id),), commit=True)
 
+def post_update_delete_menu_message(user_id: int):
+    row = db_one(
+        "SELECT COALESCE(menu_chat_id,0) AS chat_id, COALESCE(menu_message_id,0) AS message_id "
+        "FROM post_update_drafts WHERE user_id=? LIMIT 1",
+        (int(user_id),)
+    )
+
+    if not row:
+        return
+
+    chat_id = int(row["chat_id"] or 0)
+    message_id = int(row["message_id"] or 0)
+
+    if chat_id != 0 and message_id > 0:
+        try:
+            bot.delete_message(chat_id, message_id)
+        except Exception:
+            pass
+
+    try:
+        db_exec(
+            "UPDATE post_update_drafts SET menu_chat_id=0, menu_message_id=0 WHERE user_id=?",
+            (int(user_id),),
+            commit=True
+        )
+    except Exception:
+        pass
+
 def post_update_clear(user_id: int):
+    post_update_delete_menu_message(int(user_id))
     db_exec("DELETE FROM post_update_drafts WHERE user_id=?", (int(user_id),), commit=True)
 
 def post_state_clear(user_id: int):
-    post_draft_clear(int(user_id))
-    post_meta_clear(int(user_id))
-    post_update_clear(int(user_id))
-    db_exec("DELETE FROM post_state WHERE user_id=?", (int(user_id),), commit=True)
+    uid = int(user_id)
+
+    post_draft_clear(uid)
+    post_meta_clear(uid)
+    post_update_clear(uid)
+    db_exec("DELETE FROM post_state WHERE user_id=?", (uid,), commit=True)
+
+    try:
+        run_chat_autodelete_once(uid)
+    except Exception:
+        pass
 
 def post_meta_get(user_id: int) -> dict:
     row = db_one(
@@ -13381,10 +13995,10 @@ def post_kind_title(post_kind: str) -> str:
     k = str(post_kind or "").strip().lower()
     if k == POST_KIND_UPDATE:
         return "Обновление"
-    if k == POST_KIND_PROJECTS:
-        return "Проекты"
     if k == POST_KIND_OTHER:
-        return "Прочее"
+        return "Разговорные"
+    if k == POST_KIND_PROJECTS:
+        return "Вне темы"
     if k == POST_KIND_AD:
         return "Реклама"
     return "Пост"
@@ -13501,7 +14115,8 @@ def _post_normalize_media_items(media_items: Optional[list[dict]] = None) -> lis
 
 def post_update_get(user_id: int) -> dict:
     row = db_one(
-        "SELECT version, title_html, intro_html, fixes_html, changes_html, new_html, active_part, updated_at "
+        "SELECT version, title_html, intro_html, fixes_html, changes_html, new_html, active_part, "
+        "COALESCE(menu_chat_id,0) AS menu_chat_id, COALESCE(menu_message_id,0) AS menu_message_id, updated_at "
         "FROM post_update_drafts WHERE user_id=? LIMIT 1",
         (int(user_id),)
     )
@@ -13515,6 +14130,8 @@ def post_update_get(user_id: int) -> dict:
             "changes_html": "",
             "new_html": "",
             "active_part": "",
+            "menu_chat_id": 0,
+            "menu_message_id": 0,
             "updated_at": 0,
         }
 
@@ -13526,14 +14143,17 @@ def post_update_get(user_id: int) -> dict:
         "changes_html": str(row["changes_html"] or "").strip(),
         "new_html": str(row["new_html"] or "").strip(),
         "active_part": str(row["active_part"] or "").strip(),
+        "menu_chat_id": int(row["menu_chat_id"] or 0),
+        "menu_message_id": int(row["menu_message_id"] or 0),       
         "updated_at": int(row["updated_at"] or 0),
     }
 
 def post_update_save(user_id: int, data: dict):
     db_exec(
         "INSERT INTO post_update_drafts("
-        "user_id, version, title_html, intro_html, fixes_html, changes_html, new_html, active_part, updated_at"
-        ") VALUES (?,?,?,?,?,?,?,?,?) "
+        "user_id, version, title_html, intro_html, fixes_html, changes_html, new_html, active_part, "
+        "menu_chat_id, menu_message_id, updated_at"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?) "
         "ON CONFLICT(user_id) DO UPDATE SET "
         "version=excluded.version, "
         "title_html=excluded.title_html, "
@@ -13542,6 +14162,8 @@ def post_update_save(user_id: int, data: dict):
         "changes_html=excluded.changes_html, "
         "new_html=excluded.new_html, "
         "active_part=excluded.active_part, "
+        "menu_chat_id=excluded.menu_chat_id, "
+        "menu_message_id=excluded.menu_message_id, "
         "updated_at=excluded.updated_at",
         (
             int(user_id),
@@ -13552,6 +14174,8 @@ def post_update_save(user_id: int, data: dict):
             str(data.get("changes_html") or "").strip(),
             str(data.get("new_html") or "").strip(),
             str(data.get("active_part") or "").strip(),
+            int(data.get("menu_chat_id") or 0),
+            int(data.get("menu_message_id") or 0),
             int(now_ts())
         ),
         commit=True
@@ -13762,6 +14386,58 @@ def render_post_update_menu_text(user_id: int) -> str:
     lines.append("Выберите раздел кнопками ниже и отправьте текст или вложение.")
 
     return "\n".join(lines)
+
+def post_update_store_menu_message(user_id: int, chat_id: int, message_id: int):
+    data = post_update_get(int(user_id))
+    data["menu_chat_id"] = int(chat_id)
+    data["menu_message_id"] = int(message_id)
+    post_update_save(int(user_id), data)
+
+def post_update_is_current_menu_message(user_id: int, chat_id: int, message_id: int) -> bool:
+    data = post_update_get(int(user_id))
+    return (
+        int(data.get("menu_chat_id") or 0) == int(chat_id)
+        and int(data.get("menu_message_id") or 0) == int(message_id)
+    )
+
+def send_post_update_menu(user_id: int, chat_id: int):
+    uid = int(user_id)
+    post_update_delete_menu_message(uid)
+
+    msg = bot.send_message(
+        int(chat_id),
+        render_post_update_menu_text(uid),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+        reply_markup=kb_post_update_parts(uid)
+    )
+
+    try:
+        post_update_store_menu_message(uid, int(msg.chat.id), int(msg.message_id))
+    except Exception:
+        pass
+
+    return msg
+
+def reply_post_update_menu_notice(message, user_id: int, text: str):
+    uid = int(user_id)
+
+    post_update_delete_menu_message(uid)
+
+    msg = bot.reply_to(
+        message,
+        str(text or ""),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+        reply_markup=kb_post_update_parts(uid)
+    )
+
+    try:
+        post_update_store_menu_message(uid, int(msg.chat.id), int(msg.message_id))
+    except Exception:
+        pass
+
+    return msg
 
 def post_draft_get(user_id: int) -> dict:
     row = db_one(
@@ -14166,10 +14842,10 @@ def kb_post_type_choice(user_id: int) -> InlineKeyboardMarkup:
 
     kb.row(
         _ikb("Обновление", callback_data=_post_type_cb(uid, POST_KIND_UPDATE)),
-        _ikb("Проекты", callback_data=_post_type_cb(uid, POST_KIND_PROJECTS))
+        _ikb("Разговорные", callback_data=_post_type_cb(uid, POST_KIND_OTHER))
     )
     kb.row(
-        _ikb("Прочее", callback_data=_post_type_cb(uid, POST_KIND_OTHER)),
+        _ikb("Вне темы", callback_data=_post_type_cb(uid, POST_KIND_PROJECTS)),
         _ikb("Реклама", callback_data=_post_type_cb(uid, POST_KIND_AD))
     )
 
@@ -15517,6 +16193,98 @@ def _statpost_stats_row() -> sqlite3.Row:
         """
     )
 
+def _statpost_stats_dict(row=None) -> dict:
+    if row is None:
+        row = _statpost_stats_row()
+
+    return {
+        "users_total": int(row["users_total"] or 0) if row else 0,
+        "labs_total": int(row["labs_total"] or 0) if row else 0,
+        "bio_exp_total": int(row["bio_exp_total"] or 0) if row else 0,
+        "bio_res_total": int(row["bio_res_total"] or 0) if row else 0,
+        "bio_mater_total": int(row["bio_mater_total"] or 0) if row else 0,
+    }
+
+def _statpost_economy_totals() -> dict:
+    row = db_one(
+        "SELECT bio_exp_gain, bio_exp_spent, bio_res_gain, bio_res_spent, bio_mater_gain, bio_mater_spent "
+        "FROM economy_totals WHERE stats_id=1 LIMIT 1"
+    )
+
+    if not row:
+        return {
+            "bio_exp_gain": 0,
+            "bio_exp_spent": 0,
+            "bio_res_gain": 0,
+            "bio_res_spent": 0,
+            "bio_mater_gain": 0,
+            "bio_mater_spent": 0,
+        }
+
+    return {
+        "bio_exp_gain": int(row["bio_exp_gain"] or 0),
+        "bio_exp_spent": int(row["bio_exp_spent"] or 0),
+        "bio_res_gain": int(row["bio_res_gain"] or 0),
+        "bio_res_spent": int(row["bio_res_spent"] or 0),
+        "bio_mater_gain": int(row["bio_mater_gain"] or 0),
+        "bio_mater_spent": int(row["bio_mater_spent"] or 0),
+    }
+
+def _statpost_economy_reset():
+    db_exec(
+        "UPDATE economy_totals SET "
+        "bio_exp_gain=0, "
+        "bio_exp_spent=0, "
+        "bio_res_gain=0, "
+        "bio_res_spent=0, "
+        "bio_mater_gain=0, "
+        "bio_mater_spent=0, "
+        "updated_at=? "
+        "WHERE stats_id=1",
+        (int(now_ts()),),
+        commit=True
+    )
+
+def _statpost_history_row(channel_id: int):
+    return db_one(
+        "SELECT channel_id, users_total, labs_total, bio_exp_total, bio_res_total, bio_mater_total, updated_at "
+        "FROM statpost_history WHERE channel_id=? LIMIT 1",
+        (int(channel_id),)
+    )
+
+def _statpost_history_save(channel_id: int, stats: dict):
+    db_exec(
+        "INSERT INTO statpost_history("
+        "channel_id, users_total, labs_total, bio_exp_total, bio_res_total, bio_mater_total, updated_at"
+        ") VALUES (?,?,?,?,?,?,?) "
+        "ON CONFLICT(channel_id) DO UPDATE SET "
+        "users_total=excluded.users_total, "
+        "labs_total=excluded.labs_total, "
+        "bio_exp_total=excluded.bio_exp_total, "
+        "bio_res_total=excluded.bio_res_total, "
+        "bio_mater_total=excluded.bio_mater_total, "
+        "updated_at=excluded.updated_at",
+        (
+            int(channel_id),
+            int(stats.get("users_total") or 0),
+            int(stats.get("labs_total") or 0),
+            int(stats.get("bio_exp_total") or 0),
+            int(stats.get("bio_res_total") or 0),
+            int(stats.get("bio_mater_total") or 0),
+            int(now_ts())
+        ),
+        commit=True
+    )
+
+def _statpost_value_with_prev(current_value: int, prev_row, key: str) -> str:
+    cur = int(current_value or 0)
+
+    if not prev_row:
+        return _fmt_k(cur)
+
+    prev = int(prev_row[key] or 0)
+    return f"{_fmt_k(cur)} ({_fmt_k(prev)})"
+
 def _statpost_tag_html() -> str:
     if not BOT_USERNAME:
         refresh_bot_identity()
@@ -15524,22 +16292,28 @@ def _statpost_tag_html() -> str:
     un = BOT_USERNAME or "bio_war_bot"
     return f"#инфопост@{h(un)}"
 
-def render_statpost_text() -> str:
-    row = _statpost_stats_row()
+def render_statpost_text(channel_id: int = 0) -> str:
+    stats = _statpost_stats_dict()
+    prev = _statpost_history_row(int(channel_id)) if int(channel_id or 0) != 0 else None
 
-    users_total = int(row["users_total"] or 0) if row else 0
-    labs_total = int(row["labs_total"] or 0) if row else 0
-    bio_exp_total = int(row["bio_exp_total"] or 0) if row else 0
-    bio_res_total = int(row["bio_res_total"] or 0) if row else 0
-    bio_mater_total = int(row["bio_mater_total"] or 0) if row else 0
+    users_total = int(stats["users_total"] or 0)
+    labs_total = int(stats["labs_total"] or 0)
+    bio_exp_total = int(stats["bio_exp_total"] or 0)
+    bio_res_total = int(stats["bio_res_total"] or 0)
+    bio_mater_total = int(stats["bio_mater_total"] or 0)
+    econ = _statpost_economy_totals()
 
     text = (
         "📊 Статистическая информация:\n\n"
-        f"Пользователей бота: 👥 {_fmt_k(users_total)}\n"
-        f"Из них с лабораторией: 🔬 {_fmt_k(labs_total)}\n"
-        f"Общее число био-опыта: ☣️ {_fmt_k(bio_exp_total)}\n"
-        f"Общее число био-ресурсов: 🧬 {_fmt_k(bio_res_total)}\n"
-        f"Общее число био-материалов: 💊 {_fmt_k(bio_mater_total)}\n\n"
+        f"Известных пользователей: 👥 {_statpost_value_with_prev(users_total, prev, 'users_total')}\n"
+        f"Из них с лабораторией: 🔬 {_statpost_value_with_prev(labs_total, prev, 'labs_total')}\n"
+        f"Общее число био-опыта: ☣️ {_statpost_value_with_prev(bio_exp_total, prev, 'bio_exp_total')}\n"
+        f"Общее число био-ресурсов: 🧬 {_statpost_value_with_prev(bio_res_total, prev, 'bio_res_total')}\n"
+        f"Общее число био-материалов: 💊 {_statpost_value_with_prev(bio_mater_total, prev, 'bio_mater_total')}\n"
+        "Общие доходы | расходы:\n"
+        f"ㅤㅤ☣️ +{_fmt_k(int(econ['bio_exp_gain']))} | -{_fmt_k(int(econ['bio_exp_spent']))}\n"
+        f"ㅤㅤ🧬 +{_fmt_k(int(econ['bio_res_gain']))} | -{_fmt_k(int(econ['bio_res_spent']))}\n"
+        f"ㅤㅤ💊 +{_fmt_k(int(econ['bio_mater_gain']))} | -{_fmt_k(int(econ['bio_mater_spent']))}\n\n"
         "Спасибо,что всё ещё с нами!\n"
         f"{_statpost_tag_html()}"
     )
@@ -15554,12 +16328,18 @@ def _statpost_publish_now(user_id: int) -> tuple[bool, str]:
         return False, "📑 Канал для публикаций не выбран или больше недоступен. Используйте /post_chanals."
 
     channel_id = int(selected["channel_id"])
+    stats = _statpost_stats_dict()
+
     ok = _post_send_message_raw(
         int(channel_id),
-        render_statpost_text()
+        render_statpost_text(int(channel_id))
     )
 
     if ok:
+        _statpost_history_save(int(channel_id), stats)
+
+        _statpost_economy_reset()
+
         return True, f"✅ Статистический пост опубликован в «{h(selected['title'])}»."
 
     return False, "❎ Не удалось опубликовать статистический пост. Проверьте права бота в канале."
@@ -16091,13 +16871,7 @@ def _handle_post_update_version_message(message, raw_plain: str) -> bool:
         reply_markup=kb_post_draft()
     )
 
-    bot.send_message(
-        int(message.chat.id),
-        render_post_update_menu_text(uid),
-        parse_mode="HTML",
-        disable_web_page_preview=True,
-        reply_markup=kb_post_update_parts(uid)
-    )
+    send_post_update_menu(uid, int(message.chat.id))
 
     return True
 
@@ -16166,33 +16940,27 @@ def _handle_post_update_content_message(message) -> bool:
             return _post_update_publish_or_warn(message, uid)
 
         if active == POST_UPDATE_PART_MEDIA:
-            bot.reply_to(
+            reply_post_update_menu_notice(
                 message,
-                "📎 Сейчас выбран раздел «Медиа». Отправьте вложение или выберите текстовый раздел.",
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-                reply_markup=kb_post_update_parts(uid)
+                uid,
+                "📎 Сейчас выбран раздел «Медиа». Отправьте вложение или выберите текстовый раздел."
             )
             return True
 
         if active not in POST_UPDATE_TEXT_PARTS:
-            bot.reply_to(
+            reply_post_update_menu_notice(
                 message,
-                "📑 Сначала выберите раздел черновика.",
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-                reply_markup=kb_post_update_parts(uid)
+                uid,
+                "📑 Сначала выберите раздел черновика."
             )
             return True
 
         html_text = _post_message_html_payload(message)
         if not html_text:
-            bot.reply_to(
+            reply_post_update_menu_notice(
                 message,
-                "📑 Пустое сообщение. Отправьте текст или выберите другой раздел.",
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-                reply_markup=kb_post_update_parts(uid)
+                uid,
+                "📑 Пустое сообщение. Отправьте текст или выберите другой раздел."
             )
             return True
 
@@ -16205,23 +16973,15 @@ def _handle_post_update_content_message(message) -> bool:
             disable_web_page_preview=True
         )
 
-        bot.send_message(
-            int(message.chat.id),
-            render_post_update_menu_text(uid),
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-            reply_markup=kb_post_update_parts(uid)
-        )
+        send_post_update_menu(uid, int(message.chat.id))
         return True
 
     if message.content_type in ("photo", "video", "document", "audio", "voice", "animation", "video_note"):
         if active != POST_UPDATE_PART_MEDIA:
-            bot.reply_to(
+            reply_post_update_menu_notice(
                 message,
-                "📎 Для добавления вложения сначала выберите раздел «Медиа».",
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-                reply_markup=kb_post_update_parts(uid)
+                uid,
+                "📎 Для добавления вложения сначала выберите раздел «Медиа»."
             )
             return True
 
@@ -16294,6 +17054,8 @@ def _handle_post_update_content_message(message) -> bool:
             parse_mode="HTML",
             disable_web_page_preview=True
         )
+
+        send_post_update_menu(uid, int(message.chat.id))
         return True
 
     return False
@@ -16534,6 +17296,55 @@ def _known_chat_member_count(chat_id: int, exclude_user_id: int = 0) -> int:
         (int(chat_id), int(exclude_user_id))
     )
     return int(row["c"] or 0) if row else 0
+
+def _known_chat_user_count(chat_id: int, exclude_user_id: int = 0) -> int:
+    row = db_one(
+        "SELECT COUNT(*) AS c "
+        "FROM chat_members cm "
+        "LEFT JOIN users u ON u.user_id=cm.user_id "
+        "WHERE cm.chat_id=? "
+        "  AND cm.user_id>0 "
+        "  AND cm.user_id<>? "
+        "  AND COALESCE(u.is_bot,0)=0",
+        (int(chat_id), int(exclude_user_id))
+    )
+    return int(row["c"] or 0) if row else 0
+
+def _known_bot_admin_mark(chat_id: int) -> str:
+    try:
+        rights = get_bot_chat_admin_rights(int(chat_id))
+        return "❇️ " if bool(rights.get("is_admin")) else ""
+    except Exception:
+        return ""
+
+def _known_refresh_chat_type(chat_id: int, stored_type: str = "") -> str:
+    cid = int(chat_id)
+    fallback = str(stored_type or "").strip().lower()
+
+    try:
+        ch = bot.get_chat(cid)
+        chat_type = str(getattr(ch, "type", "") or "").strip().lower()
+
+        if chat_type in ("group", "supergroup", "channel"):
+            title = (
+                getattr(ch, "title", None)
+                or getattr(ch, "full_name", None)
+                or getattr(ch, "first_name", None)
+                or ""
+            )
+
+            remember_bot_group_chat(
+                cid,
+                title=str(title or ""),
+                chat_type=chat_type,
+                is_active=1
+            )
+
+            return chat_type
+    except Exception:
+        pass
+
+    return fallback
 
 def capture_user_context(message, tg_user):
     """
@@ -16919,6 +17730,110 @@ def leading_sign_after_bot_prefix(text: str) -> str:
         return s[0]
     return ""
 
+def _command_has_group_prefix(message, parsed: "Parsed") -> bool:
+    if bool(getattr(parsed, "has_prefix_char", False)):
+        return True
+
+    return has_explicit_bot_prefix(getattr(message, "text", "") or "")
+
+def _group_command_probe_after_sign(message) -> tuple[str, str]:
+    """
+    Возвращает sign и текст команды без / . Био/бот и без + - ! ~.
+    Используется только для проверки коротких алиасов в группах.
+    """
+    raw = str(getattr(message, "text", "") or "").strip()
+    if not raw:
+        return "", ""
+
+    first_line = raw.split("\n", 1)[0].strip()
+    probe = normalize(first_line)
+    probe = strip_bio_prefix(probe).strip()
+
+    sign = ""
+    if probe.startswith("++"):
+        sign = "++"
+        probe = probe[2:].lstrip()
+    elif probe and probe[0] in "+-!~":
+        sign = probe[0]
+        probe = probe[1:].lstrip()
+
+    return sign, probe.casefold()
+
+def _group_alias_head_is(low: str, alias: str) -> bool:
+    a = str(alias or "").casefold().strip()
+    s = str(low or "").casefold().strip()
+
+    if not a or not s:
+        return False
+
+    return s == a or s.startswith(a + " ")
+
+def _group_alias_any(low: str, aliases: tuple[str, ...]) -> bool:
+    return any(_group_alias_head_is(low, a) for a in aliases)
+
+def _group_short_alias_needs_prefix(message, parsed: "Parsed") -> bool:
+    """
+    В группах полный вариант команды может работать без префикса,
+    а короткие варианты должны требовать / . Био/бот.
+
+    Пример:
+    автоудаление      — можно без префикса
+    +автоудаление 30с — можно без префикса
+    ау               — только с префиксом
+    +ау 30с          — только с префиксом
+    """
+    if _command_has_group_prefix(message, parsed):
+        return False
+
+    cmd = str(getattr(parsed, "cmd", "") or "").strip()
+    sign, low = _group_command_probe_after_sign(message)
+
+    if not cmd or not low:
+        return False
+
+    # Авто-удаление
+    if cmd in ("chat_autodel_set", "chat_autodel_status", "chat_autodel_off"):
+        return _group_alias_any(low, ("ау",))
+
+    # Автоответчик / автозаражалка
+    if cmd in ("autoanswer_on", "autoanswer_off", "autoanswer_status"):
+        return _group_alias_any(low, ("ао", "аз"))
+
+    # Калькуляторы 
+    if cmd in ("calc", "calc_upg", "calc_chance", "calc_exp", "calc_duel", "calc_buff"):
+        return _group_alias_any(low, ("к", "ку", "кпк", "кш", "кпц", "ко", "кдл", "кс", "кус"))
+
+    # Команда информации о патогене
+    if cmd == "pathogen_info":
+        return _group_alias_any(low, ("пи",))
+
+    # Диверсия
+    if cmd == "sabotage":
+        return _group_alias_any(low, ("див",))
+
+    # Баланс
+    if cmd == "balance":
+        return _group_alias_any(low, ("бал", "меш", "кеш"))
+
+    # Лаборатория
+    if cmd in ("lab", "mylab"):
+        return _group_alias_any(low, ("моя л",))
+
+    # Корпорации
+    if cmd.startswith("corp_"):
+        short_corp_heads = (
+            "к рег",
+            "к инфо",
+            "зам",
+        )
+        return _group_alias_any(low, short_corp_heads)
+
+    # Информация о патогенах
+    if cmd == "pathogens_info":
+        return _group_alias_any(low, ("паты",))
+
+    return False
+
 SIGNED_COMMANDS_ALLOWED = {
     "timer_add_rel", "timer_add_abs", "timer_add_cycle", "timer_delete", "timer_clear_all",
     "chat_autodel_set", "chat_autodel_off",
@@ -16971,7 +17886,7 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
             "my_owner", "my_owner_remove",
             "agent", "агент", "agent_remove",
             "agents",
-            "blacklist", "users", "bot_ban", "bot_unban", "remake_lab",
+            "blacklist", "users", "users_cof", "bot_ban", "bot_unban", "remake_lab",
             "db_fife", "db_fife_stat", "db_fife_msg", "db_fife_upd", "its", "delete"
         ):
             cmd_map = {
@@ -16985,6 +17900,7 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
                 "agents": "agents_panel",
                 "blacklist": "blacklist",
                 "users": "users_list",
+                "users_cof": "users_cof",
                 "bot_ban": "bot_ban",
                 "bot_unban": "bot_unban",
                 "remake_lab": "remake_lab",
@@ -17032,7 +17948,7 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
             return Parsed(raw=raw, has_prefix_char=True, prefix_char=prefix_char, cmd=cmd_map[c], args=a)
 
         if c in ("bot_ban", "bot_unban", "remake_lab",
-                 "db_fife", "db_fife_stat", "db_fife_msg", "db_fife_upd", "its"):
+                 "db_fife", "db_fife_stat", "db_fife_msg", "db_fife_upd", "its", "users_cof"):
             return Parsed(raw=raw, has_prefix_char=True, prefix_char=prefix_char, cmd=c, args=a)
 
         if c == "delete":
@@ -17119,10 +18035,10 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
             rest = parts[1].strip()
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="agent_status", args=rest)
 
-    if low in ("contact", "обращение", "👨‍⚕️ тех.поддержка"):
-        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="report", args="")
+    if low in ("contact", "обращение", "👨‍⚕️ техподдержка"):
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="contact", args="")
 
-    if low in ("agents", "агенты", "🥼 тех.команды", "техкоманды"):
+    if low in ("agents", "агенты", "🥼 техкоманды", "техкоманды"):
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="agents_panel", args="")
 
     # кнопки быстрого доступа
@@ -17196,6 +18112,9 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
     if low == "blacklist":
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="blacklist", args="")
 
+    if low == "users_cof":
+        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="users_cof", args="")
+
     if sign in ("+", "-") and (low == "lab_name" or low.startswith("lab_name ")):
         rest = ""
         parts = t.split(" ", 1)
@@ -17252,11 +18171,11 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
     if low in ("помощь", "help", "ℹ️ помощь"):
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="help", args="")
 
-    if low in ("пинг", "понг", 
+    if low in ("пинг", "хуёнг", "хуенг", "понг", 
                "кинг", "конг", 
                "пиу", "пау", 
-               "окак", 
-               "сыгой", "гой", "сосал?",
+               "окак", "так", "тик",
+               "сыггой", "сосал?", "чат", "зиг", "ким",
                "бот"):
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="ping", args=low)
 
@@ -17445,8 +18364,6 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
         if ("лаб" in low) or ("лабораторию" in low) or ("лабу" in low):
             return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="lab_show", args="")
 
-
-
     # улучшения навыков
     if sign in ("+", "++"):
         first = low.split(" ", 1)[0]
@@ -17584,7 +18501,7 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
     if low in ("удалить корпорацию", "удалить корп", "удалить корпу", "удалить к"):
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="corp_delete", args="")
 
-    if sign in ("+", "-") and low in ("корп", "корпорация", "корпа", "к"):
+    if sign in ("+", "-") and low in ("корп", "корпорация", "корпа"):
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None,
                       cmd=("corp_open" if sign == "+" else "corp_close"), args="")
     if low.startswith(("открыть корп", "открыть корпорацию", 
@@ -17635,7 +18552,7 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
                 break
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="corp_info", args=rest)
 
-    if low in ("корп", "корпорация", "корпа", "к"):
+    if low in ("корп", "корпорация", "корпа"):
         return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="corp_info", args="")
 
     if low.startswith(("корп ", "корпорация ", "корпа ", "к ")):
@@ -17722,11 +18639,11 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
     if low in ("стата", "топ") or low.startswith(("стата ", "топ ")):
         toks = low.split()
 
-        if len(toks) >= 3 and toks[1] in ("корп", "корпораций", "к") and toks[2] == "чата":
+        if len(toks) >= 3 and toks[1] in ("корп", "корпораций") and toks[2] == "чата":
             rest = toks[3] if len(toks) >= 4 and toks[3].isdigit() else ""
             return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="top_corps_chat", args=rest)
 
-        if len(toks) >= 2 and toks[1] in ("корп", "корпораций", "к"):
+        if len(toks) >= 2 and toks[1] in ("корп", "корпораций"):
             rest = toks[2] if len(toks) >= 3 and toks[2].isdigit() else ""
             return Parsed(raw=raw, has_prefix_char=False, prefix_char=None, cmd="top_corps", args=rest)
 
@@ -18011,7 +18928,7 @@ def _panel_owner_rows(exclude_user_id: int = 0):
         out.append(r)
     return out
 
-def build_start_text(user) -> str:
+def build_start_text(user, *, is_private_context: bool = True) -> str:
     support_rows = []
     seen = set()
 
@@ -18051,10 +18968,10 @@ def build_start_text(user) -> str:
     lines.append(f'Я создан на основе старой игры бота <a href="{h(IRIS_BOT_LINK)}">Iris | Чат-менеджер</a> с некоторыми доработками.\n')
     lines.append("Что вас интересует?")
     lines.append(f'1. <code>Био настройки</code> — более гибкая настройка параметров уведомлений и прочего.')
-    lines.append(f'2. <code>Био обращение</code> — если заметили, что в моей работе что-то не так, или появились вопросы по игре и моей работе впринципе, обратитесь в тех.поддержку.\n')
-    lines.append(f'⚠️ Если у вас произошла ошибка в моей работе, пожалуйста, срочно сообщите об этом в тех.поддержку.\n')
+    lines.append(f'2. <code>Био обращение</code> — если заметили, что в моей работе что-то не так, или появились вопросы по игре и моей работе впринципе, обратитесь в техподдержку.\n')
+    lines.append(f'⚠️ Если у вас произошла ошибка в моей работе, пожалуйста, срочно сообщите об этом в техподдержку.\n')
 
-    lines.append('👨‍⚕️ <b>Агенты поддержки</b>, которые могут ответить на ваши вопросы:')
+    lines.append('👨‍⚕️ <b>Агенты технической поддержки</b>, которые могут ответить на ваши вопросы:')
 
     if not primary_rows and not secondary_rows:
         lines.append("Список пока пуст.")
@@ -18074,10 +18991,11 @@ def build_start_text(user) -> str:
 
     lines.append("")
     lines.append(f'📑 Список всех команд <a href="{h(URL_COMMANDS)}">с их описанием</a>')
-    lines.append(f'📑 Чат <a href="{h(URL_SUPPORT_CHAT)}">тех.поддержки</a>')
+    lines.append(f'📑 Чат <a href="{h(URL_SUPPORT_CHAT)}">техподдержки</a>')
     lines.append(f'📑 Основной <a href="{h(URL_DEV_CHANNEL)}">канал разработки бота</a>')
     lines.append(f'💬 Для повторного вызова агент-листа, введите в чат \"<code>.помощь</code>\".')
-    lines.append(f'Для повторной активации клавиатуры помощи, введите \"/start\".')
+    if bool(is_private_context):
+        lines.append(f'Для повторной активации клавиатуры помощи, введите \"/start\".')
 
     return "\n".join(lines)
 
@@ -18097,7 +19015,7 @@ def kb_quick_nav(user_id: int) -> ReplyKeyboardMarkup:
 
     kb.row(
         KeyboardButton("ℹ️ Помощь"),
-        KeyboardButton("👨‍⚕️ Тех.поддержка"),
+        KeyboardButton("👨‍⚕️ Техподдержка"),
         KeyboardButton("📚 Быстрый поиск")
     )
 
@@ -18108,7 +19026,7 @@ def kb_quick_nav(user_id: int) -> ReplyKeyboardMarkup:
 
     if is_creator(uid) or is_support(uid):
         kb.row(
-            KeyboardButton("🥼 Тех.команды"),
+            KeyboardButton("🥼 Техкоманды"),
             KeyboardButton("👥 Пользователи")
         )
 
@@ -18129,12 +19047,11 @@ def _quick_nav_button_text_is_private_only(text: str) -> bool:
 
     return low in {
         "ℹ️ помощь",
-        "👨‍⚕️ Тех.поддержка",
+        "👨‍⚕️ техподдержка",
         "📚 быстрый поиск",
         "⚙️ параметры",
-        "⚙️параметры",
         "🔗 команды",
-        "🥼 тех.команды",
+        "🥼 техкоманды",
         "👥 пользователи",
         "скрыть клавиатуру",
     }
@@ -18147,13 +19064,14 @@ def handle_hide_quick_nav_keyboard(message):
     )
 
 def send_welcome_message(chat_id: int, user, source_message=None):
-    text = build_start_text(user)
-
     is_private_context = False
+
     if source_message is not None:
         is_private_context = ((getattr(getattr(source_message, "chat", None), "type", "") or "").lower() == "private")
     else:
         is_private_context = (int(chat_id) == int(getattr(user, "id", 0) or 0))
+
+    text = build_start_text(user, is_private_context=is_private_context)
 
     rm = add_to_chat_keyboard() if is_private_context else None
 
@@ -18197,15 +19115,21 @@ def _format_ping_seconds_ms(delta_ms: int) -> str:
 PING_REPLY_MAP = {
     "пинг": "ПОНГ",
     "понг": "ПИНГ",
+    "хуёнг": "Не ругайся матом, дуралей.",
+    "хуенг": "Не ругайся матом, дуралей.",
     "кинг": "КОНГ",
     "конг": "КИНГ",
     "пиу": "ПАУ",
     "пау": "ПИУ",
     "окак": "ОТАК",
-    "сыгой": "СЫГГОЙ",
-    "гой": "ДА",
+    "так": "ТИК",
+    "тик": "ТАК",
+    "сыггой": "СЫГГОЙ",
+    "чат": "Продан Лисам 🦊",
+    "зиг": "ХАЙЛЬ!... Ой, нет, не так. ПОНГ",
+    "ким": "КОН ЧА",
     "сосал?": "ДАААА",
-    "бот": "Я тут",
+    "бот": "✅ Я тут",
 }
 
 def handle_ping_command(message, parsed: Optional[Parsed] = None):
@@ -18448,18 +19372,12 @@ def handle_emoji_pack_ids_command(message, parsed: Parsed):
         reply_markup=rm
     )
 
-def handle_mrp_add_command(message):
-    uid = int(message.from_user.id)
-    upsert_user(message.from_user)
+def _mrp_create_one_from_text(user_id: int, text: str) -> tuple[bool, str, str]:
+    uid = int(user_id)
 
-    parsed_payload = _parse_mrp_create_from_text(message.text or "")
+    parsed_payload = _parse_mrp_create_from_text(text or "")
     if not parsed_payload:
-        bot.reply_to(
-            message,
-            "📑 Неверный формат.\nИспользуйте <code>+Мрп</code> [название] / [эмодзи] [айди премиум эмодзи (не обязятельно)] / [текст рп действия].",
-            parse_mode="HTML"
-        )
-        return
+        return False, "Неверный формат команды.", ""
 
     trigger = parsed_payload["trigger"]
     trigger_key = parsed_payload["trigger_key"]
@@ -18471,32 +19389,21 @@ def handle_mrp_add_command(message):
     if premium_id_raw:
         live = _check_custom_emoji_id_live(premium_id_raw)
         if live is not True:
-            bot.reply_to(
-                message,
-                "📑 Указан нерабочий или неподтверждённый айди премиум эмодзи.\n"
-                "Укажите рабочий айди или создайте команду без него."
-            )
-            return
+            return False, "Указан нерабочий или неподтверждённый айди премиум эмодзи.", trigger
 
         premium_id = premium_id_raw
 
     emoji_count = _rp_count_emoji_clusters(emoji)
     if emoji_count > 4:
-        bot.reply_to(
-            message,
-            "📑 В личной рп команде можно указать не более 4 эмодзи."
-        )
-        return
+        return False, "В личной рп команде можно указать не более 4 эмодзи.", trigger
 
     cnt_row = db_one("SELECT COUNT(*) AS c FROM personal_rp_actions WHERE user_id=?", (uid,))
     cnt = int(cnt_row["c"] or 0) if cnt_row else 0
     if cnt >= 50:
-        bot.reply_to(message, "📑 Достигнут лимит личных рп команд.\n💬 Чтобы освободить место под новые команды, введи\n <code>-Мрп</code> <b>[название / номер]</b>", parse_mode="HTML")
-        return
+        return False, "Достигнут лимит личных рп команд.", trigger
 
     if is_reserved_for_personal_rp(uid, trigger):
-        bot.reply_to(message, "📑 Этот триггер уже занят командой бота, глобальной рп-командой или вашей личной рп-командой.")
-        return
+        return False, "Этот триггер уже занят командой бота, глобальной рп-командой или вашей личной рп-командой.", trigger
 
     db_exec(
         "INSERT INTO personal_rp_actions(user_id, trigger, trigger_key, emoji, premium_id, action_text, target_mode, uses_count, created_at) "
@@ -18505,7 +19412,93 @@ def handle_mrp_add_command(message):
         commit=True
     )
 
-    bot.reply_to(message, f"✅ Личная рп команда <code>{h(trigger)}</code> успешно создана.", parse_mode="HTML")
+    return True, "", trigger
+
+def _mrp_add_blocks_from_message(text: str) -> list[str]:
+    raw = str(text or "").strip()
+    if not raw:
+        return []
+
+    blocks = []
+
+    for line in raw.splitlines():
+        s = str(line or "").strip()
+        if not s:
+            continue
+
+        probe = strip_bio_prefix(s).strip()
+
+        if probe.startswith("/") or probe.startswith("."):
+            probe = probe[1:].strip()
+
+        if probe.startswith("+") and normalize(probe[1:].lstrip()).casefold().startswith("мрп"):
+            blocks.append(s)
+
+    return blocks
+
+def _mrp_is_multi_add_message(text: str) -> bool:
+    return len(_mrp_add_blocks_from_message(text)) > 1
+
+def handle_mrp_add_multi_command(message):
+    uid = int(message.from_user.id)
+    upsert_user(message.from_user)
+
+    blocks = _mrp_add_blocks_from_message(message.text or "")
+    if len(blocks) <= 1:
+        handle_mrp_add_command(message)
+        return
+
+    lines = []
+
+    for block in blocks:
+        ok, reason, trigger = _mrp_create_one_from_text(uid, block)
+
+        if ok:
+            lines.append(f"✅ Мрп <code>{h(trigger)}</code> создана успешно!")
+        else:
+            lines.append(
+                "⚠️ Мрп не удалось создать.\n"
+                f"Причина: {h(reason or 'неизвестная ошибка')}"
+            )
+
+    bot.reply_to(
+        message,
+        "\n".join(lines),
+        parse_mode="HTML",
+        disable_web_page_preview=True
+    )
+
+def handle_mrp_add_command(message):
+    uid = int(message.from_user.id)
+    upsert_user(message.from_user)
+
+    if _mrp_is_multi_add_message(message.text or ""):
+        handle_mrp_add_multi_command(message)
+        return
+
+    ok, reason, trigger = _mrp_create_one_from_text(uid, message.text or "")
+
+    if not ok:
+        if reason == "Неверный формат команды.":
+            bot.reply_to(
+                message,
+                "📑 Неверный формат.\nИспользуйте <code>+Мрп</code> [название] / [эмодзи] [айди премиум эмодзи (не обязятельно)] / [текст рп действия].",
+                parse_mode="HTML"
+            )
+            return
+
+        bot.reply_to(
+            message,
+            f"📑 {h(reason or 'Не удалось создать личную рп команду.')}",
+            parse_mode="HTML"
+        )
+        return
+
+    bot.reply_to(
+        message,
+        f"✅ Личная рп команда <code>{h(trigger)}</code> успешно создана.",
+        parse_mode="HTML"
+    )
 
 def handle_mrp_delete_command(message, parsed: Parsed):
     uid = int(message.from_user.id)
@@ -19137,6 +20130,41 @@ def handle_blacklist_command(message):
     text, rm = render_blacklist_text(1)
     bot.reply_to(message, text, parse_mode="HTML", disable_web_page_preview=True, reply_markup=rm)
 
+def render_users_cof_text() -> str:
+    return (
+        "📑 Переменные команды <code>/users</code>\n\n"
+        "<blockquote expandable>"
+        "<code>чаты</code> — известные чаты\n"
+        "<code>каналы</code>, <code>channels</code>, <code>chan</code> — известные каналы\n"
+        "<code>общий</code> — общий список\n"
+        "<code>боты</code>, <code>бот</code>, <code>bots</code> — боты\n"
+        "<code>юзеры</code>, <code>юзер</code>, <code>пользователи</code>, <code>пользователь</code>, <code>users</code> — пользователи\n"
+        "<code>лабы</code>, <code>lab</code>, <code>labs</code> — пользователи с лабораториями\n"
+        "<code>обыч</code>, <code>обычные</code>, <code>обычн</code>, <code>no</code>, <code>no_labs</code>, <code>nolabs</code> — пользователи без лабораторий\n"
+        "<code>нов</code>, <code>новые</code>, <code>new</code> — новые пользователи"
+        "</blockquote>\n\n"
+        "Примеры:\n"
+        "<code>/users каналы</code>\n"
+        "<code>/users пользователи лабы</code>\n"
+        "<code>/users users no_labs new</code>"
+    )
+
+def handle_users_cof_command(message):
+    if not _require_private_bot_chat(message):
+        return
+
+    uid = int(message.from_user.id)
+    if not is_support(uid):
+        bot.reply_to(message, "📑 Эта команда доступна только агентам техподдержки")
+        return
+
+    bot.reply_to(
+        message,
+        render_users_cof_text(),
+        parse_mode="HTML",
+        disable_web_page_preview=True
+    )
+
 def handle_users_list_command(message, parsed: Optional[Parsed] = None):
     if not _require_private_bot_chat(message):
         return
@@ -19151,6 +20179,8 @@ def handle_users_list_command(message, parsed: Optional[Parsed] = None):
 
     if filters["view"] == "chats":
         text, rm = render_known_chats_text(1)
+    elif filters["view"] == "channels":
+        text, rm = render_known_channels_text(1)
     else:
         text, rm = render_users_text(1, filters)
 
@@ -19297,11 +20327,182 @@ def _handle_start_payload(message, payload: str) -> bool:
 
     return False
 
+def _timer_line_looks_like_add_header(line: str) -> bool:
+    s = str(line or "").strip()
+    if not s:
+        return False
+
+    s = strip_bio_prefix(s).strip()
+
+    if s.startswith("/") or s.startswith("."):
+        s = s[1:].strip()
+
+    if s.startswith("++"):
+        s = s[2:].lstrip()
+    elif s.startswith("+"):
+        s = s[1:].lstrip()
+
+    low = normalize(s).casefold()
+
+    return (
+        low.startswith("таймер через ")
+        or low.startswith("таймер на ")
+        or low.startswith("таймер цикл ")
+    )
+
+def _timer_add_blocks_from_message(text: str) -> list[str]:
+    raw = str(text or "").strip()
+    if not raw:
+        return []
+
+    blocks = []
+    cur = []
+
+    for line in raw.splitlines():
+        if _timer_line_looks_like_add_header(line):
+            if cur:
+                block = "\n".join(cur).strip()
+                if block:
+                    blocks.append(block)
+            cur = [line]
+        else:
+            if cur:
+                cur.append(line)
+
+    if cur:
+        block = "\n".join(cur).strip()
+        if block:
+            blocks.append(block)
+
+    return blocks
+
+def _timer_is_multi_add_message(text: str) -> bool:
+    return len(_timer_add_blocks_from_message(text)) > 1
+
+def _timer_display_index_for_id(user_id: int, timer_id: int) -> int:
+    rows = _timer_rows_for_user(int(user_id))
+    for idx, row in enumerate(rows, 1):
+        if int(row["timer_id"] or 0) == int(timer_id):
+            return idx
+    return int(timer_id or 0)
+
+def _timer_create_one_from_block(user_id: int, chat_id: int, block_text: str) -> tuple[bool, str]:
+    uid = int(user_id)
+    cid = int(chat_id)
+    block = str(block_text or "").strip()
+
+    parsed = parse_message_as_command(block)
+    if not parsed or parsed.cmd not in ("timer_add_rel", "timer_add_abs", "timer_add_cycle"):
+        return False, "❎ Таймер не распознан/удалось создать."
+
+    command_text = _timer_body_command(block)
+    ok_cmd, cmd_err = _timer_validate_body_command(command_text)
+    if not ok_cmd:
+        return False, f"❎ Таймер не распознан/удалось создать.\nПричина: {h(cmd_err)}"
+
+    current_rows = _timer_rows_for_user(uid)
+    if len(current_rows) >= 10:
+        return False, "❎ Таймер не распознан/удалось создать.\nПричина: достигнут лимит таймеров."
+
+    if parsed.cmd == "timer_add_rel":
+        spec, err = _timer_parse_period_spec((parsed.args or "").strip())
+        if not spec:
+            return False, f"❎ Таймер не распознан/удалось создать.\nПричина: {h(err)}"
+
+        if not _timer_spec_has_nonsecond_period(spec):
+            return False, "❎ Таймер не распознан/удалось создать.\nПричина: минимальное время таймера — 1 минута."
+
+        spec = _timer_spec_without_seconds(spec)
+        next_dt = _timer_apply_period(datetime.now(), spec)
+        next_run_ts = int(next_dt.timestamp())
+
+        timer_id = _timer_create(uid, cid, next_run_ts, 0, {}, command_text)
+        num = _timer_display_index_for_id(uid, timer_id)
+
+        return True, f"✅ Таймер {num} создан."
+
+    if parsed.cmd == "timer_add_abs":
+        ts, err = _timer_parse_absolute_spec((parsed.args or "").strip())
+        if ts is None:
+            return False, f"❎ Таймер не распознан/удалось создать.\nПричина: {h(err)}"
+
+        timer_id = _timer_create(uid, cid, int(ts), 0, {}, command_text)
+        num = _timer_display_index_for_id(uid, timer_id)
+
+        return True, f"✅ Таймер {num} создан."
+
+    if parsed.cmd == "timer_add_cycle":
+        cycle_rows = db_all(
+            "SELECT timer_id FROM user_timers WHERE user_id=? AND is_cycle=1 ORDER BY timer_id ASC",
+            (int(uid),)
+        ) or []
+
+        if len(cycle_rows) >= 2:
+            return False, "❎ Циклический таймер не распознан/удалось создать.\nПричина: достигнут лимит циклических таймеров."
+
+        runs_total, spec, err = _timer_parse_cycle_args((parsed.args or "").strip())
+        if not spec:
+            return False, f"❎ Циклический таймер не распознан/удалось создать.\nПричина: {h(err)}"
+
+        if not _timer_spec_has_nonsecond_period(spec):
+            return False, "❎ Циклический таймер не распознан/удалось создать.\nПричина: минимальное время таймера — 1 минута."
+
+        spec = _timer_spec_without_seconds(spec)
+        next_dt = _timer_apply_period(datetime.now(), spec)
+        next_run_ts = int(next_dt.timestamp())
+
+        timer_id = _timer_create(
+            uid,
+            cid,
+            next_run_ts,
+            1,
+            spec,
+            command_text,
+            cycle_total=int(runs_total),
+            cycle_left=int(runs_total)
+        )
+        num = _timer_display_index_for_id(uid, timer_id)
+
+        return True, f"✅ Циклический таймер {num} создан."
+
+    return False, "❎ Таймер не распознан/удалось создать."
+
+def handle_timer_multi_add_command(message):
+    uid = int(message.from_user.id)
+    chat_id = int(message.chat.id)
+    upsert_user(message.from_user)
+    ensure_creator_is_support()
+
+    blocks = _timer_add_blocks_from_message(message.text or "")
+    if len(blocks) <= 1:
+        parsed = parse_message_as_command(message.text or "")
+        if parsed:
+            handle_timer_commands(message, parsed)
+        return
+
+    lines = []
+
+    for block in blocks:
+        ok, text = _timer_create_one_from_block(uid, chat_id, block)
+        lines.append(text)
+
+    bot.reply_to(
+        message,
+        "\n".join(lines),
+        parse_mode="HTML",
+        disable_web_page_preview=True
+    )
+
 def handle_timer_commands(message, parsed: Parsed):
     uid = int(message.from_user.id)
     chat_id = int(message.chat.id)
     upsert_user(message.from_user)
     ensure_creator_is_support()
+
+    if parsed.cmd in ("timer_add_rel", "timer_add_abs", "timer_add_cycle"):
+        if _timer_is_multi_add_message(message.text or ""):
+            handle_timer_multi_add_command(message)
+            return
 
     if parsed.cmd == "timer_list":
         bot.reply_to(message, render_timer_list_text(uid), parse_mode="HTML", disable_web_page_preview=True)
@@ -19346,6 +20547,14 @@ def handle_timer_commands(message, parsed: Parsed):
             bot.reply_to(message, err)
             return
 
+        if not _timer_spec_has_nonsecond_period(spec):
+            bot.reply_to(
+                message,
+                "📑 Минимальное время таймера: 1 минута."
+            )
+            return
+
+        spec = _timer_spec_without_seconds(spec)
         next_dt = _timer_apply_period(datetime.now(), spec)
         next_run_ts = int(next_dt.timestamp())
         _timer_create(uid, chat_id, next_run_ts, 0, {}, command_text)
@@ -19372,6 +20581,14 @@ def handle_timer_commands(message, parsed: Parsed):
             bot.reply_to(message, err, parse_mode="HTML", disable_web_page_preview=True)
             return
 
+        if not _timer_spec_has_nonsecond_period(spec):
+            bot.reply_to(
+                message,
+                "📑 Минимальное время таймера: 1 минута."
+            )
+            return
+
+        spec = _timer_spec_without_seconds(spec)
         next_dt = _timer_apply_period(datetime.now(), spec)
         next_run_ts = int(next_dt.timestamp())
         _timer_create(uid, chat_id, next_run_ts, 1, spec, command_text, cycle_total=int(runs_total), cycle_left=int(runs_total))
@@ -19403,21 +20620,23 @@ def handle_timer_commands(message, parsed: Parsed):
         return
 
 def handle_chat_autodelete_commands(message, parsed: Parsed):
-    if not _require_group_chat(message):
+    chat_type = (getattr(getattr(message, "chat", None), "type", "") or "").lower()
+    if chat_type not in ("private", "group", "supergroup"):
         return
 
     chat_id = int(message.chat.id)
     uid = int(message.from_user.id)
+    is_private = chat_type == "private"
 
-    if not is_group_admin(uid, chat_id):
+    if not is_private and not is_group_admin(uid, chat_id):
         bot.reply_to(message, "📑 Эта команда доступна только администраторам этого чата.")
         return
 
     if parsed.cmd == "chat_autodel_status":
-        title = getattr(message.chat, "title", None) or "чат"
+        title = "в личном чате" if is_private else (getattr(message.chat, "title", None) or "чат")
         bot.reply_to(
             message,
-            render_auto_delete_status(chat_id, title),
+            render_auto_delete_status(chat_id, title, chat_type=chat_type),
             parse_mode="HTML",
             disable_web_page_preview=True
         )
@@ -19425,7 +20644,10 @@ def handle_chat_autodelete_commands(message, parsed: Parsed):
 
     if parsed.cmd == "chat_autodel_off":
         forget_chat_auto_delete(chat_id)
-        bot.reply_to(message, "✅ Авто-удаление сообщений для этого чата отключено.")
+        bot.reply_to(
+            message,
+            "✅ Авто-удаление сообщений в личном чате отключено." if is_private else "✅ Авто-удаление сообщений для этого чата отключено."
+        )
         return
 
     spec, err = _timer_parse_period_spec((parsed.args or "").strip())
@@ -19433,16 +20655,10 @@ def handle_chat_autodelete_commands(message, parsed: Parsed):
         bot.reply_to(message, err)
         return
 
-    ttl = (
-        int(spec.get("months", 0) or 0) * 30 * 86400
-        + int(spec.get("weeks", 0) or 0) * 7 * 86400
-        + int(spec.get("days", 0) or 0) * 86400
-        + int(spec.get("hours", 0) or 0) * 3600
-        + int(spec.get("minutes", 0) or 0) * 60
-    )
+    ttl = _timer_spec_seconds_approx(spec, include_seconds=True)
 
-    if ttl < 60:
-        bot.reply_to(message, "📑 Минимальный период авто-удаления — 1 минута.")
+    if ttl < 30:
+        bot.reply_to(message, "📑 Минимальный период авто-удаления — 30 секунд.")
         return
 
     if ttl > TIMER_MAX_SECONDS:
@@ -19454,7 +20670,8 @@ def handle_chat_autodelete_commands(message, parsed: Parsed):
 
     bot.reply_to(
         message,
-        f"✅ Авто-удаление сообщений включено.\n⌛ {_format_duration(ttl)}",
+        "✅ Авто-удаление сообщений включено.\n"
+        f"⌛ {_format_hms(ttl)}",
         disable_web_page_preview=True
     )
 
@@ -20063,6 +21280,9 @@ def _timer_parse_reason_from_message(text: str) -> str:
 def _timer_period_unit_key(unit_raw: str) -> str:
     u = (unit_raw or "").strip().lower()
 
+    if u in ("сек", "секунда", "секунды", "секунд", "секунду"):
+        return "seconds"
+
     if u in ("мин", "минута", "минуты", "минут", "минуту"):
         return "minutes"
 
@@ -20087,6 +21307,7 @@ def _timer_parse_period_spec(text: str) -> tuple[Optional[dict], str]:
 
     pattern = re.compile(
         r"(?P<num>\d+)?\s*(?P<unit>"
+        r"секунду|секунды|секунда|секунд|сек|"
         r"минуту|минуты|минута|минут|мин|"
         r"часов|часа|час|"
         r"неделю|недели|неделя|недель|"
@@ -20097,7 +21318,7 @@ def _timer_parse_period_spec(text: str) -> tuple[Optional[dict], str]:
     )
 
     pos = 0
-    spec = {"months": 0, "weeks": 0, "days": 0, "hours": 0, "minutes": 0}
+    spec = {"months": 0, "weeks": 0, "days": 0, "hours": 0, "minutes": 0, "seconds": 0}
     found = False
 
     for m in pattern.finditer(s):
@@ -20129,6 +21350,7 @@ def _timer_parse_period_spec(text: str) -> tuple[Optional[dict], str]:
         + spec["days"] * 86400
         + spec["hours"] * 3600
         + spec["minutes"] * 60
+        + spec["seconds"]
     )
 
     if approx <= 0:
@@ -20255,7 +21477,7 @@ def remember_bot_message_for_autodelete(msg):
         if not chat:
             return
         chat_type = (getattr(chat, "type", "") or "").lower()
-        if chat_type not in ("group", "supergroup"):
+        if chat_type not in ("private", "group", "supergroup"):
             return
         chat_id = int(chat.id)
         ttl = get_chat_auto_delete_ttl(chat_id)
@@ -20279,7 +21501,7 @@ def remember_user_trigger_message_for_autodelete(message):
             return
 
         chat_type = (getattr(chat, "type", "") or "").lower()
-        if chat_type not in ("group", "supergroup"):
+        if chat_type not in ("private", "group", "supergroup"):
             return
 
         chat_id = int(chat.id)
@@ -20287,7 +21509,7 @@ def remember_user_trigger_message_for_autodelete(message):
         if ttl <= 0:
             return
 
-        if not bot_can_delete_chat_messages(chat_id):
+        if chat_type != "private" and not bot_can_delete_chat_messages(chat_id):
             return
 
         if not _is_text_command_message_for_autodelete(message):
@@ -20322,6 +21544,80 @@ def remember_reply_pair_for_autodelete(sent_msg=None, trigger_message=None):
     except Exception:
         pass
 
+def autodelete_post_hold_active(chat_id: int) -> bool:
+    """
+    В ЛС chat_id равен user_id.
+    Если пользователь сейчас готовит пост, авто-удаление ждёт завершения подготовки.
+    """
+    cid = int(chat_id or 0)
+
+    if cid <= 0:
+        return False
+
+    try:
+        stage, _created_ts = post_state_get(cid)
+        return _post_is_draft_stage(stage)
+    except Exception:
+        return False
+
+def _message_has_inline_buttons(msg) -> bool:
+    try:
+        rm = getattr(msg, "reply_markup", None)
+        if not rm:
+            return False
+
+        keyboard = getattr(rm, "keyboard", None)
+        if keyboard:
+            return True
+
+        inline_keyboard = getattr(rm, "inline_keyboard", None)
+        if inline_keyboard:
+            return True
+
+        raw = getattr(rm, "to_dict", None)
+        if callable(raw):
+            data = raw() or {}
+            return bool(data.get("inline_keyboard"))
+    except Exception:
+        pass
+
+    return False
+
+def autodelete_refresh_inline_button_message(cq):
+    try:
+        msg = getattr(cq, "message", None)
+        if not msg:
+            return
+
+        if not _message_has_inline_buttons(msg):
+            return
+
+        chat = getattr(msg, "chat", None)
+        if not chat:
+            return
+
+        chat_type = (getattr(chat, "type", "") or "").lower()
+        if chat_type not in ("private", "group", "supergroup"):
+            return
+
+        chat_id = int(chat.id)
+        message_id = int(getattr(msg, "message_id", 0) or 0)
+
+        if message_id <= 0:
+            return
+
+        ttl = int(get_chat_auto_delete_ttl(chat_id) or 0)
+        if ttl <= 0:
+            return
+
+        db_exec(
+            "INSERT OR REPLACE INTO bot_sent_messages(chat_id, message_id, sent_at) VALUES (?,?,?)",
+            (chat_id, message_id, int(now_ts())),
+            commit=True
+        )
+    except Exception:
+        pass
+
 def run_chat_autodelete_once(chat_id: Optional[int] = None):
     now = int(now_ts())
 
@@ -20341,6 +21637,9 @@ def run_chat_autodelete_once(chat_id: Optional[int] = None):
         if ttl <= 0:
             continue
 
+        if autodelete_post_hold_active(cid):
+            continue
+
         rows = db_all(
             "SELECT message_id, sent_at FROM bot_sent_messages WHERE chat_id=? AND sent_at<=? ORDER BY sent_at ASC LIMIT 100",
             (cid, int(now - ttl))
@@ -20355,12 +21654,21 @@ def run_chat_autodelete_once(chat_id: Optional[int] = None):
             finally:
                 db_exec("DELETE FROM bot_sent_messages WHERE chat_id=? AND message_id=?", (cid, mid), commit=True)
 
-def render_auto_delete_status(chat_id: int, chat_title: str) -> str:
+def render_auto_delete_status(chat_id: int, chat_title: str, chat_type: str = "") -> str:
     ttl = get_chat_auto_delete_ttl(int(chat_id))
     if ttl > 0:
-        val = f"⌛ {_format_duration(ttl)}"
+        val = f"⌛ {_format_hms(ttl)}"
     else:
         val = "❌ Отключено"
+
+    is_private = str(chat_type or "").lower() == "private"
+
+    if is_private:
+        return (
+            f"🔏 Авто-удаление сообщений <b>{h(chat_title)}</b>\n"
+            f"{val}\n\n"
+            f"💬 Чтобы изменить время, введите \"<code>+автоудаление</code>\" + период"
+        )
 
     rights = get_bot_chat_admin_rights(int(chat_id))
     if rights["can_delete_messages"]:
@@ -20378,14 +21686,27 @@ def render_auto_delete_status(chat_id: int, chat_title: str) -> str:
     )
 
 # Таймеры
-def _timer_spec_seconds_approx(spec: dict) -> int:
-    return int(
+def _timer_spec_seconds_approx(spec: dict, *, include_seconds: bool = True) -> int:
+    total = int(
         int(spec.get("months", 0) or 0) * 30 * 86400
         + int(spec.get("weeks", 0) or 0) * 7 * 86400
         + int(spec.get("days", 0) or 0) * 86400
         + int(spec.get("hours", 0) or 0) * 3600
         + int(spec.get("minutes", 0) or 0) * 60
     )
+
+    if include_seconds:
+        total += int(spec.get("seconds", 0) or 0)
+
+    return int(total)
+
+def _timer_spec_without_seconds(spec: dict) -> dict:
+    out = dict(spec or {})
+    out["seconds"] = 0
+    return out
+
+def _timer_spec_has_nonsecond_period(spec: dict) -> bool:
+    return _timer_spec_seconds_approx(spec or {}, include_seconds=False) > 0
 
 def _timer_parse_cycle_args(text: str) -> tuple[Optional[int], Optional[dict], str]:
     s = (text or "").strip()
@@ -20635,7 +21956,7 @@ def _timer_validate_body_command(cmd_text: str) -> tuple[bool, str]:
         "owner", "owner_remove", "my_owner", "my_owner_remove",
         "agent", "agent_remove", "agents_panel",
         "bot_ban", "bot_unban", "remake_lab",
-        "report", "settings", "blacklist", "users_list",
+        "contact", "settings", "blacklist", "users_list",
         "name_lock_lab", "name_lock_pat"
     ):
         return False, "📑 Эта команда не может быть выполнена таймером."
@@ -20659,23 +21980,33 @@ def _timer_create(
     command_text: str,
     cycle_total: int = 0,
     cycle_left: int = 0
-):
-    db_exec(
-        "INSERT INTO user_timers(user_id, chat_id, created_at, next_run_ts, is_cycle, repeat_spec, cycle_total, cycle_left, command_text) "
-        "VALUES (?,?,?,?,?,?,?,?,?)",
-        (
-            int(user_id),
-            int(chat_id),
-            int(now_ts()),
-            int(next_run_ts),
-            int(is_cycle),
-            json.dumps(repeat_spec or {}, ensure_ascii=False),
-            int(cycle_total or 0),
-            int(cycle_left or 0),
-            str(command_text or "").strip(),
-        ),
-        commit=True
-    )
+) -> int:
+    with DB_LOCK:
+        c = conn.cursor()
+        try:
+            c.execute(
+                "INSERT INTO user_timers(user_id, chat_id, created_at, next_run_ts, is_cycle, repeat_spec, cycle_total, cycle_left, command_text) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (
+                    int(user_id),
+                    int(chat_id),
+                    int(now_ts()),
+                    int(next_run_ts),
+                    int(is_cycle),
+                    json.dumps(repeat_spec or {}, ensure_ascii=False),
+                    int(cycle_total or 0),
+                    int(cycle_left or 0),
+                    str(command_text or "").strip(),
+                )
+            )
+            timer_id = int(c.lastrowid or 0)
+            conn.commit()
+            return timer_id
+        finally:
+            try:
+                c.close()
+            except Exception:
+                pass
 
 def _timer_row_to_display(index_num: int, row: sqlite3.Row) -> str:
     next_ts = int(row["next_run_ts"] or 0)
@@ -20800,7 +22131,7 @@ def _execute_timer_command_text(user_id: int, chat_id: int, command_text: str):
         "owner", "owner_remove", "my_owner", "my_owner_remove",
         "agent", "agent_remove", "agents_panel",
         "bot_ban", "bot_unban", "remake_lab",
-        "report", "settings", "blacklist",
+        "contact", "settings", "blacklist",
         "name_lock_lab", "name_lock_pat"
     ):
         try:
@@ -21019,6 +22350,7 @@ REPORTANSUI_TAG = "YR"
 BLUI_TAG = "K"
 USERSUI_TAG = "US"
 CHATSUI_TAG = "UC"
+CHANNELSUI_TAG = "UN"
 POSTCHUI_TAG = "PCH"
 POSTPUBUI_TAG = "PP"
 POSTTYPEUI_TAG = "PTY"
@@ -22504,9 +23836,9 @@ def _sabotage_reward_from_target(target_res: int, target_mat: int) -> tuple[str,
     tm = max(0, int(target_mat or 0))
 
     if tm > 0:
-        return "mat", max(1, int(math.ceil(tm * 0.10)))
+        return "mat", max(1, int(math.ceil(tm * 0.25)))
     if tr > 0:
-        return "res", max(1, int(math.ceil(tr * 0.10)))
+        return "res", max(1, int(math.ceil(tr * 0.25)))
     return "bonus_mat", 1
 
 def _sabotage_reward_text(kind: str, amount: int) -> str:
@@ -23003,7 +24335,7 @@ CALC_BUFF_METRIC_ALIASES = {
 }
 
 STRICT_NO_EXTRA_ARGS_CMDS = {
-    "help", "commands_link", "report", "settings",
+    "help", "commands_link", "contact", "settings",
     "autoanswer_status", "autoanswer_on", "autoanswer_off",
     "buy_vaccine",
     "lab_delete", "restore_lab",
@@ -23808,9 +25140,6 @@ def _inline_calc_req_from_query(query: str):
     }
 
 def handle_calc_command(message, parsed: Parsed):
-    if not has_explicit_bot_prefix(getattr(message, "text", "") or ""):
-        return
-
     uid = int(message.from_user.id)
     upsert_user(message.from_user)
     ensure_lab_exists(uid)
@@ -25694,9 +27023,9 @@ def on_new_chat_members(message):
                 f"✅ Я так рад, что меня добавили. Я - бот для игры заражений, {h(BOT_TITLE)}.\n"
                 f"🔬Для вашего удобства в пользовании ботом, рекомендую ознакомиться со "
                 f'<a href="{h(URL_COMMANDS)}">списком всех команд</a>.\n\n'
-                "⚪️ В целях безопасности от спама и стабильной работы в боте по умолчанию установлен лимит на ответ в 2-3 секунды\n"
+                "⚪️ В целях безопасности от спама и стабильной работы бота во время высокой нагрузки по умолчанию установлен лимит на ответ в 1-3 секунды.\n"
                 "❗Для более корректной работы команд и обновления списков чата, рекомендую выдать мне приписку администратора. Права администратора выдавать не обязательно.\n\n"
-                f'Остались вопросы? Можете обратиться в <a href="{h(URL_SUPPORT_CHAT)}">наш официальный чат тех.поддержки</a>.'
+                f'Остались вопросы? Можете обратиться в <a href="{h(URL_SUPPORT_CHAT)}">наш официальный чат техподдержки</a>.'
             )
             bot.send_message(message.chat.id, txt, disable_web_page_preview=True)
     except Exception as e:
@@ -26980,6 +28309,19 @@ def cb_post_update_part_choice(cq):
         post_update_set_active_part(actor_uid, part)
 
         if cq.message:
+            if not post_update_is_current_menu_message(
+                actor_uid,
+                int(cq.message.chat.id),
+                int(cq.message.message_id)
+            ):
+                try:
+                    bot.delete_message(int(cq.message.chat.id), int(cq.message.message_id))
+                except Exception:
+                    pass
+
+                bot.answer_callback_query(cq.id, "Это старое меню черновика.")
+                return
+
             limited_edit_message_text(
                 text=render_post_update_menu_text(actor_uid),
                 chat_id=cq.message.chat.id,
@@ -26987,6 +28329,12 @@ def cb_post_update_part_choice(cq):
                 parse_mode="HTML",
                 reply_markup=kb_post_update_parts(actor_uid),
                 disable_web_page_preview=True
+            )
+
+            post_update_store_menu_message(
+                actor_uid,
+                int(cq.message.chat.id),
+                int(cq.message.message_id)
             )
 
         bot.answer_callback_query(cq.id, f"Раздел: {post_update_part_label(part)}")
@@ -27347,8 +28695,10 @@ def cb_settings_ui(cq):
             else:
                 agent_status_set(int(uid), status_code)
 
+            show_back = not str(act or "").strip().upper().endswith("_NB")
+
             text = render_agent_status_menu_text(int(uid))
-            rm = kb_agent_status_settings(int(uid))
+            rm = kb_agent_status_settings(int(uid), show_back=show_back)
 
             if cq.inline_message_id:
                 limited_edit_message_text(
@@ -27541,6 +28891,14 @@ def cb_report_answer_ui(cq):
             bot.answer_callback_query(
                 cq.id,
                 "Нельзя отвечать на собственное обращение.",
+                show_alert=True
+            )
+            return
+
+        if _report_answer_notice_is_taken(int(target_uid), int(report_ts)):
+            bot.answer_callback_query(
+                cq.id,
+                "Этим обращением уже занялся другой агент.",
                 show_alert=True
             )
             return
@@ -27926,6 +29284,46 @@ def cb_known_chats_ui(cq):
         send_error_report("cb_known_chats_ui", e)
         try:
             bot.answer_callback_query(cq.id, "Не удалось открыть список чатов.")
+        except Exception:
+            pass
+
+@bot.callback_query_handler(func=lambda cq: (cq.data or "").startswith(f"{CHANNELSUI_TAG}:"))
+def cb_known_channels_ui(cq):
+    try:
+        page = _known_channels_parse_cb(cq.data or "")
+        if page is None:
+            bot.answer_callback_query(cq.id)
+            return
+
+        if not is_support(int(cq.from_user.id)):
+            bot.answer_callback_query(cq.id)
+            return
+
+        text, rm = render_known_channels_text(int(page))
+
+        if cq.inline_message_id:
+            limited_edit_message_text(
+                text=text,
+                inline_id=cq.inline_message_id,
+                parse_mode="HTML",
+                reply_markup=rm,
+                disable_web_page_preview=True
+            )
+        elif cq.message:
+            limited_edit_message_text(
+                text=text,
+                chat_id=cq.message.chat.id,
+                msg_id=cq.message.message_id,
+                parse_mode="HTML",
+                reply_markup=rm,
+                disable_web_page_preview=True
+            )
+
+        bot.answer_callback_query(cq.id)
+    except Exception as e:
+        send_error_report("cb_known_channels_ui", e)
+        try:
+            bot.answer_callback_query(cq.id, "Не удалось открыть список каналов.")
         except Exception:
             pass
 
@@ -32904,7 +34302,7 @@ def handle_lab_commands(message, parsed: Parsed):
             new_name = _normalize_chat_user_name(parsed.args or "")
             lock_row = get_name_restriction_row(int(uid))
             if lock_row and int(lock_row["user_locked"] or 0) == 1:
-                bot.reply_to(message, "⛔ Возможность менять имя пользователя ограничена. Обратитесь к агенту тех.поддержки.")
+                bot.reply_to(message, "⛔ Возможность менять имя пользователя ограничена. Обратитесь к агенту техподдержки.")
                 return
             if not new_name:
                 return
@@ -33074,7 +34472,7 @@ def handle_lab_commands(message, parsed: Parsed):
 
         lock_row = get_name_restriction_row(int(uid))
         if lock_row and int(lock_row["lab_locked"] or 0) == 1:
-            bot.reply_to(message, "⛔ Возможность менять имя лаборатории ограничена. Обратитесь к агенту тех.поддержки.")
+            bot.reply_to(message, "⛔ Возможность менять имя лаборатории ограничена. Обратитесь к агенту техподдержки.")
             return
         if len(new_name) > 40:
             bot.reply_to(message, "📑 Название вашей лаборатории превышает максимальные 40 символов.")
@@ -33101,7 +34499,7 @@ def handle_lab_commands(message, parsed: Parsed):
 
         lock_row = get_name_restriction_row(int(uid))
         if lock_row and int(lock_row["pat_locked"] or 0) == 1:
-            bot.reply_to(message, "⛔ Возможность менять имя патогена ограничена. Обратитесь к агенту тех.поддержки.")
+            bot.reply_to(message, "⛔ Возможность менять имя патогена ограничена. Обратитесь к агенту техподдержки.")
             return
         if len(new_name) > 40:
             bot.reply_to(message, "📑 Название вашего патогена превышает максимальные 40 символов.")
@@ -33287,7 +34685,7 @@ def handle_corp_commands(message, parsed: Parsed):
 
         lock_row = get_name_restriction_row(int(uid))
         if lock_row and int(lock_row["corp_locked"] or 0) == 1:
-            bot.reply_to(message, "⛔ Возможность менять название Корпорации ограничена. Обратитесь к агенту тех.поддержки.")
+            bot.reply_to(message, "⛔ Возможность менять название Корпорации ограничена. Обратитесь к агенту техподдержки.")
             return
 
         new_name = re.sub(r"\s+", " ", (parsed.args or "").strip())
@@ -33344,7 +34742,7 @@ def handle_corp_commands(message, parsed: Parsed):
         raw_name = (parsed.args or "").strip()
         lock_row = get_name_restriction_row(int(uid))
         if lock_row and int(lock_row["corp_locked"] or 0) == 1 and raw_name:
-            bot.reply_to(message, "⛔ Возможность менять название Корпорации ограничена. Обратитесь к агенту тех.поддержки.")
+            bot.reply_to(message, "⛔ Возможность менять название Корпорации ограничена. Обратитесь к агенту техподдержки.")
             return
 
         name = raw_name
@@ -34869,7 +36267,7 @@ def text_router(message):
                 ensure_creator_is_support()
         
                 if parsed_banned:
-                    if parsed_banned.cmd == "report":
+                    if parsed_banned.cmd == "contact":
                         handle_report_command(message)
                         return
         
@@ -34878,7 +36276,7 @@ def text_router(message):
                     if _handle_report_content_message(message):
                         return
         
-            if parsed_banned and parsed_banned.cmd == "report":
+            if parsed_banned and parsed_banned.cmd == "contact":
                 upsert_user(message.from_user)
                 _merge_placeholder_to_real_user(message.from_user)
                 set_pm_opened(int(uid), 1)
@@ -34912,7 +36310,7 @@ def text_router(message):
 
         if message.chat.type == "private" and stage == "await_content":
             if parsed:
-                if parsed.cmd == "report":
+                if parsed.cmd == "contact":
                     handle_report_command(message)
                     return
 
@@ -34945,6 +36343,10 @@ def text_router(message):
         if sign0 and parsed.cmd not in SIGNED_COMMANDS_ALLOWED:
             return
 
+        if message.chat.type in ("group", "supergroup"):
+            if _group_short_alias_needs_prefix(message, parsed):
+                return
+
         if parsed.cmd in STRICT_NO_EXTRA_ARGS_CMDS and (parsed.args or "").strip():
             return
         
@@ -34957,7 +36359,7 @@ def text_router(message):
                 return
         
         senior_creator_private_only_cmds = (
-            "my_owner", "my_owner_remove", "users_list",
+            "my_owner", "my_owner_remove", "users_list", "users_cof",
             "owner", "owner_remove",
             "agent", "agent_remove",
             "db_fife", "db_fife_stat", "db_fife_msg", "db_fife_upd", "its",
@@ -35162,6 +36564,10 @@ def text_router(message):
             handle_users_list_command(message, parsed)
             return
 
+        if parsed.cmd == "users_cof":
+            handle_users_cof_command(message)
+            return
+
         # промокоды
         if parsed.cmd == "promo_generate":
             handle_promo_generate_command(message)
@@ -35207,8 +36613,8 @@ def text_router(message):
             handle_agent_status_command(message, parsed)
             return
 
-        # /report
-        if parsed.cmd == "report":
+        # /contact
+        if parsed.cmd == "contact":
             handle_report_command(message)
             return
 
@@ -35301,8 +36707,6 @@ def text_router(message):
         if parsed.cmd in ("calc", "calc_upg", 
                           "calc_chance", "calc_buff", 
                           "calc_exp", "calc_duel"):
-            if not has_explicit_bot_prefix(getattr(message, "text", "") or ""):
-                return
             handle_calc_command(message, parsed)
             return
 
