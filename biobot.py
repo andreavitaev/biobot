@@ -1915,6 +1915,7 @@ PREMIUM_EMOJI_IDS: Dict[str, str] = {
     "💬": "5255727011686553638",
     "👋": "5348172574960427760",
     "⚙️": "5445347129155419150",
+    "🔔": "5445333299360723379",
 }
 _RAW_INLINE_KEYBOARD_BUTTON = InlineKeyboardButton
 PREMIUM_BUTTON_EMPTY_TEXT = "\u3164"  # невидимый, но не пустой текст для Telegram-кнопок
@@ -3421,6 +3422,7 @@ def init_db():
         is_bot              INTEGER DEFAULT 0,
         bot_status_locked   INTEGER DEFAULT 0,
         rp_off              INTEGER DEFAULT 0,
+        lab_recreate_lock_until INTEGER DEFAULT 0,
         gender              TEXT NOT NULL DEFAULT 'male'
     );
     """, commit=True)
@@ -4240,6 +4242,7 @@ def init_db():
         "ALTER TABLE users ADD COLUMN is_bot INTEGER DEFAULT 0",
         "ALTER TABLE users ADD COLUMN bot_status_locked INTEGER DEFAULT 0",
         "ALTER TABLE users ADD COLUMN rp_off INTEGER DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN lab_recreate_lock_until INTEGER DEFAULT 0",
         "ALTER TABLE users ADD COLUMN gender TEXT NOT NULL DEFAULT 'male'",
     ):
         try:
@@ -4644,6 +4647,30 @@ def has_lab_delete_pending(user_id: int) -> bool:
     r = db_one("SELECT 1 FROM lab_delete_pending WHERE user_id=? LIMIT 1", (int(user_id),))
     return r is not None
 
+def build_lab_recreate_lock_text(user_id: int) -> str:
+    row = db_one(
+        "SELECT COALESCE(lab_recreate_lock_until,0) AS lock_until "
+        "FROM users WHERE user_id=? LIMIT 1",
+        (int(user_id),)
+    )
+    lock_until = int(row["lock_until"] or 0) if row else 0
+    left = max(0, lock_until - now_ts())
+
+    if left <= 0:
+        if lock_until > 0:
+            db_exec(
+                "UPDATE users SET lab_recreate_lock_until=0 WHERE user_id=?",
+                (int(user_id),),
+                commit=True
+            )
+        return ""
+
+    return (
+        "⚠️ Действие не возможно.\n"
+        "После разблокировки действует ограничение: нельзя удалять лабораторию и создавать новую в течение 3 дней.\n"
+        f"⏳ Ограничение снимется через {_format_duration(left)}."
+    )
+
 def _bot_pm_link_html() -> str:
     if BOT_USERNAME:
         return f'<a href="https://t.me/{h(BOT_USERNAME)}">личных сообщениях</a>'
@@ -4722,6 +4749,38 @@ def _set_deleted_lab_restore_offer_suppressed(user_id: int, suppressed: bool = T
     row = get_deleted_lab_row(int(user_id))
     if not row:
         return
+
+    if suppressed:
+        try:
+            snapshot = json.loads((row["snapshot_json"] or "") or "{}")
+        except Exception:
+            snapshot = {}
+
+        if "promo_uses" not in snapshot:
+            deleted_at = int(row["deleted_at"] or 0)
+
+            snapshot["promo_uses"] = _rows_to_dicts(
+                db_all(
+                    "SELECT promo_id, user_id, used_at FROM promo_uses "
+                    "WHERE user_id=? AND used_at<=?",
+                    (int(user_id), int(deleted_at))
+                )
+            )
+
+            _deleted_db_exec(
+                "UPDATE deleted_labs SET snapshot_json=? WHERE user_id=?",
+                (
+                    json.dumps(snapshot, ensure_ascii=False),
+                    int(user_id)
+                ),
+                commit=True
+            )
+
+            db_exec(
+                "DELETE FROM promo_uses WHERE user_id=? AND used_at<=?",
+                (int(user_id), int(deleted_at)),
+                commit=True
+            )
 
     meta = _load_deleted_meta(row)
     meta["suppress_restore_offer"] = 1 if suppressed else 0
@@ -4891,6 +4950,12 @@ def _build_deleted_lab_snapshot(user_id: int) -> tuple[dict, dict]:
         "sabotage_cooldowns": _rows_to_dicts(
             db_all("SELECT * FROM sabotage_cooldowns WHERE attacker_id=? OR target_id=?", (int(user_id), int(user_id)))
         ),
+        "promo_uses": _rows_to_dicts(
+            db_all(
+                "SELECT promo_id, user_id, used_at FROM promo_uses WHERE user_id=?",
+                (int(user_id),)
+            )
+        ),
     }
 
     lab_row = snapshot["lab"] or {}
@@ -4905,6 +4970,11 @@ def _build_deleted_lab_snapshot(user_id: int) -> tuple[dict, dict]:
     return snapshot, meta
 
 def _perform_lab_delete(user_id: int) -> tuple[bool, str]:
+    lock_text = build_lab_recreate_lock_text(int(user_id))
+    if lock_text:
+        clear_lab_delete_pending(int(user_id))
+        return False, lock_text
+
     lab = db_one("SELECT * FROM labs WHERE user_id=?", (int(user_id),))
     if not lab or int(lab["lab_active"] or 0) != 1:
         clear_lab_delete_pending(int(user_id))
@@ -4946,6 +5016,7 @@ def _perform_lab_delete(user_id: int) -> tuple[bool, str]:
                 c.execute("DELETE FROM sabotage_cooldowns WHERE attacker_id=? OR target_id=?", (int(user_id), int(user_id)))
                 c.execute("DELETE FROM autoanswer_used_reports WHERE user_id=?", (int(user_id),))
                 c.execute("DELETE FROM autoanswer_state WHERE user_id=?", (int(user_id),))
+                c.execute("DELETE FROM promo_uses WHERE user_id=?", (int(user_id),))
                 c.execute("DELETE FROM labs WHERE user_id=?", (int(user_id),))
 
                 conn.commit()
@@ -4996,6 +5067,17 @@ def _restore_deleted_lab(user_id: int, *, support_mode: bool = False) -> tuple[b
     cd_rows = snapshot.get("infection_cooldowns") or []
     sab_rows = snapshot.get("sabotage_cooldowns") or []
 
+    if "promo_uses" in snapshot:
+        promo_rows = snapshot.get("promo_uses") or []
+    else:
+        promo_rows = _rows_to_dicts(
+            db_all(
+                "SELECT promo_id, user_id, used_at FROM promo_uses "
+                "WHERE user_id=? AND used_at<=?",
+                (int(user_id), int(deleted_at))
+            )
+        )
+
     lab_data["corp_id"] = 0
     lab_data["corp_name"] = ""
 
@@ -5010,6 +5092,7 @@ def _restore_deleted_lab(user_id: int, *, support_mode: bool = False) -> tuple[b
                 c.execute("DELETE FROM infection_seen WHERE attacker_id=? OR target_id=?", (int(user_id), int(user_id)))
                 c.execute("DELETE FROM infection_cooldowns WHERE attacker_id=? OR target_id=?", (int(user_id), int(user_id)))
                 c.execute("DELETE FROM sabotage_cooldowns WHERE attacker_id=? OR target_id=?", (int(user_id), int(user_id)))
+                c.execute("DELETE FROM promo_uses WHERE user_id=?", (int(user_id),))
                 c.execute("DELETE FROM labs WHERE user_id=?", (int(user_id),))
 
                 cols = list(lab_data.keys())
@@ -5066,11 +5149,11 @@ def _restore_deleted_lab(user_id: int, *, support_mode: bool = False) -> tuple[b
                         tuple(r[k] for k in cols)
                     )
 
-                for r in sab_rows:
+                for r in promo_rows:
                     cols = list(r.keys())
                     ph = ",".join(["?"] * len(cols))
                     c.execute(
-                        f"INSERT OR REPLACE INTO sabotage_cooldowns({','.join(cols)}) VALUES ({ph})",
+                        f"INSERT OR REPLACE INTO promo_uses({','.join(cols)}) VALUES ({ph})",
                         tuple(r[k] for k in cols)
                     )
 
@@ -8162,13 +8245,14 @@ USERS_RECENT_SEC = 30 * 60 # недавние пользователи
 
 def _users_default_filters() -> dict:
     return {
-        "view": "overall",   # overall / chats
+        "view": "overall",   # overall / chats / channels
         "kind": "all",       # all / bots / users
         "lab": "all",        # all / labs / no_labs
         "new_only": False,   # False / True
+        "pm_only": False,    # False / True
     }
 
-def _users_normalize_filters(view="overall", kind="all", lab="all", new_only=False) -> dict:
+def _users_normalize_filters(view="overall", kind="all", lab="all", new_only=False, pm_only=False) -> dict:
     view = str(view or "overall").strip().lower()
     kind = str(kind or "all").strip().lower()
     lab = str(lab or "all").strip().lower()
@@ -8183,21 +8267,25 @@ def _users_normalize_filters(view="overall", kind="all", lab="all", new_only=Fal
         lab = "all"
 
     new_only = bool(new_only)
+    pm_only = bool(pm_only)
 
     if kind != "users":
         lab = "all"
         new_only = False
+        pm_only = False
 
     if view in ("chats", "channels"):
         kind = "all"
         lab = "all"
         new_only = False
+        pm_only = False
 
     return {
         "view": view,
         "kind": kind,
         "lab": lab,
         "new_only": new_only,
+        "pm_only": pm_only,
     }
 
 def _parse_users_filters_from_args(args_text: str) -> dict:
@@ -8230,12 +8318,16 @@ def _parse_users_filters_from_args(args_text: str) -> dict:
             f["lab"] = "no_labs"
         elif t in ("нов", "новые", "new"):
             f["new_only"] = True
+        elif t in ("лс", "ls"):
+            f["kind"] = "users"
+            f["pm_only"] = True
 
     return _users_normalize_filters(
         view=f["view"],
         kind=f["kind"],
         lab=f["lab"],
-        new_only=f["new_only"]
+        new_only=f["new_only"],
+        pm_only=f["pm_only"]
     )
 
 def _users_is_new(first_seen: int, first_seen_verified: int) -> bool:
@@ -8253,13 +8345,14 @@ def _users_is_recent(last_seen: int) -> bool:
         return False
     return (int(now_ts()) - ls) <= int(USERS_RECENT_SEC)
 
-def _users_cb(page: int, *, view="overall", kind="all", lab="all", new_only=False) -> str:
-    f = _users_normalize_filters(view=view, kind=kind, lab=lab, new_only=new_only)
-    v = "c" if f["view"] == "chats" else "o"
+def _users_cb(page: int, *, view="overall", kind="all", lab="all", new_only=False, pm_only=False) -> str:
+    f = _users_normalize_filters(view=view, kind=kind, lab=lab, new_only=new_only, pm_only=pm_only)
+    v = "c" if f["view"] == "chats" else ("h" if f["view"] == "channels" else "o")
     k = "b" if f["kind"] == "bots" else ("u" if f["kind"] == "users" else "a")
     l = "l" if f["lab"] == "labs" else ("n" if f["lab"] == "no_labs" else "a")
     n = "1" if f["new_only"] else "0"
-    return f"{USERSUI_TAG}:{int(page)}:{v}:{k}:{l}:{n}"
+    pm = "1" if f["pm_only"] else "0"
+    return f"{USERSUI_TAG}:{int(page)}:{v}:{k}:{l}:{n}:{pm}"
 
 def _users_parse_cb(data: str) -> Optional[dict]:
     try:
@@ -8270,18 +8363,25 @@ def _users_parse_cb(data: str) -> Optional[dict]:
                 "filters": _users_default_filters()
             }
 
-        if len(p) != 6 or p[0] != USERSUI_TAG:
+        if len(p) not in (6, 7) or p[0] != USERSUI_TAG:
             return None
 
         page = int(p[1])
-        view = "chats" if p[2] == "c" else "overall"
+        view = "chats" if p[2] == "c" else ("channels" if p[2] == "h" else "overall")
         kind = "bots" if p[3] == "b" else ("users" if p[3] == "u" else "all")
         lab = "labs" if p[4] == "l" else ("no_labs" if p[4] == "n" else "all")
         new_only = (p[5] == "1")
+        pm_only = (len(p) >= 7 and p[6] == "1")
 
         return {
             "page": int(page),
-            "filters": _users_normalize_filters(view=view, kind=kind, lab=lab, new_only=new_only)
+            "filters": _users_normalize_filters(
+                view=view,
+                kind=kind,
+                lab=lab,
+                new_only=new_only,
+                pm_only=pm_only
+            )
         }
     except Exception:
         return None
@@ -8345,19 +8445,40 @@ def _users_toggle_lab_filters(current: Optional[dict], target_lab: str) -> dict:
     if f["lab"] == target_lab:
         return _users_normalize_filters(view=f["view"], kind="users", lab="all", new_only=False)
 
-    return _users_normalize_filters(view=f["view"], kind="users", lab=target_lab, new_only=f["new_only"])
+    return _users_normalize_filters(
+        view=f["view"],
+        kind="users",
+        lab=target_lab,
+        new_only=f["new_only"],
+        pm_only=f["pm_only"]
+    )
 
 def _users_toggle_new_filters(current: Optional[dict]) -> dict:
     f = _users_normalize_filters(**(current or {}))
 
     if f["kind"] != "users":
-        f = _users_normalize_filters(view=f["view"], kind="users", lab="all", new_only=False)
+        f = _users_normalize_filters(view=f["view"], kind="users", lab="all", new_only=False, pm_only=False)
 
     return _users_normalize_filters(
         view=f["view"],
         kind="users",
         lab=f["lab"],
-        new_only=(not bool(f["new_only"]))
+        new_only=(not bool(f["new_only"])),
+        pm_only=f["pm_only"]
+    )
+
+def _users_toggle_pm_filters(current: Optional[dict]) -> dict:
+    f = _users_normalize_filters(**(current or {}))
+
+    if f["kind"] != "users":
+        f = _users_normalize_filters(view=f["view"], kind="users", lab="all", new_only=False, pm_only=False)
+
+    return _users_normalize_filters(
+        view=f["view"],
+        kind="users",
+        lab=f["lab"],
+        new_only=f["new_only"],
+        pm_only=(not bool(f["pm_only"]))
     )
 
 def _users_append_filter_rows(kb: InlineKeyboardMarkup, current: Optional[dict]) -> InlineKeyboardMarkup:
@@ -8392,6 +8513,11 @@ def _users_append_filter_rows(kb: InlineKeyboardMarkup, current: Optional[dict])
                 "🆕",
                 callback_data=_users_cb(1, **_users_toggle_new_filters(f)),
                 style=("success" if bool(f["new_only"]) else "primary")
+            ),
+            _ikb(
+                "chat",
+                callback_data=_users_cb(1, **_users_toggle_pm_filters(f)),
+                style=("success" if bool(f["pm_only"]) else "primary")
             ),
         )
 
@@ -8732,6 +8858,8 @@ def _users_collect_rows(filters: Optional[dict] = None) -> list[dict]:
                 continue
             if f["new_only"] and not is_new:
                 continue
+            if f["pm_only"] and pm_opened != 1:
+                continue
 
         nm = "no name"
         if fn or ln or un:
@@ -8796,6 +8924,8 @@ def render_users_text(page: int, filters: Optional[dict] = None) -> tuple[str, O
 
         if bool(f["new_only"]):
             title += " (новые)"
+        if bool(f["pm_only"]):
+            title += " (лс с ботом)"
 
         shown_users_count = total
         shown_bots_count = None
@@ -9259,15 +9389,8 @@ def render_bot_ban_text(user_id: int) -> str:
     return text
 
 def _resolve_admin_target_and_reason(message, parsed: "Parsed"):
-    first_line, _body = _timer_first_line_and_body(message.text or "")
-    fl = first_line.strip()
-    if fl.startswith("/") or fl.startswith("."):
-        fl = fl[1:].strip()
-
     reason = _timer_parse_reason_from_message(message.text or "")
-
-    parts = fl.split(None, 1)
-    target_expr = parts[1].strip() if len(parts) >= 2 else ""
+    target_expr = (parsed.args or "").strip()
 
     fake = Parsed(
         raw=parsed.raw,
@@ -9297,6 +9420,44 @@ def _resolve_admin_target_and_reason(message, parsed: "Parsed"):
             return int(pref_uid), None, reason
 
     return None, None, reason
+
+def _row_get_value(row, key: str, default: str = "") -> str:
+    try:
+        v = row[key]
+        return str(v or default)
+    except Exception:
+        try:
+            v = getattr(row, key, default)
+            return str(v or default)
+        except Exception:
+            return str(default or "")
+
+def _support_target_tag_with_id(user_id: int, *, target_user_obj=None, fallback_row=None) -> str:
+    uid = int(user_id)
+
+    username = ""
+    first_name = ""
+    last_name = ""
+
+    if target_user_obj is not None:
+        username = str(getattr(target_user_obj, "username", "") or "").strip()
+        first_name = str(getattr(target_user_obj, "first_name", "") or "").strip()
+        last_name = str(getattr(target_user_obj, "last_name", "") or "").strip()
+
+    if not username and not first_name and not last_name and fallback_row is not None:
+        username = _row_get_value(fallback_row, "username")
+        first_name = _row_get_value(fallback_row, "first_name")
+        last_name = _row_get_value(fallback_row, "last_name")
+
+    if not username and not first_name and not last_name:
+        row = get_user_row(uid)
+        if row:
+            username = str(row["username"] or "").strip()
+            first_name = str(row["first_name"] or "").strip()
+            last_name = str(row["last_name"] or "").strip()
+
+    name = standard_display_name(first_name, last_name, username, uid)
+    return f"<b>{tg_mention(uid, name, username=username)}</b> (<code>id{uid}</code>)"
 
 def _purge_user_for_bot_ban(user_id: int):
     uid = int(user_id)
@@ -9440,21 +9601,59 @@ def handle_admin_service_commands(message, parsed: "Parsed"):
             bot.reply_to(message, "📑 Не удалось заблокировать пользователя в боте.")
             return
 
+        target_notice_tag = _support_target_tag_with_id(
+            int(target_id),
+            target_user_obj=target_user_obj,
+            fallback_row={
+                "username": snap_username,
+                "first_name": snap_first_name,
+                "last_name": snap_last_name,
+            }
+        )
+
         bot.reply_to(
             message,
-            f"✅ Пользователь <code>{_corp_actor_tag(int(target_id))}</code> заблокирован в боте.",
+            f"✅ Пользователь {target_notice_tag} заблокирован в боте.",
             parse_mode="HTML",
             disable_web_page_preview=True
         )
         return
 
     if parsed.cmd == "bot_unban":
+        ban_row = get_bot_ban_row(int(target_id))
         rc = db_exec("DELETE FROM bot_bans WHERE user_id=?", (int(target_id),), commit=True)
         if int(rc or 0) <= 0:
             bot.reply_to(message, "📑 Этот пользователь не заблокирован в боте.")
             return
 
-        bot.reply_to(message, f"✅ Пользователь <code>{int(target_id)}</code> разблокирован в боте.", parse_mode="HTML")
+        lock_until = int(now_ts() + 3 * 86400)
+
+        db_exec(
+            "INSERT INTO users("
+            "user_id, first_seen, first_seen_verified, last_seen, lab_recreate_lock_until"
+            ") VALUES (?,?,0,0,?) "
+            "ON CONFLICT(user_id) DO UPDATE SET "
+            "lab_recreate_lock_until=excluded.lab_recreate_lock_until",
+            (
+                int(target_id),
+                int(now_ts()),
+                int(lock_until)
+            ),
+            commit=True
+        )
+
+        target_notice_tag = _support_target_tag_with_id(
+            int(target_id),
+            target_user_obj=target_user_obj,
+            fallback_row=ban_row
+        )
+
+        bot.reply_to(
+            message,
+            f"✅ Пользователь {target_notice_tag} разблокирован в боте.",
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
         return
 
     if parsed.cmd == "remake_lab":
@@ -10686,7 +10885,7 @@ def handle_delete_user_db_command(message, parsed: "Parsed"):
         bot.reply_to(message, "📑 Эта команда доступна только агентам техподдержки.")
         return
 
-    target_id, target_user_obj = _parse_delete_target(message, parsed)
+    target_id, target_user_obj = resolve_admin_target_from_reply_or_args(message, parsed)
     if target_id is None:
         bot.reply_to(message, "📑 Используйте формат: /delete [ссылка/uid/@username] или reply на пользователя/бота.")
         return
@@ -11058,7 +11257,13 @@ def _pick_random_common_chat_for_user(user_id: int) -> int:
     set_notify_prefs(int(user_id), cid, 0)
     return cid
 
-def send_user_notification(user_id: int, text: str, *, respect_notify_off: bool = True):
+def send_user_notification(
+    user_id: int,
+    text: str,
+    *,
+    respect_notify_off: bool = True,
+    group_text: Optional[str] = None
+):
     """
     Отправляет уведомление пользователю по правилам:
     - если уведомления отключены -> None
@@ -11069,6 +11274,11 @@ def send_user_notification(user_id: int, text: str, *, respect_notify_off: bool 
     Если ничего не удалось — молча None.
     """
     uid = int(user_id)
+
+    def _text_for_destination(destination_id: int) -> str:
+        if int(destination_id) < 0 and group_text is not None:
+            return str(group_text)
+        return str(text)
 
     try:
         notify_chat_id, notify_off = get_notify_prefs(uid)
@@ -11104,7 +11314,12 @@ def send_user_notification(user_id: int, text: str, *, respect_notify_off: bool 
             return None
 
         try:
-            return bot.send_message(dest, text, parse_mode="HTML", disable_web_page_preview=True)
+            return bot.send_message(
+                dest,
+                _text_for_destination(dest),
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
         except Exception:
             if int(notify_chat_id) != 0:
                 try:
@@ -11114,14 +11329,24 @@ def send_user_notification(user_id: int, text: str, *, respect_notify_off: bool 
 
             if int(pm_opened) == 1:
                 try:
-                    return bot.send_message(uid, text, parse_mode="HTML", disable_web_page_preview=True)
+                    return bot.send_message(
+                        uid,
+                        _text_for_destination(uid),
+                        parse_mode="HTML",
+                        disable_web_page_preview=True
+                    )
                 except Exception:
                     return None
 
             alt = _pick_random_common_chat_for_user(uid)
             if alt != 0 and alt != dest:
                 try:
-                    return bot.send_message(int(alt), text, parse_mode="HTML", disable_web_page_preview=True)
+                    return bot.send_message(
+                        int(alt),
+                        _text_for_destination(int(alt)),
+                        parse_mode="HTML",
+                        disable_web_page_preview=True
+                    )
                 except Exception:
                     return None
 
@@ -15719,7 +15944,7 @@ def kb_post_publication(promo_code: str) -> Optional[InlineKeyboardMarkup]:
     if activate_url:
         kb.add(
             _ikb(
-                "Активировать промокод",
+                "🎁 Активировать промокод",
                 url=activate_url,
                 style="success"
             )
@@ -16580,6 +16805,26 @@ def _post_agents_send_to_one(user_id: int, text_html: str, media_items: list[dic
 
     return True
 
+def _post_agents_header_html(user_id: int) -> str:
+    uid = int(user_id)
+
+    row = get_user_row(uid)
+    if row:
+        name = standard_display_name(row["first_name"] or "", row["last_name"] or "", row["username"] or "", uid)
+        username = row["username"] or ""
+    else:
+        name = str(uid)
+        username = ""
+
+    author_tag = tg_mention(uid, name, username=username)
+    bot_name = str(BOT_TITLE or "Bio War bot").strip() or "Bio War bot"
+
+    return (
+        f"{premium_emoji_html('🔔')} Инфо-пост от {time.strftime('%d.%m.%Y %H:%M', time.localtime(now_ts()))} по обновлению <b>{h(bot_name)}</b> "
+        "для агентов технической поддержки!\n"
+        f"Автор <b>{author_tag}</b>"
+    )
+
 def _post_agents_publish_draft(user_id: int, overflow_mode: str = "") -> tuple[bool, str]:
     uid = int(user_id)
     overflow_mode = str(overflow_mode or "").strip().lower()
@@ -16593,6 +16838,9 @@ def _post_agents_publish_draft(user_id: int, overflow_mode: str = "") -> tuple[b
 
     if not text_html and not media_items:
         return False, "📑 Черновик пуст. Добавьте текст, фото или видео."
+
+    header_html = _post_agents_header_html(uid)
+    text_html = f"{header_html}\n\n{text_html}" if text_html else header_html
 
     targets = _post_agents_target_ids(uid)
     if not targets:
@@ -17852,6 +18100,20 @@ SIGNED_COMMANDS_ALLOWED = {
     "upgrade_preview", "upgrade_buy",
 }
 
+def _strip_command_bot_suffix(command_name: str) -> str:
+    cmd = str(command_name or "").strip().lower()
+    if "@" not in cmd:
+        return cmd
+
+    base, botname = cmd.split("@", 1)
+    botname = botname.strip().lstrip("@").lower()
+    current = str(BOT_USERNAME or "").strip().lstrip("@").lower()
+
+    if current and botname == current:
+        return base.strip().lower()
+
+    return cmd
+
 def parse_message_as_command(text: str) -> Optional[Parsed]:
     if not text:
         return None
@@ -17878,7 +18140,7 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
             )
 
         parts = body.split(" ", 1)
-        c = parts[0].lower()
+        c = _strip_command_bot_suffix(parts[0])
         a = parts[1].strip() if len(parts) > 1 else ""
 
         if c in (
@@ -17933,7 +18195,7 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
             )
 
         parts = body.split(" ", 1)
-        c = parts[0].lower()
+        c = _strip_command_bot_suffix(parts[0])
         a = parts[1].strip() if len(parts) > 1 else ""
         if c in ("owner", "owner_remove", "my_owner", "my_owner_remove", "agent", "агент", "agent_remove"):
             cmd_map = {
@@ -19766,9 +20028,6 @@ def handle_my_owner_remove_command(message, parsed: Parsed):
     bot.reply_to(message, "✅ Вы сняли с себя owner-права.")
 
 def handle_owner_remove_command(message, parsed: Parsed):
-    if not _require_private_bot_chat(message):
-        return
-
     uid = int(message.from_user.id)
     if not can_manage_owners(uid):
         bot.reply_to(message, "📑 Только разработчик бота может снимать owner-права.")
@@ -19785,22 +20044,42 @@ def handle_owner_remove_command(message, parsed: Parsed):
         except Exception:
             pass
 
+    target_notice_tag = _support_target_tag_with_id(
+        int(target_id),
+        target_user_obj=target_user_obj
+    )
+
     current_creator_id = int(get_current_creator_id())
     if int(target_id) == current_creator_id:
         bot.reply_to(message, "📑 Нельзя снять owner-права с текущего разработчика через /owner_remove. Используйте /my_owner_remove.")
         return
 
     if not is_owner(int(target_id)):
-        bot.reply_to(message, f"📑 Пользователь <code>{int(target_id)}</code> не является старшим агентом.", parse_mode="HTML")
+        bot.reply_to(
+            message,
+            f"📑 Пользователь {target_notice_tag} не является старшим агентом техподдержки.",
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
         return
 
     remove_bot_owner(int(target_id))
-    bot.reply_to(message, f"✅ Пользователь <code>{int(target_id)}</code> больше не является старшим агентом.", parse_mode="HTML")
+    _agent_role_notify_user(
+        message,
+        int(target_id),
+        target_user_obj=target_user_obj,
+        action="remove",
+        role="owner"
+    )
+    bot.reply_to(
+        message,
+        f"✅ Пользователь {target_notice_tag} больше не является старшим агентом техподдержки.",
+        parse_mode="HTML",
+        disable_web_page_preview=True
+    )
 
 def handle_agent_command(message, parsed: Parsed):
     if not parsed.has_prefix_char or parsed.cmd != "agent":
-        return
-    if not _require_private_bot_chat(message):
         return
 
     uid = int(message.from_user.id)
@@ -19819,6 +20098,11 @@ def handle_agent_command(message, parsed: Parsed):
         except Exception:
             pass
 
+    target_notice_tag = _support_target_tag_with_id(
+        int(target_id),
+        target_user_obj=target_user_obj
+    )
+
     current_creator_id = int(get_current_creator_id())
     if int(target_id) == current_creator_id:
         bot.reply_to(message, "📑 Разработчика бота нельзя назначить агентом техподдержки.")
@@ -19829,25 +20113,32 @@ def handle_agent_command(message, parsed: Parsed):
         return
 
     if is_agent(int(target_id)):
-        bot.reply_to(message, f"📑 Пользователь <code>{int(target_id)}</code> уже является агентом техподдержки.", parse_mode="HTML")
+        bot.reply_to(
+            message,
+            f"📑 Пользователь {target_notice_tag} уже является агентом техподдержки.",
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
         return
 
     add_agent(int(target_id), uid)
+    _agent_role_notify_user(
+        message,
+        int(target_id),
+        target_user_obj=target_user_obj,
+        action="add",
+        role="agent"
+    )
 
-    row = get_user_row(int(target_id))
-    disp = display_name(row["first_name"] or "", row["last_name"] or "", row["username"] or "", int(target_id)) if row else str(int(target_id))
-    un = (row["username"] or "") if row else ""
     bot.reply_to(
         message,
-        f"✅ Пользователь <b>{tg_mention(int(target_id), disp, username=un)}</b> назначен агентом технической поддержки.",
+        f"✅ Пользователь {target_notice_tag} назначен агентом техподдержки.",
         parse_mode="HTML",
         disable_web_page_preview=True
     )
 
 def handle_agent_remove_command(message, parsed: Parsed):
     if not parsed.has_prefix_char or parsed.cmd != "agent_remove":
-        return
-    if not _require_private_bot_chat(message):
         return
 
     uid = int(message.from_user.id)
@@ -19866,6 +20157,11 @@ def handle_agent_remove_command(message, parsed: Parsed):
         except Exception:
             pass
 
+    target_notice_tag = _support_target_tag_with_id(
+        int(target_id),
+        target_user_obj=target_user_obj
+    )
+
     current_creator_id = int(get_current_creator_id())
     if int(target_id) == current_creator_id:
         bot.reply_to(message, "📑 Нельзя снять права агента с текущего разработчика бота.")
@@ -19876,11 +20172,28 @@ def handle_agent_remove_command(message, parsed: Parsed):
         return
 
     if not is_agent(int(target_id)):
-        bot.reply_to(message, f"📑 Пользователь <code>{int(target_id)}</code> не является агентом техподдержки.", parse_mode="HTML")
+        bot.reply_to(
+            message,
+            f"📑 Пользователь {target_notice_tag} не является агентом техподдержки.",
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
         return
 
     remove_agent(int(target_id))
-    bot.reply_to(message, f"✅ Пользователь <code>{int(target_id)}</code> больше не является агентом техподдержки.", parse_mode="HTML")
+    _agent_role_notify_user(
+        message,
+        int(target_id),
+        target_user_obj=target_user_obj,
+        action="remove",
+        role="agent"
+    )
+    bot.reply_to(
+        message,
+        f"✅ Пользователь {target_notice_tag} больше не является агентом техподдержки.",
+        parse_mode="HTML",
+        disable_web_page_preview=True
+    )
 
 def handle_edit_k_command(message, parsed: Parsed):
     if not parsed.has_prefix_char or not can_manage_support(int(message.from_user.id)):
@@ -20141,12 +20454,13 @@ def render_users_cof_text() -> str:
         "<code>юзеры</code>, <code>юзер</code>, <code>пользователи</code>, <code>пользователь</code>, <code>users</code> — пользователи\n"
         "<code>лабы</code>, <code>lab</code>, <code>labs</code> — пользователи с лабораториями\n"
         "<code>обыч</code>, <code>обычные</code>, <code>обычн</code>, <code>no</code>, <code>no_labs</code>, <code>nolabs</code> — пользователи без лабораторий\n"
-        "<code>нов</code>, <code>новые</code>, <code>new</code> — новые пользователи"
+        "<code>нов</code>, <code>новые</code>, <code>new</code> — новые пользователи\n"
+        "<code>лс</code>, <code>ls</code> — пользователи, у которых есть личные сообщения с ботом"
         "</blockquote>\n\n"
         "Примеры:\n"
         "<code>/users каналы</code>\n"
         "<code>/users пользователи лабы</code>\n"
-        "<code>/users users no_labs new</code>"
+        "<code>/users users no_labs new ls</code>"
     )
 
 def handle_users_cof_command(message):
@@ -20298,6 +20612,145 @@ def handle_promo_use_command(message, parsed: Parsed):
     ok, txt = _promo_apply_to_user(code, uid)
     bot.reply_to(message, txt, parse_mode="HTML", disable_web_page_preview=True)
 
+def _agent_role_role_text(role: str) -> str:
+    return "старшего агента" if str(role or "").strip().lower() == "owner" else "агента"
+
+def _agent_role_payload(action: str, role: str, user_id: int) -> str:
+    act = "a" if str(action or "").strip().lower() in ("add", "assign", "a") else "r"
+    rl = "o" if str(role or "").strip().lower() == "owner" else "a"
+    return f"ar_{act}_{rl}_{int(user_id)}"
+
+def _agent_role_parse_payload(payload: str):
+    m = re.fullmatch(r"ar_([ar])_([ao])_(\d+)", str(payload or "").strip())
+    if not m:
+        return None
+
+    return {
+        "action": "add" if m.group(1) == "a" else "remove",
+        "role": "owner" if m.group(2) == "o" else "agent",
+        "user_id": int(m.group(3)),
+    }
+
+def _agent_role_pm_url(action: str, role: str, user_id: int) -> str:
+    if not BOT_USERNAME:
+        refresh_bot_identity()
+
+    if not BOT_USERNAME:
+        return ""
+
+    return f"https://t.me/{BOT_USERNAME}?start={_agent_role_payload(action, role, int(user_id))}"
+
+def _agent_role_plain_name(user_id: int, target_user_obj=None) -> str:
+    uid = int(user_id)
+
+    if target_user_obj is not None:
+        return standard_display_name(
+            str(getattr(target_user_obj, "first_name", "") or ""),
+            str(getattr(target_user_obj, "last_name", "") or ""),
+            str(getattr(target_user_obj, "username", "") or ""),
+            uid
+        )
+
+    row = get_user_row(uid)
+    if row:
+        return standard_display_name(
+            row["first_name"] or "",
+            row["last_name"] or "",
+            row["username"] or "",
+            uid
+        )
+
+    return str(uid)
+
+def _agent_role_notice_text(user_id: int, *, target_user_obj=None, action: str, role: str) -> str:
+    name = _agent_role_plain_name(int(user_id), target_user_obj=target_user_obj)
+    role_text = _agent_role_role_text(role)
+
+    if str(action or "").strip().lower() in ("add", "assign", "a"):
+        return (
+            f"👨‍⚕️ Пользователь, <b>{h(name)}</b>. Вас назначили на роль {role_text} технической поддержки.\n\n"
+            "Рад приветствовать Вас в нашей команде! 😉"
+        )
+
+    return (
+        f"🥼 Пользователь, <b>{h(name)}</b>. Вы были сняты с роли {role_text} технической поддержки.\n\n"
+        "Спасибо Вам за плодотворную работу! 🥲"
+    )
+
+def _agent_role_notify_user(message, target_id: int, target_user_obj=None, *, action: str, role: str):
+    tid = int(target_id)
+    text = _agent_role_notice_text(
+        tid,
+        target_user_obj=target_user_obj,
+        action=action,
+        role=role
+    )
+
+    try:
+        if int(get_pm_opened(tid)) == 1:
+            bot.send_message(
+                tid,
+                text,
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
+            return
+    except Exception:
+        pass
+
+    url = _agent_role_pm_url(action, role, tid)
+    if not url:
+        return
+
+    row = get_user_row(tid)
+    username = ""
+    if target_user_obj is not None:
+        username = str(getattr(target_user_obj, "username", "") or "").strip()
+    if not username and row:
+        username = str(row["username"] or "").strip()
+
+    name = _agent_role_plain_name(tid, target_user_obj=target_user_obj)
+    tag = tg_mention(tid, name, username=username)
+
+    kb = InlineKeyboardMarkup()
+    kb.add(_ikb("Перейти в личные сообщения", url=url, style="success"))
+
+    notice_text = (
+        f"⚠️ <b>{tag}</b>, минуточку внимания! "
+        "У Вас одно срочное сообщение. Прошу Вас с ним ознакомиться."
+    )
+
+    chat_ids: list[int] = []
+    chat = getattr(message, "chat", None)
+    chat_type = (getattr(chat, "type", "") or "").lower()
+    current_chat_id = int(getattr(chat, "id", 0) or 0)
+
+    if (
+        chat_type in ("group", "supergroup")
+        and current_chat_id != 0
+        and _notify_chat_is_group_chat(current_chat_id)
+        and _chat_has_user(current_chat_id, tid)
+    ):
+        chat_ids.append(current_chat_id)
+
+    for cid in _known_common_chat_ids_for_user(tid):
+        ccid = int(cid)
+        if ccid not in chat_ids:
+            chat_ids.append(ccid)
+
+    for cid in chat_ids:
+        try:
+            bot.send_message(
+                int(cid),
+                notice_text,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=kb
+            )
+            return
+        except Exception:
+            pass
+
 def _start_payload_from_message_text(text: str) -> str:
     first_line, _body = _timer_first_line_and_body(text or "")
     parts = first_line.strip().split(None, 1)
@@ -20313,6 +20766,30 @@ def _start_payload_from_message_text(text: str) -> str:
 def _handle_start_payload(message, payload: str) -> bool:
     uid = int(message.from_user.id)
     payload = str(payload or "").strip()
+
+    role_payload = _agent_role_parse_payload(payload)
+    if role_payload:
+        if int(role_payload["user_id"]) != uid:
+            bot.send_message(
+                int(message.chat.id),
+                "📑 Это сообщение адресовано другому пользователю.",
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
+            return True
+
+        bot.send_message(
+            int(message.chat.id),
+            _agent_role_notice_text(
+                uid,
+                target_user_obj=message.from_user,
+                action=role_payload["action"],
+                role=role_payload["role"]
+            ),
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
+        return True
 
     promo_code = _promo_code_from_start_payload(payload)
     if promo_code:
@@ -23005,7 +23482,10 @@ def _promo_apply_to_user(code: str, user_id: int) -> tuple[bool, str]:
         if exp > 0 and exp < now_ts():
             return False, "📑 Срок действия промокода истёк."
 
-    used = db_one("SELECT 1 FROM promo_uses WHERE promo_id=? AND user_id=? LIMIT 1", (promo_id, int(user_id)))
+    used = db_one(
+        "SELECT 1 FROM promo_uses WHERE promo_id=? AND user_id=? LIMIT 1",
+        (promo_id, int(user_id))
+    )
     if used:
         return False, "📑 Вы уже использовали этот промокод."
 
@@ -24469,7 +24949,7 @@ def _calc_chance_metric_prompt_text(metric_key: str) -> str:
         ])
     if metric_key == "SAB":
         return _calc_quote_block([
-            "Укажите 1.уровень группы быстрого реагирования атакующего 2.уровень Системы обнаружения угроз (IDS) защищающегося."
+            "Укажите 1.уровень группы быстрого реагирования атакующего 2.уровень Системы предотвращения угроз (IPS) защищающегося."
         ])
     if metric_key == "HEA":
         return _calc_quote_block([
@@ -26840,21 +27320,21 @@ def handle_notify_toggle(message, cmd: str):
                 bot.reply_to(message, "⚠️ Я не могу отправлять сообщения в этот чат. Уведомления будут приходить в личные сообщения.")
             else:
                 set_notify_prefs(uid, chat_id, 0)
-                bot.reply_to(message, "✅ Уведомления о заражении включены для этого чата.")
+                bot.reply_to(message, "✅ Игровые уведомления включены для этого чата.")
         else:
             set_notify_prefs(uid, 0, 0)
-            bot.reply_to(message, "✅ Уведомления о заражении включены в личных сообщениях.")
+            bot.reply_to(message, "✅ Игровые уведомления включены в личных сообщениях.")
         return
 
     chat_id, off = get_notify_prefs(uid)
     if message.chat.type in ("group", "supergroup"):
         set_notify_prefs(uid, 0, 0)
-        bot.reply_to(message, "❎ Уведомления о заражении для этого чата отключены.")
+        bot.reply_to(message, "❎ Игровые уведомления для этого чата отключены.")
         return
 
     if int(chat_id) == 0:
         set_notify_prefs(uid, 0, 1)
-        bot.reply_to(message, "❎ Уведомления о заражении отключены.")
+        bot.reply_to(message, "❎ Игровые уведомления отключены.")
     else:
         bot.reply_to(message, "ℹ️ Уведомления уже включены для группового чата.")
 
@@ -29643,9 +30123,21 @@ def cb_lab_create(cq):
             bot.answer_callback_query(cq.id)
             return
 
+        deleted_row = get_deleted_lab_row(int(target_uid))
+        lock_text = build_lab_recreate_lock_text(int(target_uid))
+
+        if deleted_row and lock_text:
+            bot.answer_callback_query(
+                cq.id,
+                lock_text,
+                show_alert=True
+            )
+            return
+
         if not is_lab_active(int(target_uid)):
             ensure_lab_exists(int(target_uid))
-            if get_deleted_lab_row(int(target_uid)):
+
+            if deleted_row:
                 _set_deleted_lab_restore_offer_suppressed(int(target_uid), True)
             mark_lab_active(int(target_uid))
             _maybe_apply_deleted_lab_bonus(int(target_uid))
@@ -32620,9 +33112,6 @@ def handle_owner_command(message, parsed: Parsed):
 
     upsert_user(message.from_user)
 
-    if not _require_private_bot_chat(message):
-        return
-
     uid = int(message.from_user.id)
     if not can_manage_owners(uid):
         bot.reply_to(message, "📑 Только разработчик бота может назначать агентов.")
@@ -32642,24 +33131,38 @@ def handle_owner_command(message, parsed: Parsed):
         except Exception:
             pass
 
+    target_notice_tag = _support_target_tag_with_id(
+        int(target_id),
+        target_user_obj=target_user_obj
+    )
+
     current_creator_id = int(get_current_creator_id())
     if int(target_id) == current_creator_id:
         bot.reply_to(message, "📑 Нельзя назначить текущего разработчика старшим агентом через /owner. Используйте /my_owner.")
         return
 
     if is_owner(int(target_id)):
-        bot.reply_to(message, f"📑 Пользователь <code>{int(target_id)}</code> уже является старшим агентом.", parse_mode="HTML")
+        bot.reply_to(
+            message,
+            f"📑 Пользователь {target_notice_tag} уже является старшим агентом.",
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
         return
 
     add_bot_owner(int(target_id), added_by=uid)
     ensure_lab_exists(int(target_id))
+    _agent_role_notify_user(
+        message,
+        int(target_id),
+        target_user_obj=target_user_obj,
+        action="add",
+        role="owner"
+    )
 
-    row = get_user_row(int(target_id))
-    disp = display_name(row["first_name"] or "", row["last_name"] or "", row["username"] or "", int(target_id)) if row else str(int(target_id))
-    un = (row["username"] or "") if row else ""
     bot.reply_to(
         message,
-        f"✅ Пользователь <b>{tg_mention(int(target_id), disp, username=un)}</b> назначен старшим агентом технической поддержки.",
+        f"✅ Пользователь {target_notice_tag} назначен старшим агентом технической поддержки.",
         parse_mode="HTML",
         disable_web_page_preview=True
     )
@@ -33811,7 +34314,7 @@ def handle_sabotage_command(message, parsed: Parsed, edit_ctx: Optional[dict] = 
         (attacker_id,)
     )
     t = db_one(
-        "SELECT COALESCE(ips,1) AS ips, COALESCE(ids,1) AS t_ids, "
+        "SELECT COALESCE(ips,1) AS ips, COALESCE(ids,1) AS t_ids, COALESCE(lab_name,'') AS lab_name, "
         "COALESCE(ready_pathogens,0) AS rp, COALESCE(total_pathogens,1) AS tp, COALESCE(next_pathogen_in,0) AS npi, "
         "COALESCE(ready_vaccines,0) AS rv, COALESCE(total_vaccines,1) AS tv, COALESCE(next_vaccine_in,0) AS nvi, "
         "COALESCE(all_bio_res,0) AS ar, COALESCE(all_bio_mater,0) AS am, COALESCE(bio_res,0) AS br "
@@ -33840,14 +34343,24 @@ def handle_sabotage_command(message, parsed: Parsed, edit_ctx: Optional[dict] = 
     )
     target_tag = tg_mention(int(target_id), t_disp, username=t_un)
 
+    target_lab_name = (t["lab_name"] or "").strip()
+    if target_lab_name:
+        target_lab_tag = f'«<b>{tg_mention(int(target_id), target_lab_name, username=t_un)}</b>»'
+    else:
+        target_lab_tag = f"им. <b>{target_tag}</b>"
+
     a_un = getattr(actor, "username", "") or ""
     a_fn = getattr(actor, "first_name", "") or ""
     a_ln = getattr(actor, "last_name", "") or ""
     a_disp = display_name(a_fn, a_ln, a_un, attacker_id)
     organizer_tag = tg_mention(attacker_id, a_disp, username=a_un)
 
-    def _notify(tid: int, text: str):
-        return send_user_notification(int(tid), text)
+    def _notify(tid: int, text: str, *, group_text: Optional[str] = None):
+        return send_user_notification(
+            int(tid),
+            text,
+            group_text=group_text
+        )
 
     db_exec(
         "INSERT INTO sabotage_cooldowns(attacker_id,target_id,until_ts) VALUES (?,?,?) "
@@ -34058,7 +34571,19 @@ def handle_sabotage_command(message, parsed: Parsed, edit_ctx: Optional[dict] = 
             + "\n".join(target_lines)
             + "\nОрганизатор диверсии остался неизвестен."
         )
-        _notify(int(target_id), tgt_notice)
+
+        tgt_group_notice = (
+            f"💥 В лабораторию <b>{target_tag}</b> совершена диверсия. "
+            "Марадёры повредили контейнеры с образцами и лабораторное оборудование.\n\n"
+            + "\n".join(target_lines)
+            + "\nОрганизатор диверсии остался неизвестен."
+        )
+
+        _notify(
+            int(target_id),
+            tgt_notice,
+            group_text=tgt_group_notice
+        )
 
         if ids_should_fire(a_ids, t_ids):
             ids_text = render_ids_report(
@@ -34144,26 +34669,33 @@ def handle_sabotage_command(message, parsed: Parsed, edit_ctx: Optional[dict] = 
     )
 
     tgt_notice = (
-        f"📟 Попытка диверсии лаборатории «{target_tag}» была предотвращена. Группа человек была поймана на месте и дала показания.\n\n"
+        "📟 Попытка диверсии на вашу лабораторию была предотвращена. "
+        "Группа человек была поймана на месте и дала показания.\n\n"
         f"Организатор: {organizer_tag}\n"
         f"🧾 Финансовая компенсация: {spent_txt}"
     )
-    _notify(int(target_id), tgt_notice)
 
-    if ids_should_fire(a_ids, t_ids):
-        ids_text = render_ids_report(
-            target_id=int(target_id),
-            attempts=1,
-            kind="sabotage",
-            organizer_tag=organizer_tag,
-            result_text=(
-                "📟 Попытка вторжения была предотвращена.\n"
-                f"Компенсация: {spent_txt}"
-            )
+    tgt_group_notice = (
+        f"📟 Попытка диверсии на лабораторию {target_lab_tag} была предотвращена. "
+        "Группа человек была поймана на месте и дала показания.\n\n"
+        f"Организатор: {organizer_tag}\n"
+        f"🧾 Финансовая компенсация: {spent_txt}"
+    )
+
+    tgt_msg = _notify(
+        int(target_id),
+        tgt_notice,
+        group_text=tgt_group_notice
+    )
+
+    if ids_should_fire(a_ids, t_ids) and tgt_msg:
+        autoanswer_trigger(
+            int(target_id),
+            attacker_id,
+            int(tgt_msg.chat.id),
+            int(tgt_msg.message_id),
+            "IDS"
         )
-        ids_msg = _notify(int(target_id), ids_text)
-        if ids_msg:
-            autoanswer_trigger(int(target_id), attacker_id, int(ids_msg.chat.id), int(ids_msg.message_id), "IDS")
 
     _emit(
         "🥷 Диверсия провалилась.\n"
@@ -34186,6 +34718,16 @@ def handle_lab_commands(message, parsed: Parsed):
         ensure_lab_exists(uid)
 
     if parsed.cmd == "lab_delete":
+        lock_text = build_lab_recreate_lock_text(int(uid))
+        if lock_text:
+            bot.reply_to(
+                message,
+                lock_text,
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
+            return
+
         if not is_lab_active(int(uid)):
             bot.reply_to(
                 message,
@@ -34584,6 +35126,12 @@ def handle_lab_commands(message, parsed: Parsed):
             bot.reply_to(message, "📑 Этот пользователь ещё не создал свою лабораторию.")
             return
 
+        create_own_lab = (
+            parsed.cmd == "lab"
+            and target_id is None
+            and not target_args
+        )
+
         if target_id is None:
             target_id = int(uid)
             target_user_obj = message.from_user
@@ -34592,14 +35140,17 @@ def handle_lab_commands(message, parsed: Parsed):
             capture_user_context(message, target_user_obj)
 
         if int(target_id) == int(uid) and not is_lab_active(int(uid)):
-            bot.reply_to(
-                message,
-                build_inactive_lab_text(int(uid), after_delete=False),
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-                reply_markup=kb_inactive_lab_actions(int(uid))
-            )
-            return
+            if create_own_lab and get_deleted_lab_row(int(uid)) is None:
+                mark_lab_active(int(uid))
+            else:
+                bot.reply_to(
+                    message,
+                    build_inactive_lab_text(int(uid), after_delete=False),
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                    reply_markup=kb_inactive_lab_actions(int(uid))
+                )
+                return
 
         tok = (target_args.split()[0] if target_args else "")
         if is_bot_target(target_id, target_user_obj, tok):
@@ -36354,20 +36905,12 @@ def text_router(message):
             if not strict_single_numeric_arg_ok(parsed):
                 return
 
-        if parsed.cmd in ("promo_delete", "promo_use", "bot_ban", "bot_unban", "remake_lab", "edit_k", "edit_b"):
+        if parsed.cmd in ("promo_delete", "promo_use", "edit_k", "edit_b"):
             if not strict_single_word_arg_ok(parsed):
                 return
         
         senior_creator_private_only_cmds = (
-            "my_owner", "my_owner_remove", "users_list", "users_cof",
-            "owner", "owner_remove",
-            "agent", "agent_remove",
-            "db_fife", "db_fife_stat", "db_fife_msg", "db_fife_upd", "its",
-            "edit_k", "edit_b", "cof_inf_stats",
-            "duel_cof_stats", "duel_cof_break", "duel_cof_break_bon",
-            "duel_cof_aim", "duel_cof_base_pts", "duel_rounds",
-            "promo_generate", "promo_create", "promo_all", "promo_delete",
-            "promo_delete_all", "post_channels", "post", "statpost", "post_agents",
+            "my_owner", "my_owner_remove", "users_list", "users_cof", "agent_status",
         )
 
         if message.chat.type != "private" and parsed.cmd in senior_creator_private_only_cmds:
@@ -36522,6 +37065,22 @@ def text_router(message):
 
         # пинг
         if parsed.cmd == "ping":
+            replied = getattr(message, "reply_to_message", None)
+
+            if replied is not None:
+                replied_user = getattr(replied, "from_user", None)
+                replied_user_id = int(getattr(replied_user, "id", 0) or 0)
+                replied_is_bot = bool(getattr(replied_user, "is_bot", False))
+
+                if (
+                    replied_user is None
+                    or replied_is_bot
+                    or (replied_user_id > 0 and replied_user_id != int(uid))
+                ):
+                    if try_handle_rp_action_message(message):
+                        return
+                    return
+
             handle_ping_command(message, parsed)
             return
 
