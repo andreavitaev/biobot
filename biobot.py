@@ -919,6 +919,12 @@ def autoanswer_trigger(defender_id: int, organizer_id: int, chat_id: int, reply_
     if defender_id <= 0 or organizer_id <= 0 or defender_id == organizer_id:
         return
 
+    if (
+        not main_game_target_enabled(int(defender_id))
+        or not main_game_target_enabled(int(organizer_id))
+    ):
+        return
+
     cd_row = db_one(
         "SELECT COALESCE(until_ts,0) AS u FROM infection_cooldowns WHERE attacker_id=? AND target_id=?",
         (int(defender_id), int(organizer_id))
@@ -1095,11 +1101,8 @@ def autoanswer_trigger(defender_id: int, organizer_id: int, chat_id: int, reply_
 
     pathogen_name = (lab_def["pathogen_name"] or "").strip()
 
-    active = db_one(
-        "SELECT end_ts FROM infections WHERE attacker_id=? AND target_id=?",
-        (defender_id, organizer_id)
-    )
-    already_active = bool(active and int(active["end_ts"] or 0) > now)
+    already_active, already_visible_for_target_lab = _active_infection_state(defender_id, organizer_id)
+    target_lab_epoch = get_lab_epoch(organizer_id)
 
     with DB_LOCK:
         c = conn.cursor()
@@ -1130,16 +1133,18 @@ def autoanswer_trigger(defender_id: int, organizer_id: int, chat_id: int, reply_
 
             if not already_active:
                 c.execute("UPDATE labs SET infected_total=COALESCE(infected_total,0)+1 WHERE user_id=?", (defender_id,))
+            if not already_visible_for_target_lab:
                 c.execute("UPDATE labs SET diseases_total=COALESCE(diseases_total,0)+1 WHERE user_id=?", (organizer_id,))
 
             c.execute(
-                "INSERT INTO infections(attacker_id,target_id,start_ts,end_ts,add_bio_res,next_payout_ts,counted,pathogen_name,known_to_target) "
-                "VALUES (?,?,?,?,?,?,1,?,1) "
+                "INSERT INTO infections(attacker_id,target_id,start_ts,end_ts,add_bio_res,next_payout_ts,counted,pathogen_name,known_to_target,target_lab_epoch) "
+                "VALUES (?,?,?,?,?,?,1,?,1,?) "
                 "ON CONFLICT(attacker_id,target_id) DO UPDATE SET "
                 "start_ts=excluded.start_ts, end_ts=excluded.end_ts, "
                 "add_bio_res=excluded.add_bio_res, "
-                "next_payout_ts=excluded.next_payout_ts, counted=1, pathogen_name=excluded.pathogen_name, known_to_target=1",
-                (defender_id, organizer_id, now, end_ts, gained, next_payout, pathogen_name)
+                "next_payout_ts=excluded.next_payout_ts, counted=1, pathogen_name=excluded.pathogen_name, "
+                "known_to_target=1, target_lab_epoch=excluded.target_lab_epoch",
+                (defender_id, organizer_id, now, end_ts, gained, next_payout, pathogen_name, int(target_lab_epoch))
             )
 
             c.execute(
@@ -1916,6 +1921,7 @@ PREMIUM_EMOJI_IDS: Dict[str, str] = {
     "👋": "5348172574960427760",
     "⚙️": "5445347129155419150",
     "🔔": "5445333299360723379",
+    "➕": "5258079378159453410",
 }
 _RAW_INLINE_KEYBOARD_BUTTON = InlineKeyboardButton
 PREMIUM_BUTTON_EMPTY_TEXT = "\u3164"  # невидимый, но не пустой текст для Telegram-кнопок
@@ -2581,12 +2587,13 @@ def _try_send_rp_result_to_pm_users(
     target_id: int,
     text: str,
     *,
-    target_is_bot: bool = False
+    target_is_bot: bool = False,
+    include_actor: bool = True
 ) -> bool:
     delivered = False
 
     recipients = []
-    if int(actor_id) > 0:
+    if bool(include_actor) and int(actor_id) > 0:
         recipients.append(int(actor_id))
 
     if (not bool(target_is_bot)) and int(target_id) > 0 and int(target_id) != int(actor_id):
@@ -3167,7 +3174,8 @@ def _infection_daemon():
                 )
 
             exp = db_all(
-                "SELECT attacker_id, target_id, counted FROM infections WHERE end_ts<=?",
+                "SELECT attacker_id, target_id, counted, COALESCE(target_lab_epoch,0) AS target_lab_epoch "
+                "FROM infections WHERE end_ts<=?",
                 (now,)
             ) or []
 
@@ -3183,12 +3191,13 @@ def _infection_daemon():
                         (att,),
                         commit=True
                     )
-                    db_exec(
-                        "UPDATE labs SET diseases_total=CASE WHEN COALESCE(diseases_total,0)>0 THEN diseases_total-1 ELSE 0 END "
-                        "WHERE user_id=?",
-                        (tgt,),
-                        commit=True
-                    )
+                    if _infection_target_visible_for_current_lab(tgt, int(r["target_lab_epoch"] or 0)):
+                        db_exec(
+                            "UPDATE labs SET diseases_total=CASE WHEN COALESCE(diseases_total,0)>0 THEN diseases_total-1 ELSE 0 END "
+                            "WHERE user_id=?",
+                            (tgt,),
+                            commit=True
+                        )
 
                 db_exec("DELETE FROM infections WHERE attacker_id=? AND target_id=?", (att, tgt), commit=True)
 
@@ -3415,6 +3424,7 @@ def init_db():
         last_name           TEXT,
         notify_chat_id      INTEGER DEFAULT 0,
         notify_off          INTEGER DEFAULT 0,
+        notify_all_off      INTEGER DEFAULT 0,
         first_seen          INTEGER DEFAULT 0,
         first_seen_verified INTEGER DEFAULT 0,
         last_seen           INTEGER DEFAULT 0,
@@ -3422,6 +3432,7 @@ def init_db():
         is_bot              INTEGER DEFAULT 0,
         bot_status_locked   INTEGER DEFAULT 0,
         rp_off              INTEGER DEFAULT 0,
+        game_enabled        INTEGER NOT NULL DEFAULT 1,
         lab_recreate_lock_until INTEGER DEFAULT 0,
         gender              TEXT NOT NULL DEFAULT 'male'
     );
@@ -3504,9 +3515,18 @@ def init_db():
     db_exec("""
     CREATE TABLE IF NOT EXISTS lab_delete_pending (
         user_id     INTEGER PRIMARY KEY,
-        created_at  INTEGER NOT NULL
+        created_at  INTEGER NOT NULL,
+        mode        TEXT NOT NULL DEFAULT 'lab'
     );
     """, commit=True)
+
+    try:
+        db_exec(
+            "ALTER TABLE lab_delete_pending ADD COLUMN mode TEXT NOT NULL DEFAULT 'lab'",
+            commit=True
+        )
+    except Exception:
+        pass
 
     db_exec("""
     CREATE TABLE IF NOT EXISTS autoanswer_state (
@@ -3795,6 +3815,24 @@ def init_db():
     );
     """, commit=True)
 
+    # настройки текущего черновика публикации
+    db_exec("""
+    CREATE TABLE IF NOT EXISTS post_publication_settings (
+        user_id                  INTEGER PRIMARY KEY,
+        preview_enabled          INTEGER NOT NULL DEFAULT 1,
+        links_as_buttons_enabled INTEGER NOT NULL DEFAULT 1,
+        buttons_json             TEXT NOT NULL DEFAULT '[]',
+        hashtags_json            TEXT NOT NULL DEFAULT '[]',
+        hashtags_vertical        INTEGER NOT NULL DEFAULT 1,
+        selected_button_index    INTEGER,
+        selected_hashtag_index   INTEGER,
+        screen_mode              TEXT NOT NULL DEFAULT '',
+        screen_chat_id           INTEGER NOT NULL DEFAULT 0,
+        screen_message_id        INTEGER NOT NULL DEFAULT 0,
+        updated_at               INTEGER NOT NULL DEFAULT 0
+    );
+    """, commit=True)
+
     db_exec("""
     CREATE TABLE IF NOT EXISTS post_update_drafts (
         user_id         INTEGER PRIMARY KEY,
@@ -3916,6 +3954,60 @@ def init_db():
         updated_at    INTEGER NOT NULL DEFAULT 0
     );
     """, commit=True)
+
+    db_exec("""
+    CREATE TABLE IF NOT EXISTS quick_keyboard_configs (
+        user_id       INTEGER PRIMARY KEY,
+        config_id     TEXT NOT NULL UNIQUE,
+        group_enabled INTEGER NOT NULL DEFAULT 0,
+        updated_at    INTEGER NOT NULL DEFAULT 0
+    );
+    """, commit=True)
+
+    db_exec("""
+    CREATE TABLE IF NOT EXISTS quick_keyboard_slots (
+        user_id      INTEGER NOT NULL,
+        slot_index   INTEGER NOT NULL,
+        label        TEXT NOT NULL DEFAULT '',
+        command_text TEXT NOT NULL DEFAULT '',
+        is_standard  INTEGER NOT NULL DEFAULT 0,
+        updated_at   INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY(user_id, slot_index)
+    );
+    """, commit=True)
+
+    db_exec("""
+    CREATE TABLE IF NOT EXISTS quick_keyboard_editor_state (
+        user_id              INTEGER PRIMARY KEY,
+        selected_index       INTEGER,
+        opened_from_settings INTEGER NOT NULL DEFAULT 0,
+        chat_id              INTEGER NOT NULL DEFAULT 0,
+        message_id           INTEGER NOT NULL DEFAULT 0,
+        updated_at           INTEGER NOT NULL DEFAULT 0
+    );
+    """, commit=True)
+
+    db_exec("""
+    CREATE TABLE IF NOT EXISTS quick_keyboard_chat_state (
+        user_id         INTEGER NOT NULL,
+        chat_id         INTEGER NOT NULL,
+        enabled         INTEGER NOT NULL DEFAULT 0,
+        message_chat_id INTEGER NOT NULL DEFAULT 0,
+        message_id      INTEGER NOT NULL DEFAULT 0,
+        updated_at      INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY(user_id, chat_id)
+    );
+    """, commit=True)
+
+    try:
+        db_exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_quick_keyboard_configs_id ON quick_keyboard_configs(config_id);", commit=True)
+    except Exception:
+        pass
+
+    try:
+        db_exec("CREATE INDEX IF NOT EXISTS idx_quick_keyboard_chat_msg ON quick_keyboard_chat_state(chat_id, message_id, enabled);", commit=True)
+    except Exception:
+        pass
 
     db_exec("""
     CREATE TABLE IF NOT EXISTS user_timers (
@@ -4070,7 +4162,8 @@ def init_db():
         defended_total  INTEGER DEFAULT 0,
 
         infected_total  INTEGER DEFAULT 0,
-        diseases_total  INTEGER DEFAULT 0
+        diseases_total  INTEGER DEFAULT 0,
+        lab_epoch       INTEGER DEFAULT 0
     );
     """, commit=True)
 
@@ -4236,12 +4329,14 @@ def init_db():
         "ALTER TABLE users ADD COLUMN notify_chat_id INTEGER DEFAULT 0",
         "ALTER TABLE users ADD COLUMN pm_opened INTEGER DEFAULT 0",
         "ALTER TABLE users ADD COLUMN notify_off INTEGER DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN notify_all_off INTEGER DEFAULT 0",
         "ALTER TABLE users ADD COLUMN first_seen INTEGER DEFAULT 0",
         "ALTER TABLE users ADD COLUMN first_seen_verified INTEGER DEFAULT 0",
         "ALTER TABLE users ADD COLUMN is_placeholder INTEGER DEFAULT 0",
         "ALTER TABLE users ADD COLUMN is_bot INTEGER DEFAULT 0",
         "ALTER TABLE users ADD COLUMN bot_status_locked INTEGER DEFAULT 0",
         "ALTER TABLE users ADD COLUMN rp_off INTEGER DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN game_enabled INTEGER NOT NULL DEFAULT 1",
         "ALTER TABLE users ADD COLUMN lab_recreate_lock_until INTEGER DEFAULT 0",
         "ALTER TABLE users ADD COLUMN gender TEXT NOT NULL DEFAULT 'male'",
     ):
@@ -4299,6 +4394,7 @@ def init_db():
         "ALTER TABLE labs ADD COLUMN acceleration INTEGER DEFAULT 1",
         "ALTER TABLE labs ADD COLUMN defended_total INTEGER DEFAULT 0",
         "ALTER TABLE labs ADD COLUMN corp_id INTEGER DEFAULT 0",
+        "ALTER TABLE labs ADD COLUMN lab_epoch INTEGER DEFAULT 0",
     ):
         try:
             db_exec(sql, commit=True)
@@ -4342,6 +4438,7 @@ def init_db():
         add_bio_res     INTEGER NOT NULL DEFAULT 1,
         next_payout_ts  INTEGER NOT NULL DEFAULT 0,
         counted         INTEGER NOT NULL DEFAULT 1,
+        target_lab_epoch INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY(attacker_id, target_id)
     );
     """, commit=True)
@@ -4353,6 +4450,11 @@ def init_db():
 
     try:
         db_exec("ALTER TABLE infections ADD COLUMN known_to_target INTEGER DEFAULT 0", commit=True)
+    except Exception:
+        pass
+
+    try:
+        db_exec("ALTER TABLE infections ADD COLUMN target_lab_epoch INTEGER NOT NULL DEFAULT 0", commit=True)
     except Exception:
         pass
 
@@ -4368,18 +4470,26 @@ def init_db():
 
     db_exec("""
     CREATE TABLE IF NOT EXISTS bot_group_chats (
-        chat_id      INTEGER PRIMARY KEY,
-        title        TEXT NOT NULL DEFAULT '',
-        chat_type    TEXT NOT NULL DEFAULT '',
-        is_active    INTEGER NOT NULL DEFAULT 1,
-        updated_at   INTEGER NOT NULL DEFAULT 0
+        chat_id                 INTEGER PRIMARY KEY,
+        title                   TEXT NOT NULL DEFAULT '',
+        chat_type               TEXT NOT NULL DEFAULT '',
+        is_active               INTEGER NOT NULL DEFAULT 1,
+        updated_at              INTEGER NOT NULL DEFAULT 0,
+        owner_id                INTEGER NOT NULL DEFAULT 0,
+        member_count            INTEGER NOT NULL DEFAULT 0,
+        member_count_updated_at INTEGER NOT NULL DEFAULT 0
     );
     """, commit=True)
 
-    try:
-        db_exec("ALTER TABLE bot_group_chats ADD COLUMN owner_id INTEGER DEFAULT 0", commit=True)
-    except Exception:
-        pass
+    for sql in (
+        "ALTER TABLE bot_group_chats ADD COLUMN owner_id INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE bot_group_chats ADD COLUMN member_count INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE bot_group_chats ADD COLUMN member_count_updated_at INTEGER NOT NULL DEFAULT 0",
+    ):
+        try:
+            db_exec(sql, commit=True)
+        except Exception:
+            pass
 
     db_exec("""
     CREATE TABLE IF NOT EXISTS rp_offers (
@@ -4440,6 +4550,10 @@ def init_db():
     # индексы для топов/болезней
     try:
         db_exec("CREATE INDEX IF NOT EXISTS idx_infections_target_end ON infections(target_id, end_ts);", commit=True)
+    except Exception:
+        pass
+    try:
+        db_exec("CREATE INDEX IF NOT EXISTS idx_infections_target_epoch_end ON infections(target_id, target_lab_epoch, end_ts);", commit=True)
     except Exception:
         pass
     try:
@@ -4632,19 +4746,49 @@ def _maybe_apply_deleted_lab_bonus(user_id: int):
     _save_deleted_meta(int(user_id), meta)
     _deleted_lab_log(int(user_id), "grant_bonus", f"+{grant}")
 
-def set_lab_delete_pending(user_id: int):
+def set_lab_delete_pending(user_id: int, mode: str = "lab"):
+    delete_mode = "game_off" if str(mode or "").strip() == "game_off" else "lab"
+
     db_exec(
-        "INSERT INTO lab_delete_pending(user_id, created_at) VALUES (?,?) "
-        "ON CONFLICT(user_id) DO UPDATE SET created_at=excluded.created_at",
-        (int(user_id), int(now_ts())),
+        "INSERT INTO lab_delete_pending(user_id, created_at, mode) VALUES (?,?,?) "
+        "ON CONFLICT(user_id) DO UPDATE SET "
+        "created_at=excluded.created_at, mode=excluded.mode",
+        (
+            int(user_id),
+            int(now_ts()),
+            delete_mode
+        ),
         commit=True
     )
 
+def get_lab_delete_pending_mode(user_id: int) -> str:
+    r = db_one(
+        "SELECT COALESCE(mode,'lab') AS mode "
+        "FROM lab_delete_pending WHERE user_id=? LIMIT 1",
+        (int(user_id),)
+    )
+
+    if not r:
+        return ""
+
+    return (
+        "game_off"
+        if str(r["mode"] or "").strip() == "game_off"
+        else "lab"
+    )
+
 def clear_lab_delete_pending(user_id: int):
-    db_exec("DELETE FROM lab_delete_pending WHERE user_id=?", (int(user_id),), commit=True)
+    db_exec(
+        "DELETE FROM lab_delete_pending WHERE user_id=?",
+        (int(user_id),),
+        commit=True
+    )
 
 def has_lab_delete_pending(user_id: int) -> bool:
-    r = db_one("SELECT 1 FROM lab_delete_pending WHERE user_id=? LIMIT 1", (int(user_id),))
+    r = db_one(
+        "SELECT 1 FROM lab_delete_pending WHERE user_id=? LIMIT 1",
+        (int(user_id),)
+    )
     return r is not None
 
 def build_lab_recreate_lock_text(user_id: int) -> str:
@@ -4702,6 +4846,7 @@ def _send_hidden_self_info_to_pm(viewer_id: int, text: str, reply_markup=None) -
     except Exception:
         return False
 
+# TEXTS DELETE LABz 
 def build_lab_delete_confirm_text() -> str:
     return (
         "⚠️ Вы собираетесь удалить свою Лабораторию.\n\n"
@@ -4709,13 +4854,49 @@ def build_lab_delete_confirm_text() -> str:
         f"Если вы точно уверены в своём решении, введите <code>{h(LAB_DELETE_PHRASE)}</code>"
     )
 
+def build_game_disable_confirm_text() -> str:
+    return (
+        "⚠️ Я не могу убрать Ваше участие из игры, пока Вы до сих пор являетесь её участником. "
+        "Для отключения основной игры Вам потребуется удалить свою Лабораторию.\n\n"
+        "После удаления у Вас будет всего 3 дня для её восстановления. "
+        "Команда включения основной игры восстановит Вашу лабораторию автоматически "
+        "до окончания периода восстановления.\n\n"
+        f"Если вы точно уверены в своём решении, введите "
+        f"<code>{h(LAB_DELETE_PHRASE)}</code>"
+    )
+
 def build_lab_deleted_text() -> str:
     return (
-        "❎ Вы исключили себя из участия в мини-игре «Био-атака»\n\n"
+        "❎ Вы исключили себя из участия в мини-игре «Био-война»\n\n"
         "💬 У Вас есть 3 дня на восстановление Лаборатории. "
         "Команда \"<code>Био восстановить лабу</code>\"\n"
-        f"Для отслеживания состояния лаборатории перейдите в {_bot_pm_link_html()}"
+        f"Для отслеживания состояния лаборатории перейдите в {_bot_pm_link_html()}."
     )
+
+def build_game_disabled_deleted_text() -> str:
+    return (
+        f"{MAIN_GAME_SELF_DISABLED_TEXT}\n\n"
+        "💬 У Вас есть 3 дня на восстановление Лаборатории.\n"
+        "Команда «<code>Био +игра</code>» автоматически восстановит её "
+        "до окончания периода восстановления.\n"
+        f"Для отслеживания состояния лаборатории перейдите в {_bot_pm_link_html()}."
+    )
+
+MAIN_GAME_TIMER_DISABLED_TEXT = (
+    "📑 Игровая команда для таймера не доступна.\n"
+    "Для включения используйте команду "
+    "«<code>Био +игра</code>»."
+)
+
+MAIN_GAME_SELF_DISABLED_TEXT = (
+    "❎ Вы отключили участие в основной игре.\n"
+    "Для включения используйте команду "
+    "«<code>Био +игра</code>»."
+)
+
+MAIN_GAME_TARGET_DISABLED_TEXT = (
+    "❎ Пользователь отключил участие в основной игре."
+)
 
 def kb_lab_delete_confirm(uid: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup(row_width=2)
@@ -4969,7 +5150,17 @@ def _build_deleted_lab_snapshot(user_id: int) -> tuple[dict, dict]:
     }
     return snapshot, meta
 
-def _perform_lab_delete(user_id: int) -> tuple[bool, str]:
+def _perform_lab_delete(
+    user_id: int,
+    *,
+    delete_mode: str = "lab"
+) -> tuple[bool, str]:
+    mode = (
+        "game_off"
+        if str(delete_mode or "").strip() == "game_off"
+        else "lab"
+    )
+
     lock_text = build_lab_recreate_lock_text(int(user_id))
     if lock_text:
         clear_lab_delete_pending(int(user_id))
@@ -4981,10 +5172,18 @@ def _perform_lab_delete(user_id: int) -> tuple[bool, str]:
         return False, "📑 У вас нет активной Лаборатории."
 
     snapshot, meta = _build_deleted_lab_snapshot(int(user_id))
+
+    if mode == "game_off":
+        meta["game_off_delete"] = 1
+        meta["game_off_delete_at"] = int(now_ts())
+
     save_deleted_lab_snapshot(int(user_id), snapshot, meta)
 
-    out_rows = db_all("SELECT attacker_id, target_id, counted FROM infections WHERE attacker_id=?", (int(user_id),)) or []
-    in_rows = db_all("SELECT attacker_id, target_id, counted FROM infections WHERE target_id=?", (int(user_id),)) or []
+    out_rows = db_all(
+        "SELECT attacker_id, target_id, counted, COALESCE(target_lab_epoch,0) AS target_lab_epoch "
+        "FROM infections WHERE attacker_id=?",
+        (int(user_id),)
+    ) or []
 
     try:
         _corp_transfer_on_lab_delete(int(user_id))
@@ -4995,24 +5194,23 @@ def _perform_lab_delete(user_id: int) -> tuple[bool, str]:
                 c.execute("BEGIN")
 
                 for r in out_rows:
-                    if int(r["counted"] or 0) == 1 and int(r["target_id"]) != int(user_id):
+                    if (
+                        int(r["counted"] or 0) == 1
+                        and int(r["target_id"] or 0) != int(user_id)
+                        and _infection_target_visible_for_current_lab(
+                            int(r["target_id"]),
+                            int(r["target_lab_epoch"] or 0)
+                        )
+                    ):
                         c.execute(
                             "UPDATE labs SET diseases_total=CASE WHEN COALESCE(diseases_total,0)>0 THEN diseases_total-1 ELSE 0 END "
                             "WHERE user_id=?",
                             (int(r["target_id"]),)
                         )
 
-                for r in in_rows:
-                    if int(r["counted"] or 0) == 1 and int(r["attacker_id"]) != int(user_id):
-                        c.execute(
-                            "UPDATE labs SET infected_total=CASE WHEN COALESCE(infected_total,0)>0 THEN infected_total-1 ELSE 0 END "
-                            "WHERE user_id=?",
-                            (int(r["attacker_id"]),)
-                        )
-
-                c.execute("DELETE FROM infections WHERE attacker_id=? OR target_id=?", (int(user_id), int(user_id)))
-                c.execute("DELETE FROM infection_seen WHERE attacker_id=? OR target_id=?", (int(user_id), int(user_id)))
-                c.execute("DELETE FROM infection_cooldowns WHERE attacker_id=? OR target_id=?", (int(user_id), int(user_id)))
+                c.execute("DELETE FROM infections WHERE attacker_id=?", (int(user_id),))
+                c.execute("DELETE FROM infection_seen WHERE attacker_id=?", (int(user_id),))
+                c.execute("DELETE FROM infection_cooldowns WHERE attacker_id=?", (int(user_id),))
                 c.execute("DELETE FROM sabotage_cooldowns WHERE attacker_id=? OR target_id=?", (int(user_id), int(user_id)))
                 c.execute("DELETE FROM autoanswer_used_reports WHERE user_id=?", (int(user_id),))
                 c.execute("DELETE FROM autoanswer_state WHERE user_id=?", (int(user_id),))
@@ -5029,13 +5227,47 @@ def _perform_lab_delete(user_id: int) -> tuple[bool, str]:
                 except Exception:
                     pass
 
+        _maybe_apply_deleted_lab_bonus(int(user_id))
         clear_lab_delete_pending(int(user_id))
-        _deleted_lab_log(int(user_id), "delete", "ok")
+        _deleted_lab_log(int(user_id), "delete", mode)
+
+        if mode == "game_off":
+            return True, build_game_disabled_deleted_text()
+
         return True, build_lab_deleted_text()
 
     except Exception as e:
         send_error_report("_perform_lab_delete", e)
         return False, "📑 Не удалось удалить Лабораторию."
+
+def _perform_pending_lab_delete(
+    user_id: int
+) -> tuple[bool, str, Optional[InlineKeyboardMarkup]]:
+    uid = int(user_id)
+    mode = get_lab_delete_pending_mode(uid) or "lab"
+
+    ok, text = _perform_lab_delete(
+        uid,
+        delete_mode=mode
+    )
+
+    if not ok:
+        return False, text, None
+
+    if mode == "game_off":
+        set_main_game_enabled(uid, 0)
+
+        return (
+            True,
+            build_game_disabled_deleted_text(),
+            None
+        )
+
+    return (
+        True,
+        build_inactive_lab_text(uid, after_delete=True),
+        kb_inactive_lab_actions(uid)
+    )
 
 def _restore_deleted_lab(user_id: int, *, support_mode: bool = False) -> tuple[bool, str]:
     row = get_deleted_lab_row(int(user_id))
@@ -5067,6 +5299,29 @@ def _restore_deleted_lab(user_id: int, *, support_mode: bool = False) -> tuple[b
     cd_rows = snapshot.get("infection_cooldowns") or []
     sab_rows = snapshot.get("sabotage_cooldowns") or []
 
+    current_out_rows = _rows_to_dicts(
+        db_all(
+            "SELECT * FROM infections WHERE attacker_id=? AND end_ts>?",
+            (int(user_id), int(now))
+        )
+    )
+    current_in_rows = _rows_to_dicts(
+        db_all(
+            "SELECT * FROM infections WHERE target_id=? AND end_ts>?",
+            (int(user_id), int(now))
+        )
+    )
+    current_in_keys = {
+        (int(r.get("attacker_id", 0) or 0), int(r.get("target_id", 0) or 0))
+        for r in current_in_rows
+    }
+    seen_rows = list(seen_rows or []) + _rows_to_dicts(
+        db_all("SELECT * FROM infection_seen WHERE target_id=?", (int(user_id),))
+    )
+    cd_rows = list(cd_rows or []) + _rows_to_dicts(
+        db_all("SELECT * FROM infection_cooldowns WHERE target_id=?", (int(user_id),))
+    )
+
     if "promo_uses" in snapshot:
         promo_rows = snapshot.get("promo_uses") or []
     else:
@@ -5080,6 +5335,45 @@ def _restore_deleted_lab(user_id: int, *, support_mode: bool = False) -> tuple[b
 
     lab_data["corp_id"] = 0
     lab_data["corp_name"] = ""
+    restored_epoch = int(lab_data.get("lab_epoch", 0) or 0)
+
+    merged_inf_in = {}
+    restored_inf_keys = set()
+
+    for r in list(inf_in or []):
+        try:
+            if int(r.get("target_id", 0) or 0) != int(user_id):
+                continue
+            if int(r.get("end_ts", 0) or 0) <= int(now):
+                continue
+            rr = dict(r)
+            rr["target_lab_epoch"] = int(restored_epoch)
+            key = (int(rr.get("attacker_id", 0) or 0), int(rr.get("target_id", 0) or 0))
+            restored_inf_keys.add(key)
+            merged_inf_in[key] = rr
+        except Exception:
+            continue
+
+    for r in list(current_in_rows or []):
+        try:
+            if int(r.get("target_id", 0) or 0) != int(user_id):
+                continue
+            if int(r.get("end_ts", 0) or 0) <= int(now):
+                continue
+
+            key = (int(r.get("attacker_id", 0) or 0), int(r.get("target_id", 0) or 0))
+            current_epoch = int(r.get("target_lab_epoch", 0) or 0)
+
+            if key in restored_inf_keys and current_epoch != int(restored_epoch):
+                continue
+
+            rr = dict(r)
+            rr["target_lab_epoch"] = int(restored_epoch)
+            merged_inf_in[key] = rr
+        except Exception:
+            continue
+
+    inf_in = list(merged_inf_in.values())
 
     try:
         with DB_LOCK:
@@ -5088,6 +5382,22 @@ def _restore_deleted_lab(user_id: int, *, support_mode: bool = False) -> tuple[b
                 c.execute("BEGIN")
 
                 c.execute("DELETE FROM corp_members WHERE user_id=?", (int(user_id),))
+
+                for r in current_out_rows:
+                    if (
+                        int(r.get("counted", 0) or 0) == 1
+                        and int(r.get("target_id", 0) or 0) != int(user_id)
+                        and _infection_target_visible_for_current_lab(
+                            int(r.get("target_id", 0) or 0),
+                            int(r.get("target_lab_epoch", 0) or 0)
+                        )
+                    ):
+                        c.execute(
+                            "UPDATE labs SET diseases_total=CASE WHEN COALESCE(diseases_total,0)>0 THEN diseases_total-1 ELSE 0 END "
+                            "WHERE user_id=?",
+                            (int(r.get("target_id", 0) or 0),)
+                        )
+
                 c.execute("DELETE FROM infections WHERE attacker_id=? OR target_id=?", (int(user_id), int(user_id)))
                 c.execute("DELETE FROM infection_seen WHERE attacker_id=? OR target_id=?", (int(user_id), int(user_id)))
                 c.execute("DELETE FROM infection_cooldowns WHERE attacker_id=? OR target_id=?", (int(user_id), int(user_id)))
@@ -5114,7 +5424,15 @@ def _restore_deleted_lab(user_id: int, *, support_mode: bool = False) -> tuple[b
                         f"INSERT OR REPLACE INTO infections({','.join(cols)}) VALUES ({ph})",
                         tuple(r[k] for k in cols)
                     )
-                    if int(r.get("counted", 0) or 0) == 1 and int(r.get("target_id", 0) or 0) != int(user_id):
+                    if (
+                        int(r.get("counted", 0) or 0) == 1
+                        and int(r.get("end_ts", 0) or 0) > int(now)
+                        and int(r.get("target_id", 0) or 0) != int(user_id)
+                        and _infection_target_visible_for_current_lab(
+                            int(r.get("target_id", 0) or 0),
+                            int(r.get("target_lab_epoch", 0) or 0)
+                        )
+                    ):
                         c.execute(
                             "UPDATE labs SET diseases_total=COALESCE(diseases_total,0)+1 WHERE user_id=?",
                             (int(r["target_id"]),)
@@ -5127,7 +5445,13 @@ def _restore_deleted_lab(user_id: int, *, support_mode: bool = False) -> tuple[b
                         f"INSERT OR REPLACE INTO infections({','.join(cols)}) VALUES ({ph})",
                         tuple(r[k] for k in cols)
                     )
-                    if int(r.get("counted", 0) or 0) == 1 and int(r.get("attacker_id", 0) or 0) != int(user_id):
+                    key = (int(r.get("attacker_id", 0) or 0), int(r.get("target_id", 0) or 0))
+                    if (
+                        int(r.get("counted", 0) or 0) == 1
+                        and int(r.get("end_ts", 0) or 0) > int(now)
+                        and int(r.get("attacker_id", 0) or 0) != int(user_id)
+                        and key not in current_in_keys
+                    ):
                         c.execute(
                             "UPDATE labs SET infected_total=COALESCE(infected_total,0)+1 WHERE user_id=?",
                             (int(r["attacker_id"]),)
@@ -5156,6 +5480,15 @@ def _restore_deleted_lab(user_id: int, *, support_mode: bool = False) -> tuple[b
                         f"INSERT OR REPLACE INTO promo_uses({','.join(cols)}) VALUES ({ph})",
                         tuple(r[k] for k in cols)
                     )
+
+                c.execute(
+                    "UPDATE labs SET diseases_total=("
+                    "SELECT COUNT(*) FROM infections "
+                    "WHERE target_id=? AND COALESCE(counted,0)=1 AND end_ts>? "
+                    "AND COALESCE(target_lab_epoch,0)=?"
+                    ") WHERE user_id=?",
+                    (int(user_id), int(now), int(restored_epoch), int(user_id))
+                )
 
                 if corp_meta:
                     corp = corp_by_id(int(corp_meta.get("corp_id", 0) or 0))
@@ -5527,12 +5860,83 @@ def ensure_lab_exists(user_id: int):
         db_exec("INSERT INTO labs(user_id) VALUES(?)", (uid,), commit=True)
 
 def mark_lab_active(user_id: int):
-    ensure_lab_exists(user_id)
-    db_exec("UPDATE labs SET lab_active=1 WHERE user_id=?", (int(user_id),), commit=True)
+    uid = int(user_id)
+    ensure_lab_exists(uid)
+    db_exec(
+        "UPDATE labs SET lab_active=1, "
+        "lab_epoch=CASE "
+        "WHEN COALESCE(lab_active,0)=1 THEN COALESCE(lab_epoch,0) "
+        "ELSE ? END "
+        "WHERE user_id=?",
+        (int(now_ts()), uid),
+        commit=True
+    )
+    _sync_lab_diseases_total(uid)
 
 def is_lab_active(user_id: int) -> bool:
     r = db_one("SELECT COALESCE(lab_active,0) AS a FROM labs WHERE user_id=? LIMIT 1", (int(user_id),))
     return bool(r) and int(r["a"] or 0) == 1
+
+def get_lab_epoch(user_id: int) -> int:
+    r = db_one(
+        "SELECT COALESCE(lab_epoch,0) AS e FROM labs WHERE user_id=? LIMIT 1",
+        (int(user_id),)
+    )
+    return int(r["e"] or 0) if r else 0
+
+def _infection_target_visible_for_current_lab(target_id: int, target_lab_epoch: int) -> bool:
+    r = db_one(
+        "SELECT COALESCE(lab_active,0) AS a, COALESCE(lab_epoch,0) AS e "
+        "FROM labs WHERE user_id=? LIMIT 1",
+        (int(target_id),)
+    )
+    if not r or int(r["a"] or 0) != 1:
+        return False
+    return int(r["e"] or 0) == int(target_lab_epoch or 0)
+
+def _active_infection_state(attacker_id: int, target_id: int) -> tuple[bool, bool]:
+    r = db_one(
+        "SELECT COALESCE(end_ts,0) AS end_ts, COALESCE(counted,0) AS counted, "
+        "COALESCE(target_lab_epoch,0) AS target_lab_epoch "
+        "FROM infections WHERE attacker_id=? AND target_id=? LIMIT 1",
+        (int(attacker_id), int(target_id))
+    )
+    if not r:
+        return False, False
+
+    active_counted = (
+        int(r["counted"] or 0) == 1
+        and int(r["end_ts"] or 0) > int(now_ts())
+    )
+    if not active_counted:
+        return False, False
+
+    active_visible = _infection_target_visible_for_current_lab(
+        int(target_id),
+        int(r["target_lab_epoch"] or 0)
+    )
+    return True, bool(active_visible)
+
+def _visible_diseases_count_for_current_lab(user_id: int) -> int:
+    if not is_lab_active(int(user_id)):
+        return 0
+
+    r = db_one(
+        "SELECT COUNT(*) AS c FROM infections "
+        "WHERE target_id=? AND COALESCE(counted,0)=1 AND end_ts>? "
+        "AND COALESCE(target_lab_epoch,0)=?",
+        (int(user_id), int(now_ts()), int(get_lab_epoch(int(user_id))))
+    )
+    return int(r["c"] or 0) if r else 0
+
+def _sync_lab_diseases_total(user_id: int):
+    if not is_lab_active(int(user_id)):
+        return
+    db_exec(
+        "UPDATE labs SET diseases_total=? WHERE user_id=?",
+        (int(_visible_diseases_count_for_current_lab(int(user_id))), int(user_id)),
+        commit=True
+    )
 
 def set_hide_balance(user_id: int, hide: bool):
     ensure_lab_exists(user_id)
@@ -6104,8 +6508,16 @@ def kb_corp_transfer_mix_offer(uid: int, cmd: str, target_id: int, res_amount: i
     return kb
 
 def _corp_transfer_apply(sender_id: int, target_id: int, *, res_amount: int = 0, mat_amount: int = 0) -> tuple[bool, str]:
+    sender_id = int(sender_id)
+    target_id = int(target_id)
     res_amount = int(res_amount or 0)
     mat_amount = int(mat_amount or 0)
+
+    if main_game_enabled(sender_id) == 0:
+        return False, MAIN_GAME_SELF_DISABLED_TEXT
+
+    if not main_game_target_enabled(target_id):
+        return False, MAIN_GAME_TARGET_DISABLED_TEXT
 
     if res_amount < 0 or mat_amount < 0 or (res_amount == 0 and mat_amount == 0):
         return False, "📑 Некорректная сумма перевода."
@@ -6458,6 +6870,9 @@ def _corp_request_resolve(request_id: int, actor_id: int, approved: bool) -> tup
         return False, "📑 Корпорация не найдена."
 
     if approved:
+        if not main_game_target_enabled(int(user_id)):
+            return False, MAIN_GAME_TARGET_DISABLED_TEXT
+
         if not is_lab_active(user_id):
             return False, "📑 Игрок ещё не создал свою лабораторию."
 
@@ -6683,6 +7098,9 @@ def _corp_invite_resolve(invite_id: int, actor_id: int, accepted: bool) -> tuple
     inviter_id = int(inv["invited_by"])
 
     if accepted:
+        if not main_game_target_enabled(int(user_id)):
+            return False, MAIN_GAME_TARGET_DISABLED_TEXT
+
         if not is_lab_active(user_id):
             return False, "📑 Сначала создайте лабораторию."
 
@@ -7327,6 +7745,71 @@ def _resolve_or_create_infect_target(token: str) -> Optional[int]:
         return _ensure_placeholder_user_by_username(m.group(1))
 
     return None
+
+def _resolve_known_infect_target(token: str) -> Optional[int]:
+    """
+    Возвращает только уже известного боту реального пользователя.
+    Временные placeholder-записи для заражения здесь не создаются.
+    """
+    s = str(token or "").strip()
+    if not s:
+        return None
+
+    def _known_uid(value) -> Optional[int]:
+        try:
+            uid = int(value)
+        except Exception:
+            return None
+
+        if uid <= 0:
+            return None
+
+        row = db_one(
+            "SELECT user_id FROM users "
+            "WHERE user_id=? AND COALESCE(is_placeholder,0)=0 LIMIT 1",
+            (uid,)
+        )
+        return int(uid) if row else None
+
+    m = re.search(r"tg://openmessage\?user_id=(\d+)", s, flags=re.IGNORECASE)
+    if m:
+        return _known_uid(m.group(1))
+
+    m = re.search(r"tg://user\?id=(\d+)", s, flags=re.IGNORECASE)
+    if m:
+        return _known_uid(m.group(1))
+
+    pref_uid = _extract_prefixed_numeric_id(s)
+    if pref_uid is not None:
+        return _known_uid(pref_uid)
+
+    uname = _extract_public_username_token(s)
+    if not uname:
+        m = re.search(r"@([A-Za-z0-9_]{3,64})", s)
+        if m:
+            uname = m.group(1).strip().lower()
+
+    if not uname:
+        m = re.search(
+            r"(?:https?://)?(?:t\.me|telegram\.me)/([A-Za-z0-9_]{3,64})/?",
+            s,
+            flags=re.IGNORECASE
+        )
+        if m:
+            uname = m.group(1).strip().lower()
+
+    if not uname:
+        return None
+
+    row = db_one(
+        "SELECT user_id FROM users "
+        "WHERE lower(COALESCE(username,''))=? "
+        "  AND user_id>0 "
+        "  AND COALESCE(is_placeholder,0)=0 "
+        "LIMIT 1",
+        (str(uname).lower(),)
+    )
+    return int(row["user_id"]) if row else None
 
 def _raw_name_fallback(first_name: str, last_name: str) -> str:
     fn = _strip_invisible(first_name or "").strip()
@@ -8541,6 +9024,7 @@ def _known_chats_collect_rows() -> list[dict]:
         "COALESCE(title, '') AS title, "
         "lower(COALESCE(chat_type,'')) AS chat_type, "
         "COALESCE(owner_id, 0) AS owner_id, "
+        "COALESCE(member_count, 0) AS member_count, "
         "COALESCE(updated_at, 0) AS updated_at "
         "FROM bot_group_chats "
         "WHERE COALESCE(is_active,0)=1 "
@@ -8580,7 +9064,7 @@ def _known_chats_collect_rows() -> list[dict]:
                     title = db_title
 
         owner_tag = public_user_tag(owner_id, force_standard=True) if owner_id > 0 else "неизвестно"
-        users_count = _known_chat_user_count(chat_id)
+        users_count = int(r["member_count"] or 0)
         admin_mark = _known_bot_admin_mark(chat_id)
 
         out.append({
@@ -8613,6 +9097,9 @@ def render_known_chats_text(page: int) -> tuple[str, Optional[InlineKeyboardMark
     page = max(1, min(int(page), total_pages))
     start = (page - 1) * USERS_PAGE_SIZE
     part = rows[start:start + USERS_PAGE_SIZE]
+
+    for row in part:
+        row["users_count"] = refresh_bot_group_member_count(int(row["chat_id"]))
 
     lines = []
     lines.append("📑 Список известных чатов")
@@ -8685,6 +9172,7 @@ def _known_channels_collect_rows() -> list[dict]:
         "COALESCE(title,'') AS title, "
         "lower(COALESCE(chat_type,'')) AS chat_type, "
         "COALESCE(owner_id,0) AS owner_id, "
+        "COALESCE(member_count,0) AS member_count, "
         "COALESCE(updated_at,0) AS updated_at "
         "FROM bot_group_chats "
         "WHERE COALESCE(is_active,0)=1 "
@@ -8726,7 +9214,7 @@ def _known_channels_collect_rows() -> list[dict]:
                     title = db_title
 
         owner_tag = public_user_tag(owner_id, force_standard=True) if owner_id > 0 else "неизвестно"
-        users_count = _known_chat_user_count(channel_id)
+        users_count = int(r["member_count"] or 0)
         admin_mark = _known_bot_admin_mark(channel_id)
 
         out.append({
@@ -8759,6 +9247,9 @@ def render_known_channels_text(page: int) -> tuple[str, Optional[InlineKeyboardM
     page = max(1, min(int(page), total_pages))
     start = (page - 1) * USERS_PAGE_SIZE
     part = rows[start:start + USERS_PAGE_SIZE]
+
+    for row in part:
+        row["users_count"] = refresh_bot_group_member_count(int(row["channel_id"]))
 
     lines = []
     lines.append("📑 Список известных каналов")
@@ -8839,6 +9330,10 @@ def _users_collect_rows(filters: Optional[dict] = None) -> list[dict]:
         un = (r["username"] or "").strip()
         fn = (r["first_name"] or "").strip()
         ln = (r["last_name"] or "").strip()
+
+        if uid <= 0 or not (fn or ln or un):
+            continue
+
         is_bot = int(r["is_bot"] or 0)
         lab_active = int(r["lab_active"] or 0)
         is_new = _users_is_new(int(r["first_seen"] or 0), int(r["first_seen_verified"] or 0))
@@ -9143,7 +9638,7 @@ def format_agent_line_with_status(a) -> str:
 
     return f"{h(role)} {tag} ({h(status)})"
 
-def _agents_sort_rows_by_status(rows: list) -> tuple[list, list]:
+def _agents_sort_rows_by_status(rows: list, *, hide_hidden: bool = False) -> tuple[list, list]:
     primary = []
     secondary = []
 
@@ -9151,6 +9646,9 @@ def _agents_sort_rows_by_status(rows: list) -> tuple[list, list]:
         uid = int(_agent_row_get(a, "user_id", 0) or 0)
         last_seen = int(_agent_row_get(a, "last_seen", 0) or 0)
         code = agent_status_list_code(uid, last_seen)
+
+        if bool(hide_hidden) and code == AGENT_STATUS_HIDDEN:
+            continue
 
         if code in (AGENT_STATUS_ONLINE, AGENT_STATUS_OFFLINE):
             primary.append(a)
@@ -9269,6 +9767,7 @@ def _agents_panel_owner_section_lines(uid: int) -> list[str]:
     lines.append("/agent — назначить агента техподдержки")
     lines.append("/agent_remove — снять права агента техподдержки")
     lines.append("/its + {ссылка} + {<code>бот</code>|<code>юзер</code>} — ручное редактирование списка")
+    lines.append("/reguser + {ссылка} — ручная регистрация")
     lines.append("")
     lines.append("💾 Data Base")
     lines.append("/db_fife_stat — параметры базы данных")
@@ -9505,25 +10004,49 @@ def _purge_user_for_delete(user_id: int):
 
     _purge_user_for_bot_ban(uid)
 
-    db_exec("DELETE FROM users WHERE user_id=?", (uid,), commit=True)
-    db_exec("DELETE FROM bot_bans WHERE user_id=?", (uid,), commit=True)
-    db_exec("DELETE FROM bot_owners WHERE user_id=?", (uid,), commit=True)
-
+    # Персональные настройки, активность и временные данные.
+    db_exec("DELETE FROM user_activity_seen WHERE user_id=?", (uid,), commit=True)
+    db_exec("DELETE FROM agent_status_prefs WHERE user_id=?", (uid,), commit=True)
     db_exec("DELETE FROM balance_chain_state WHERE user_id=?", (uid,), commit=True)
     db_exec("DELETE FROM quick_infect_prefs WHERE user_id=?", (uid,), commit=True)
     db_exec("DELETE FROM user_timers WHERE user_id=?", (uid,), commit=True)
     db_exec("DELETE FROM db_file_msg_schedule WHERE user_id=?", (uid,), commit=True)
     db_exec("DELETE FROM db_file_exports WHERE requested_by=?", (uid,), commit=True)
 
+    # Быстрая клавиатура, публикации и статистические посты.
+    db_exec("DELETE FROM quick_keyboard_slots WHERE user_id=?", (uid,), commit=True)
+    db_exec("DELETE FROM quick_keyboard_editor_state WHERE user_id=?", (uid,), commit=True)
+    db_exec("DELETE FROM quick_keyboard_chat_state WHERE user_id=?", (uid,), commit=True)
+    db_exec("DELETE FROM quick_keyboard_configs WHERE user_id=?", (uid,), commit=True)
+    db_exec("DELETE FROM post_channel_prefs WHERE user_id=?", (uid,), commit=True)
+    db_exec("DELETE FROM post_state WHERE user_id=?", (uid,), commit=True)
+    db_exec("DELETE FROM post_drafts WHERE user_id=?", (uid,), commit=True)
+    db_exec("DELETE FROM post_meta WHERE user_id=?", (uid,), commit=True)
+    db_exec("DELETE FROM post_publication_settings WHERE user_id=?", (uid,), commit=True)
+    db_exec("DELETE FROM post_update_drafts WHERE user_id=?", (uid,), commit=True)
+    db_exec("DELETE FROM statpost_settings WHERE user_id=?", (uid,), commit=True)
+
+    # Имена, РП, обращения и промокоды.
     db_exec("DELETE FROM user_name_restrictions WHERE user_id=?", (uid,), commit=True)
     db_exec("DELETE FROM chat_user_names WHERE user_id=?", (uid,), commit=True)
-
     db_exec("DELETE FROM personal_rp_actions WHERE user_id=?", (uid,), commit=True)
     db_exec("DELETE FROM rp_offers WHERE actor_id=? OR target_id=?", (uid, uid), commit=True)
     db_exec("DELETE FROM rp_events WHERE actor_id=? OR target_id=?", (uid, uid), commit=True)
-
+    db_exec(
+        "DELETE FROM report_answer_notices "
+        "WHERE reporter_user_id=? OR agent_user_id=? OR answered_by=?",
+        (uid, uid, uid),
+        commit=True
+    )
+    db_exec("DELETE FROM report_drafts WHERE user_id=?", (uid,), commit=True)
     db_exec("DELETE FROM promo_uses WHERE user_id=?", (uid,), commit=True)
 
+    # Остаточные игровые и соревновательные записи.
+    db_exec(
+        "DELETE FROM infection_fail_stacks WHERE attacker_id=? OR target_id=?",
+        (uid, uid),
+        commit=True
+    )
     db_exec("DELETE FROM duel_stats WHERE user_id=?", (uid,), commit=True)
     db_exec("DELETE FROM duel_bets WHERE bettor_id=? OR candidate_id=?", (uid, uid), commit=True)
     db_exec("DELETE FROM duel_invites WHERE challenger_id=? OR target_id=?", (uid, uid), commit=True)
@@ -9533,7 +10056,16 @@ def _purge_user_for_delete(user_id: int):
         commit=True
     )
 
+    # Служебные ссылки на удалённый аккаунт.
     db_exec("UPDATE bot_group_chats SET owner_id=0 WHERE owner_id=?", (uid,), commit=True)
+    db_exec("UPDATE chat_auto_delete SET updated_by=0 WHERE updated_by=?", (uid,), commit=True)
+    db_exec("UPDATE support_agents SET added_by=0 WHERE added_by=?", (uid,), commit=True)
+    db_exec("UPDATE bot_owners SET added_by=0 WHERE added_by=?", (uid,), commit=True)
+    db_exec("UPDATE bot_bans SET banned_by=0 WHERE banned_by=?", (uid,), commit=True)
+
+    db_exec("DELETE FROM bot_bans WHERE user_id=?", (uid,), commit=True)
+    db_exec("DELETE FROM bot_owners WHERE user_id=?", (uid,), commit=True)
+    db_exec("DELETE FROM users WHERE user_id=?", (uid,), commit=True)
 
 def handle_admin_service_commands(message, parsed: "Parsed"):
     uid = int(message.from_user.id)
@@ -10877,6 +11409,174 @@ def handle_owner_db_commands(message, parsed: "Parsed"):
         parse_mode="HTML"
     )
 
+def handle_reguser_command(message, parsed: "Parsed"):
+    actor_id = int(message.from_user.id)
+    upsert_user(message.from_user)
+
+    if not _post_channel_actor_can_use(actor_id):
+        bot.reply_to(
+            message,
+            "📑 Эта команда доступна только разработчику и старшим агентам.",
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
+        return
+
+    usage = (
+        "📑 Используйте формат:\n"
+        "<code>/reguser 123456789 [Имя Фамилия] [@username | https://t.me/username]</code>"
+    )
+
+    raw_args = re.sub(r"\s+", " ", str(parsed.args or "").strip())
+    parts = raw_args.split() if raw_args else []
+
+    if not parts:
+        bot.reply_to(
+            message,
+            usage,
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
+        return
+
+    raw_id = str(parts.pop(0) or "").strip()
+    target_id = _extract_prefixed_numeric_id(raw_id)
+
+    if target_id is None and re.fullmatch(r"\d{1,20}", raw_id):
+        target_id = int(raw_id)
+
+    if target_id is None or int(target_id) <= 0:
+        bot.reply_to(
+            message,
+            "📑 Укажите корректный положительный user_id.\n" + usage,
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
+        return
+
+    target_id = int(target_id)
+
+    if get_user_row(target_id):
+        bot.reply_to(
+            message,
+            f"📑 Пользователь {_support_target_tag_with_id(target_id)} уже зарегистрирован в базе бота.",
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
+        return
+
+    if get_bot_ban_row(target_id):
+        bot.reply_to(
+            message,
+            f"📑 Пользователь <code>id{target_id}</code> уже находится в базе блокировок бота.",
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
+        return
+
+    username = ""
+    if parts:
+        profile_token = str(parts[-1] or "").strip()
+        looks_like_profile = (
+            profile_token.startswith("@")
+            or re.match(
+                r"^(?:https?://)?(?:t\.me|telegram\.me)/",
+                profile_token,
+                flags=re.IGNORECASE
+            ) is not None
+        )
+
+        if looks_like_profile:
+            username = _extract_public_username_token(profile_token)
+            if not username:
+                bot.reply_to(
+                    message,
+                    "📑 Некорректный @username или Telegram-ссылка.\n" + usage,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True
+                )
+                return
+            parts.pop()
+
+    if len(parts) not in (0, 2):
+        bot.reply_to(
+            message,
+            "📑 Имя и фамилия указываются только парой.\n" + usage,
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
+        return
+
+    first_name = str(parts[0]).strip() if len(parts) == 2 else ""
+    last_name = str(parts[1]).strip() if len(parts) == 2 else ""
+
+    if len(first_name) > 64 or len(last_name) > 64:
+        bot.reply_to(
+            message,
+            "📑 Имя и фамилия не могут быть длиннее 64 символов.",
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
+        return
+
+    if username:
+        username_owner = db_one(
+            "SELECT user_id FROM users "
+            "WHERE lower(COALESCE(username,''))=? "
+            "  AND user_id>0 "
+            "  AND COALESCE(is_placeholder,0)=0 "
+            "LIMIT 1",
+            (username,)
+        )
+        if username_owner:
+            bot.reply_to(
+                message,
+                "📑 Этот @username уже привязан к другому пользователю в базе бота.",
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
+            return
+
+        username_ban = db_one(
+            "SELECT user_id FROM bot_bans "
+            "WHERE lower(COALESCE(username,''))=? LIMIT 1",
+            (username,)
+        )
+        if username_ban:
+            bot.reply_to(
+                message,
+                "📑 Этот @username заблокирован.",
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
+            return
+
+    db_exec(
+        "INSERT INTO users("
+        "user_id, username, first_name, last_name, first_seen, first_seen_verified, last_seen, "
+        "is_placeholder, is_bot, bot_status_locked"
+        ") VALUES (?,?,?,?,?,?,?,?,?,0)",
+        (
+            target_id,
+            username or None,
+            first_name or None,
+            last_name or None,
+            0,
+            1,
+            0,
+            0,
+            0,
+        ),
+        commit=True
+    )
+
+    bot.reply_to(
+        message,
+        f"✅ Пользователь {_support_target_tag_with_id(target_id)} зарегистрирован в базе бота.",
+        parse_mode="HTML",
+        disable_web_page_preview=True
+    )
+
 def handle_delete_user_db_command(message, parsed: "Parsed"):
     uid = int(message.from_user.id)
     upsert_user(message.from_user)
@@ -10988,6 +11688,295 @@ def set_notify_prefs(user_id: int, chat_id: int, off: int):
         "UPDATE users SET notify_chat_id=?, notify_off=? WHERE user_id=?",
         (int(chat_id), int(off), int(user_id)),
         commit=True
+    )
+
+def notifications_master_enabled(user_id: int) -> int:
+    r = db_one(
+        "SELECT COALESCE(notify_all_off,0) AS v FROM users WHERE user_id=?",
+        (int(user_id),)
+    )
+    return 0 if (r and int(r["v"] or 0) == 1) else 1
+
+def set_notifications_master_flag(user_id: int, enabled: int):
+    db_exec(
+        "UPDATE users SET notify_all_off=? WHERE user_id=?",
+        (0 if int(enabled) == 1 else 1, int(user_id)),
+        commit=True
+    )
+
+def set_notify_private_destination(user_id: int):
+    _chat_id, notify_off = get_notify_prefs(int(user_id))
+    set_notify_prefs(int(user_id), 0, int(notify_off))
+
+def sync_notifications_master_flag(user_id: int):
+    notify_chat_id, notify_off = get_notify_prefs(int(user_id))
+
+    game_notifications_on = not (
+        int(notify_chat_id) == 0
+        and int(notify_off) == 1
+    )
+    corp_notifications_on = corp_notify_enabled(int(user_id)) == 1
+
+    set_notifications_master_flag(
+        int(user_id),
+        1 if (game_notifications_on or corp_notifications_on) else 0
+    )
+
+def set_notifications_master_enabled(user_id: int, enabled: int):
+    uid = int(user_id)
+
+    if int(enabled) == 1:
+        notify_chat_id, _notify_off = get_notify_prefs(uid)
+
+        set_notify_prefs(
+            uid,
+            int(notify_chat_id),
+            0
+        )
+        set_corp_notify_enabled(uid, 1)
+        set_notifications_master_flag(uid, 1)
+        return
+
+    set_notify_prefs(uid, 0, 1)
+    set_corp_notify_enabled(uid, 0)
+    set_notifications_master_flag(uid, 0)
+
+def main_game_enabled(user_id: int) -> int:
+    r = db_one(
+        "SELECT COALESCE(game_enabled,1) AS v "
+        "FROM users WHERE user_id=?",
+        (int(user_id),)
+    )
+
+    if not r:
+        return 1
+
+    return 1 if int(r["v"]) == 1 else 0
+
+def set_main_game_enabled(user_id: int, enabled: int):
+    db_exec(
+        "UPDATE users SET game_enabled=? WHERE user_id=?",
+        (1 if int(enabled) == 1 else 0, int(user_id)),
+        commit=True
+    )
+
+MAIN_GAME_COMMANDS = frozenset({
+    # Основные игровые действия
+    "infect",
+    "sabotage",
+    "autoanswer_status",
+    "autoanswer_on",
+    "autoanswer_off",
+    "upgrade_preview",
+    "upgrade_buy",
+    "use_vaccine",
+    "buy_vaccine",
+
+    # Топы и игровая статистика
+    "top_users",
+    "top_users_chat",
+    "top_diseases",
+    "top_diseases_chat",
+    "top_corps",
+    "top_corps_chat",
+
+    # Корпорации
+    "corp_create",
+    "corp_delete",
+    "corp_open",
+    "corp_close",
+    "corp_rename",
+    "corp_reg",
+    "corp_info",
+    "corp_my",
+    "corp_join",
+    "corp_invite",
+    "corp_req_accept",
+    "corp_req_reject",
+    "corp_req_list",
+    "corp_deputy",
+    "corp_deputy_remove",
+    "corp_kick",
+    "corp_leave",
+    "corp_transfer_owner",
+    "corp_send_res",
+    "corp_send_mat",
+
+    # Лаборатория, болезни и патогены
+    "lab",
+    "mylab",
+    "my_victims",
+    "my_diseases",
+    "labname",
+    "labname_set",
+    "labname_clear",
+    "pathogenname",
+    "pathogenname_set",
+    "pathogenname_clear",
+    "lab_hide",
+    "lab_show",
+    "lab_delete",
+    "lab_delete_now",
+    "lab_delete_confirm_phrase",
+    "restore_lab",
+    "pathogens_info",
+    "pathogen_info",
+})
+
+def command_uses_main_game(command_name: str) -> bool:
+    return str(command_name or "").strip() in MAIN_GAME_COMMANDS
+
+def main_game_target_enabled(user_id: int) -> bool:
+    return main_game_enabled(int(user_id)) == 1
+
+def _main_game_callback_edit_current(cq, text: str):
+    try:
+        if getattr(cq, "inline_message_id", None):
+            limited_edit_message_text(
+                text=text,
+                inline_id=cq.inline_message_id,
+                parse_mode="HTML",
+                reply_markup=None,
+                disable_web_page_preview=True
+            )
+            return
+
+        if getattr(cq, "message", None):
+            limited_edit_message_text(
+                text=text,
+                chat_id=cq.message.chat.id,
+                msg_id=cq.message.message_id,
+                parse_mode="HTML",
+                reply_markup=None,
+                disable_web_page_preview=True
+            )
+    except Exception:
+        pass
+
+def _main_game_callback_guard(
+    cq,
+    user_id: int,
+    *,
+    target: bool = False,
+    edit_current: bool = False
+) -> bool:
+    try:
+        uid = int(user_id or 0)
+    except Exception:
+        uid = 0
+
+    if uid <= 0:
+        return False
+
+    if main_game_target_enabled(uid):
+        return False
+
+    text = MAIN_GAME_TARGET_DISABLED_TEXT if bool(target) else MAIN_GAME_SELF_DISABLED_TEXT
+    alert_text = (
+        MAIN_GAME_TARGET_DISABLED_TEXT
+        if bool(target)
+        else "❎ Вы отключили участие в основной игре.\nДля включения используйте команду «Био +игра»."
+    )
+
+    if bool(edit_current):
+        _main_game_callback_edit_current(cq, text)
+
+    try:
+        bot.answer_callback_query(
+            cq.id,
+            alert_text,
+            show_alert=True
+        )
+    except Exception:
+        pass
+
+    return True
+
+def apply_main_game_preference(
+    user_id: int,
+    enabled: int
+) -> tuple[str, str, Optional[InlineKeyboardMarkup]]:
+    uid = int(user_id)
+    turn_on = int(enabled) == 1
+
+    if turn_on:
+        if main_game_enabled(uid) == 1:
+            return "noop", "ℹ️ Участие в основной игре уже включено.", None
+
+        deleted_row = get_deleted_lab_row(uid)
+        deleted_meta = _load_deleted_meta(deleted_row) if deleted_row else {}
+        deleted_by_game_off = int(
+            deleted_meta.get("game_off_delete", 0) or 0
+        ) == 1
+
+        if deleted_row and deleted_by_game_off:
+            deleted_at = int(deleted_row["deleted_at"] or 0)
+
+            if now_ts() <= deleted_at + 3 * 86400:
+                restored, restore_text = _restore_deleted_lab(
+                    uid,
+                    support_mode=False
+                )
+
+                if not restored:
+                    return "error", restore_text, None
+
+                set_main_game_enabled(uid, 1)
+
+                return (
+                    "changed",
+                    "✅ Вы включили участие в основной игре.\n"
+                    "✅ Лаборатория восстановлена.",
+                    None
+                )
+
+        set_main_game_enabled(uid, 1)
+
+        if deleted_row and deleted_by_game_off:
+            return (
+                "changed",
+                "✅ Вы включили участие в основной игре.\n\n"
+                "⚠️ Период автоматического восстановления "
+                "Лаборатории истёк.",
+                None
+            )
+
+        return (
+            "changed",
+            "✅ Вы включили участие в основной игре.",
+            None
+        )
+
+    if main_game_enabled(uid) == 0:
+        return (
+            "noop",
+            "ℹ️ Участие в основной игре уже отключено.",
+            None
+        )
+
+    if is_lab_active(uid):
+        lock_text = build_lab_recreate_lock_text(uid)
+
+        if lock_text:
+            return "error", lock_text, None
+
+        set_lab_delete_pending(
+            uid,
+            mode="game_off"
+        )
+
+        return (
+            "confirm",
+            build_game_disable_confirm_text(),
+            kb_lab_delete_confirm(uid)
+        )
+
+    set_main_game_enabled(uid, 0)
+
+    return (
+        "changed",
+        MAIN_GAME_SELF_DISABLED_TEXT,
+        None
     )
 
 def rp_commands_enabled(user_id: int) -> int:
@@ -11282,7 +12271,15 @@ def send_user_notification(
 
     try:
         notify_chat_id, notify_off = get_notify_prefs(uid)
-        if respect_notify_off and int(notify_off) == 1 and int(notify_chat_id) == 0:
+
+        if notifications_master_enabled(uid) != 1:
+            return None
+
+        if (
+            respect_notify_off
+            and int(notify_off) == 1
+            and int(notify_chat_id) == 0
+        ):
             return None
 
         pm_opened = get_pm_opened(uid)
@@ -11693,37 +12690,80 @@ def render_settings_text(user_id: int, current_chat_id: int = 0) -> str:
     current_chat_id = int(current_chat_id or 0)
 
     lab_row = db_one(
-        "SELECT COALESCE(hide_balance,0) AS hb, COALESCE(hide_lab,0) AS hl, COALESCE(lab_active,0) AS la "
+        "SELECT COALESCE(hide_balance,0) AS hb, "
+        "COALESCE(hide_lab,0) AS hl, "
+        "COALESCE(lab_active,0) AS la "
         "FROM labs WHERE user_id=? LIMIT 1",
         (uid,)
     )
-    has_active_lab = bool(lab_row) and int(lab_row["la"] or 0) == 1
+
+    has_active_lab = (
+        bool(lab_row)
+        and int(lab_row["la"] or 0) == 1
+    )
+    game_enabled = main_game_enabled(uid) == 1
+
+    hb = int(lab_row["hb"] or 0) if lab_row else 0
+    hl = int(lab_row["hl"] or 0) if lab_row else 0
+
+    bal_txt = "🔒" if hb == 1 else "🔓"
 
     if has_active_lab:
-        hb = int(lab_row["hb"] or 0)
-        hl = int(lab_row["hl"] or 0)
-        bal_txt = "🔒" if hb == 1 else "🔓"
         lab_txt = "🔒" if hl == 1 else "🔓"
     else:
-        bal_txt = "❌"
         lab_txt = "❌"
 
     notify_chat_id, notify_off = get_notify_prefs(uid)
-    if int(notify_off) == 1 and int(notify_chat_id) == 0:
-        notify_txt = "🔇"
+
+    game_notify_enabled = not (
+        int(notify_off) == 1
+        and int(notify_chat_id) == 0
+    )
+
+    if not game_notify_enabled:
+        game_notify_txt = "🔇"
     elif int(notify_chat_id) != 0:
-        notify_txt = f"{h(_get_chat_title_cached(int(notify_chat_id)))} 🔊"
+        game_notify_txt = (
+            f"{h(_get_chat_title_cached(int(notify_chat_id)))} 🔊"
+        )
     else:
-        notify_txt = "личные сообщения 🔊"
+        game_notify_txt = "личные сообщения 🔊"
 
     deleted_row = get_deleted_lab_row(uid)
     cid, _cname, role = _user_corp_role_soft(uid)
 
+    corp_notify_on = (
+        int(cid) > 0
+        and corp_notify_enabled(uid) == 1
+    )
+    master_notify_on = (
+        notifications_master_enabled(uid) == 1
+    )
+
+    if not master_notify_on:
+        master_notify_txt = "🔇"
+    elif (
+        int(cid) > 0
+        and bool(game_notify_enabled) != bool(corp_notify_on)
+    ):
+        master_notify_txt = "частично 🔊"
+    elif (
+        game_notify_enabled
+        and (int(cid) <= 0 or corp_notify_on)
+    ):
+        master_notify_txt = "🔊"
+    else:
+        master_notify_txt = "частично 🔊"
+
     title = "⚙️ Параметры"
+
     if current_chat_id < 0:
         row = get_user_row(uid)
-        chat_name = get_chat_user_name(int(current_chat_id), int(uid))
-    
+        chat_name = get_chat_user_name(
+            int(current_chat_id),
+            int(uid)
+        )
+
         if row:
             shown_name = chat_name or standard_display_name(
                 row["first_name"] or "",
@@ -11731,6 +12771,7 @@ def render_settings_text(user_id: int, current_chat_id: int = 0) -> str:
                 row["username"] or "",
                 int(uid)
             )
+
             shown_tag = tg_mention(
                 int(uid),
                 shown_name,
@@ -11738,143 +12779,347 @@ def render_settings_text(user_id: int, current_chat_id: int = 0) -> str:
             )
         else:
             shown_name = chat_name or str(int(uid))
-            shown_tag = tg_mention(int(uid), shown_name)
-    
+            shown_tag = tg_mention(
+                int(uid),
+                shown_name
+            )
+
         title = f"⚙️ Параметры <b>«{shown_tag}»</b>"
 
-    lines = []
-    lines.append(title)
-    lines.append("")
-    lines.append("ПРИВАТНЫЕ НАСТРОЙКИ:")
-    lines.append(f"👤 Пол: {gender_label(uid)}")
-    lines.append(f"💰 Баланс: {bal_txt}")
-    lines.append(f"🔬 Досье лаборатории: {lab_txt}")
-    lines.append(f"🗨️ РП-команды: {'⭕' if rp_commands_enabled(uid) == 1 else '❌'}")
-    if _agent_status_actor_can_use(uid):
-        lines.append(f"Статус: {h(agent_status_settings_label(uid))}")
-    lines.append("")
-    lines.append("УВЕДОМЛЕНИЯ:")
-    lines.append(f"Уведомления: {notify_txt}")
+    lines = [
+        title,
+        "",
+        "ПРИВАТНЫЕ НАСТРОЙКИ:",
+        f"👤 Пол: {gender_label(uid)}",
+        f"💰 Баланс: {bal_txt}",
+    ]
 
-    if int(cid) > 0:
-        corp_notify_txt = "🔊" if corp_notify_enabled(uid) == 1 else "🔇"
-        lines.append(f"Корпоративные уведомления: {corp_notify_txt}")
+    if game_enabled:
+        lines.append(
+            f"🔬 Досье лаборатории: {lab_txt}"
+        )
+
+    lines.append(
+        f"🗨️ РП-команды: "
+        f"{'⭕' if rp_commands_enabled(uid) == 1 else '❌'}"
+    )
+    lines.append(
+        f"🎮 Основная игра: "
+        f"{'⭕' if game_enabled else '❌'}"
+    )
+
+    if _agent_status_actor_can_use(uid):
+        lines.append(
+            f"Статус: {h(agent_status_settings_label(uid))}"
+        )
+
+    lines.extend([
+        "",
+        "УВЕДОМЛЕНИЯ:",
+        f"Уведомления: {master_notify_txt}",
+    ])
+
+    if master_notify_on:
+        lines.append(
+            f"Игровые уведомления: {game_notify_txt}"
+        )
+
+        if int(cid) > 0:
+            corp_notify_txt = (
+                "🔊" if corp_notify_on else "🔇"
+            )
+
+            lines.append(
+                f"Корпоративные уведомления: "
+                f"{corp_notify_txt}"
+            )
 
     if deleted_row:
-        lines.append("")
-        lines.append("⌛ Восстановление лаборатории")
-        lines.append(f"{_settings_restore_timer_text(uid)}")
+        lines.extend([
+            "",
+            "⌛ Восстановление лаборатории",
+            _settings_restore_timer_text(uid),
+        ])
 
     return "\n".join(lines)
 
 def kb_settings(
         user_id: int,
-        current_chat_id: int = 0, 
+        current_chat_id: int = 0,
         current_chat_type: str = "private"
 ) -> InlineKeyboardMarkup:
     uid = int(user_id)
     kb = InlineKeyboardMarkup(row_width=2)
+    is_private_settings = str(current_chat_type or "").lower() == "private"
 
     lab_row = db_one(
-        "SELECT COALESCE(hide_balance,0) AS hb, COALESCE(hide_lab,0) AS hl, COALESCE(lab_active,0) AS la "
+        "SELECT COALESCE(hide_balance,0) AS hb, "
+        "COALESCE(hide_lab,0) AS hl, "
+        "COALESCE(lab_active,0) AS la "
         "FROM labs WHERE user_id=? LIMIT 1",
         (uid,)
     )
-    has_active_lab = bool(lab_row) and int(lab_row["la"] or 0) == 1
 
-    if has_active_lab:
-        hb = int(lab_row["hb"] or 0)
-        hl = int(lab_row["hl"] or 0)
+    has_active_lab = (
+        bool(lab_row)
+        and int(lab_row["la"] or 0) == 1
+    )
+    game_enabled = main_game_enabled(uid) == 1
 
-        kb.row(
-            _ikb(
-                "Открыть баланс" if hb == 1 else "Скрыть баланс",
-                callback_data=_settings_cb(uid, "HB"),
-                style=("success" if hb == 1 else "danger")
-            ),
-            _ikb(
-                "Открыть досье" if hl == 1 else "Скрыть досье",
-                callback_data=_settings_cb(uid, "HL"),
-                style=("success" if hl == 1 else "danger")
+    hb = int(lab_row["hb"] or 0) if lab_row else 0
+    hl = int(lab_row["hl"] or 0) if lab_row else 0
+
+    privacy_buttons = [
+        _ikb(
+            "Открыть баланс"
+            if hb == 1
+            else "Скрыть баланс",
+            callback_data=_settings_cb(uid, "HB"),
+            style=(
+                "success"
+                if hb == 1
+                else "danger"
             )
         )
+    ]
+
+    if has_active_lab and game_enabled:
+        privacy_buttons.append(
+            _ikb(
+                "Открыть досье"
+                if hl == 1
+                else "Скрыть досье",
+                callback_data=_settings_cb(uid, "HL"),
+                style=(
+                    "success"
+                    if hl == 1
+                    else "danger"
+                )
+            )
+        )
+
+    kb.row(*privacy_buttons)
 
     g = get_user_gender(uid)
     rp_en = rp_commands_enabled(uid)
-    
-    if _agent_status_actor_can_use(uid):
-        kb.row(
-            _ikb(
-                f"Пол: {'Мужской' if g == 'male' else 'Женский'}",
-                callback_data=_settings_cb(uid, "G"),
-                style="primary"
-            ),
+
+    private_buttons = [
+        _ikb(
+            f"Пол: "
+            f"{'Мужской' if g == 'male' else 'Женский'}",
+            callback_data=_settings_cb(uid, "G"),
+            style="primary"
+        )
+    ]
+
+    if is_private_settings and _agent_status_actor_can_use(uid):
+        private_buttons.append(
             _ikb(
                 agent_status_button_label(uid),
                 callback_data=_settings_cb(uid, "ST")
-            ),
-            _ikb(
-                "Выключить РП" if rp_en == 1 else "Включить РП",
-                callback_data=_settings_cb(uid, "RP"),
-                style=("danger" if rp_en == 1 else "success")
-            )
-        )
-    else:
-        kb.row(
-            _ikb(
-                f"Пол: {'Мужской' if g == 'male' else 'Женский'}",
-                callback_data=_settings_cb(uid, "G"),
-                style="primary"
-            ),
-            _ikb(
-                "Выключить РП" if rp_en == 1 else "Включить РП",
-                callback_data=_settings_cb(uid, "RP"),
-                style=("danger" if rp_en == 1 else "success")
             )
         )
 
-    notify_chat_id, notify_off = get_notify_prefs(uid)
-    can_show_chat_notify = (
-        str(current_chat_type or "").lower() in ("group", "supergroup")
-        and int(current_chat_id) != 0
-        and (int(notify_chat_id) != int(current_chat_id) or int(notify_off) == 1)
+    private_buttons.append(
+        _ikb(
+            "Выключить РП"
+            if rp_en == 1
+            else "Включить РП",
+            callback_data=_settings_cb(uid, "RP"),
+            style=(
+                "danger"
+                if rp_en == 1
+                else "success"
+            )
+        )
     )
 
-    if int(notify_off) == 1 and int(notify_chat_id) == 0:
+    if is_private_settings:
+        private_buttons.append(
+            _ikb(
+                "Выключить игру"
+                if game_enabled
+                else "Включить игру",
+                callback_data=_settings_cb(uid, "GAME"),
+                style=(
+                    "danger"
+                    if game_enabled
+                    else "success"
+                )
+            )
+        )
+
+    kb.row(*private_buttons)
+
+    master_notify_on = (
+        notifications_master_enabled(uid) == 1
+    )
+
+    kb.add(
+        _ikb(
+            "Отключить уведомления"
+            if master_notify_on
+            else "Включить уведомления",
+            callback_data=_settings_cb(uid, "NA"),
+            style=(
+                "danger"
+                if master_notify_on
+                else "success"
+            )
+        )
+    )
+
+    if (
+        not master_notify_on
+        and str(current_chat_type or "").lower() == "private"
+    ):
+        kb.add(
+            _ikb(
+                "⌨️ Клавиатура",
+                callback_data=_settings_cb(uid, "QK"),
+                style="primary"
+            )
+        )
+
+    if not master_notify_on:
+        return kb
+
+    notify_chat_id, notify_off = get_notify_prefs(uid)
+
+    can_show_chat_notify = (
+        str(current_chat_type or "").lower()
+        in ("group", "supergroup")
+        and int(current_chat_id) != 0
+        and (
+            int(notify_chat_id) != int(current_chat_id)
+            or int(notify_off) == 1
+        )
+    )
+
+    if (
+        int(notify_off) == 1
+        and int(notify_chat_id) == 0
+    ):
         if can_show_chat_notify:
             kb.row(
-                _ikb("Уведомления в этот чат", callback_data=_settings_cb(uid, "NCHAT"), style="primary"),
-                _ikb("Включить уведомления в ЛС", callback_data=_settings_cb(uid, "NPM"), style="success")
+                _ikb(
+                    "Игр.уведомления в этот чат",
+                    callback_data=_settings_cb(
+                        uid,
+                        "NCHAT"
+                    ),
+                    style="primary"
+                ),
+                _ikb(
+                    "Игр.уведомления в ЛС",
+                    callback_data=_settings_cb(
+                        uid,
+                        "NPM"
+                    ),
+                    style="success"
+                )
             )
         else:
-            kb.add(_ikb("Включить уведомления в ЛС", callback_data=_settings_cb(uid, "NPM"), style="success"))
+            kb.add(
+                _ikb(
+                    "Игр.уведомления в ЛС",
+                    callback_data=_settings_cb(
+                        uid,
+                        "NPM"
+                    ),
+                    style="success"
+                )
+            )
 
     elif int(notify_chat_id) == 0:
         if can_show_chat_notify:
             kb.row(
-                _ikb("Уведомления в этот чат", callback_data=_settings_cb(uid, "NCHAT"), style="primary"),
-                _ikb("Отключить уведомления", callback_data=_settings_cb(uid, "NOFF"), style="danger")
+                _ikb(
+                    "Игр.уведомления в этот чат",
+                    callback_data=_settings_cb(
+                        uid,
+                        "NCHAT"
+                    ),
+                    style="primary"
+                ),
+                _ikb(
+                    "Отключить игровые уведомления",
+                    callback_data=_settings_cb(
+                        uid,
+                        "NOFF"
+                    ),
+                    style="danger"
+                )
             )
         else:
-            kb.add(_ikb("Отключить уведомления", callback_data=_settings_cb(uid, "NOFF"), style="danger"))
+            kb.add(
+                _ikb(
+                    "Отключить игровые уведомления",
+                    callback_data=_settings_cb(
+                        uid,
+                        "NOFF"
+                    ),
+                    style="danger"
+                )
+            )
 
     else:
         kb.row(
-            _ikb("Уведомления в ЛС", callback_data=_settings_cb(uid, "NPM"), style="primary"),
-            _ikb("Отключить уведомления", callback_data=_settings_cb(uid, "NOFF"), style="danger")
+            _ikb(
+                "Игр.уведомления в ЛС",
+                callback_data=_settings_cb(
+                    uid,
+                    "NPM"
+                ),
+                style="primary"
+            ),
+            _ikb(
+                "Отключить игровые уведомления",
+                callback_data=_settings_cb(
+                    uid,
+                    "NOFF"
+                ),
+                style="danger"
+            )
         )
 
         if can_show_chat_notify:
-            kb.add(_ikb("Уведомления в этот чат", callback_data=_settings_cb(uid, "NCHAT"), style="primary"))
+            kb.add(
+                _ikb(
+                    "Игр.уведомления в этот чат",
+                    callback_data=_settings_cb(
+                        uid,
+                        "NCHAT"
+                    ),
+                    style="primary"
+                )
+            )
 
     _cid, _cname, role = _user_corp_role_soft(uid)
+
     if int(_cid) > 0:
         en = corp_notify_enabled(uid)
+
         kb.add(
             _ikb(
-                "Выключить корп. уведомления" if en == 1 else "Включить корп. уведомления",
+                "Отключить корп. уведомления"
+                if en == 1
+                else "Включить корп. уведомления",
                 callback_data=_settings_cb(uid, "CN"),
-                style=("danger" if en == 1 else "success")
+                style=(
+                    "danger"
+                    if en == 1
+                    else "success"
+                )
+            )
+        )
+
+    if str(current_chat_type or "").lower() == "private":
+        kb.add(
+            _ikb(
+                "⌨️ Клавиатура",
+                callback_data=_settings_cb(uid, "QK"),
+                style="primary"
             )
         )
 
@@ -13431,8 +14676,6 @@ def _activity_track_callback_query(cq):
 
         if chat and chat_type in ("group", "supergroup"):
             remember_chat_member(chat_id, user, activity=True)
-
-        autodelete_refresh_inline_button_message(cq)
     except Exception:
         pass
 
@@ -13452,180 +14695,32 @@ def _activity_track_inline_query(iq):
     except Exception:
         pass
 
-def _activity_track_chat_member_update(update):
+def _activity_track_chat_member_update(update, *, is_bot_update: bool = False):
     try:
         chat = getattr(update, "chat", None)
-        chat_id = int(getattr(chat, "id", 0) or 0) if chat else 0
-
-        actor = getattr(update, "from_user", None)
-        if actor:
-            activity_mark_user(
-                actor,
-                source="member_event_actor",
-                chat_id=chat_id,
-                message_id=0,
-                touch_user_last_seen=True
-            )
-
-        new_cm = getattr(update, "new_chat_member", None)
-        subject = getattr(new_cm, "user", None) if new_cm else None
-        if subject:
-            activity_mark_user(
-                subject,
-                source="member_event_subject",
-                chat_id=chat_id,
-                message_id=0,
-                touch_user_last_seen=True
-            )
-    except Exception:
-        pass
-
-def _activity_scan_update(update):
-    try:
-        msg = getattr(update, "message", None)
-        if msg:
-            _activity_track_message(msg)
-
-        edited_msg = getattr(update, "edited_message", None)
-        if edited_msg:
-            _activity_track_message(edited_msg)
-
-        cq = getattr(update, "callback_query", None)
-        if cq:
-            _activity_track_callback_query(cq)
-
-        iq = getattr(update, "inline_query", None)
-        if iq:
-            _activity_track_inline_query(iq)
-
-        cmu = getattr(update, "chat_member", None)
-        if cmu:
-            _activity_track_chat_member_update(cmu)
-
-        my_cmu = getattr(update, "my_chat_member", None)
-        if my_cmu:
-            _activity_track_chat_member_update(my_cmu)
-    except Exception:
-        pass
-
-def install_activity_tracking_hook():
-    global _ACTIVITY_HOOK_INSTALLED
-
-    if _ACTIVITY_HOOK_INSTALLED:
-        return
-
-    original_process_new_updates = bot.process_new_updates
-
-    def _wrapped_process_new_updates(updates):
-        try:
-            for upd in (updates or []):
-                _activity_scan_update(upd)
-        except Exception:
-            pass
-
-        return original_process_new_updates(updates)
-
-    bot.process_new_updates = _wrapped_process_new_updates
-    _ACTIVITY_HOOK_INSTALLED = True_ACTIVITY_HOOK_INSTALLED = False
-
-def _activity_message_source(message) -> str:
-    chat_type = (getattr(getattr(message, "chat", None), "type", "") or "").lower()
-
-    if chat_type == "private":
-        return "message_private"
-
-    if chat_type in ("group", "supergroup"):
-        return "message_group"
-
-    return "message_other"
-
-def _activity_track_message(message):
-    try:
-        chat = getattr(message, "chat", None)
-        chat_type = (getattr(chat, "type", "") or "").lower()
-
-        if chat_type == "channel":
-            return
-
-        if is_channel_sender_message(message):
-            return
-
-        user = getattr(message, "from_user", None)
-        if not user:
-            return
-
-        chat_id = int(getattr(chat, "id", 0) or 0)
-        msg_id = int(getattr(message, "message_id", 0) or 0)
-
-        activity_mark_user(
-            user,
-            source=_activity_message_source(message),
-            chat_id=chat_id,
-            message_id=msg_id,
-            touch_user_last_seen=True
-        )
-
-        if chat_type in ("group", "supergroup"):
-            remember_chat_member(chat_id, user, activity=True)
-
-        for nu in (getattr(message, "new_chat_members", None) or []):
-            if nu:
-                activity_mark_user(
-                    nu,
-                    source="member_event_subject",
-                    chat_id=chat_id,
-                    message_id=msg_id,
-                    touch_user_last_seen=True
-                )
-                if chat_type in ("group", "supergroup"):
-                    remember_chat_member(chat_id, nu, activity=True)
-    except Exception:
-        pass
-
-def _activity_track_callback_query(cq):
-    try:
-        user = getattr(cq, "from_user", None)
-        if not user:
-            return
-
-        msg = getattr(cq, "message", None)
-        chat = getattr(msg, "chat", None) if msg else None
         chat_id = int(getattr(chat, "id", 0) or 0) if chat else 0
         chat_type = (getattr(chat, "type", "") or "").lower() if chat else ""
 
-        activity_mark_user(
-            user,
-            source="callback",
-            chat_id=chat_id,
-            message_id=int(getattr(msg, "message_id", 0) or 0) if msg else 0,
-            touch_user_last_seen=True
-        )
-
-        if chat and chat_type in ("group", "supergroup"):
-            remember_chat_member(chat_id, user, activity=True)
-    except Exception:
-        pass
-
-def _activity_track_inline_query(iq):
-    try:
-        user = getattr(iq, "from_user", None)
-        if not user:
+        if chat_id == 0:
             return
 
-        activity_mark_user(
-            user,
-            source="inline_query",
-            chat_id=0,
-            message_id=0,
-            touch_user_last_seen=True
+        new_cm = getattr(update, "new_chat_member", None)
+        status = (getattr(new_cm, "status", "") or "").lower() if new_cm else ""
+        chat_title = (
+            getattr(chat, "title", None)
+            or getattr(chat, "full_name", None)
+            or getattr(chat, "first_name", None)
+            or ""
         )
-    except Exception:
-        pass
 
-def _activity_track_chat_member_update(update):
-    try:
-        chat = getattr(update, "chat", None)
-        chat_id = int(getattr(chat, "id", 0) or 0) if chat else 0
+        if chat_type in ("group", "supergroup", "channel"):
+            bot_left_chat = bool(is_bot_update) and status in ("left", "kicked")
+            remember_bot_group_chat(
+                chat_id,
+                title=str(chat_title or ""),
+                chat_type=chat_type,
+                is_active=0 if bot_left_chat else 1
+            )
 
         actor = getattr(update, "from_user", None)
         if actor:
@@ -13637,7 +14732,9 @@ def _activity_track_chat_member_update(update):
                 touch_user_last_seen=True
             )
 
-        new_cm = getattr(update, "new_chat_member", None)
+            if chat_type in ("group", "supergroup"):
+                remember_chat_member(chat_id, actor, activity=True)
+
         subject = getattr(new_cm, "user", None) if new_cm else None
         if subject:
             activity_mark_user(
@@ -13647,6 +14744,25 @@ def _activity_track_chat_member_update(update):
                 message_id=0,
                 touch_user_last_seen=True
             )
+
+            if chat_type in ("group", "supergroup"):
+                restricted_not_member = (
+                    status == "restricted"
+                    and not bool(getattr(new_cm, "is_member", True))
+                )
+                is_removed = status in ("left", "kicked") or restricted_not_member
+
+                if is_removed:
+                    db_exec(
+                        "DELETE FROM chat_members WHERE chat_id=? AND user_id=?",
+                        (chat_id, int(subject.id)),
+                        commit=True
+                    )
+                else:
+                    remember_chat_member(chat_id, subject, activity=True)
+
+        if chat_type in ("group", "supergroup", "channel"):
+            refresh_bot_group_member_count(chat_id, force=True)
     except Exception:
         pass
 
@@ -13670,11 +14786,11 @@ def _activity_scan_update(update):
 
         cmu = getattr(update, "chat_member", None)
         if cmu:
-            _activity_track_chat_member_update(cmu)
+            _activity_track_chat_member_update(cmu, is_bot_update=False)
 
         my_cmu = getattr(update, "my_chat_member", None)
         if my_cmu:
-            _activity_track_chat_member_update(my_cmu)
+            _activity_track_chat_member_update(my_cmu, is_bot_update=True)
     except Exception:
         pass
 
@@ -13754,6 +14870,52 @@ def remember_bot_group_chat(chat_id: int, title: str = "", chat_type: str = "gro
         commit=True
     )
 
+BOT_GROUP_MEMBER_COUNT_TTL_SEC = 5 * 60
+
+def refresh_bot_group_member_count(chat_id: int, *, force: bool = False) -> int:
+    cid = int(chat_id)
+    now = int(now_ts())
+
+    row = db_one(
+        "SELECT COALESCE(member_count,0) AS member_count, "
+        "COALESCE(member_count_updated_at,0) AS member_count_updated_at "
+        "FROM bot_group_chats WHERE chat_id=? LIMIT 1",
+        (cid,)
+    )
+
+    cached_count = int(row["member_count"] or 0) if row else 0
+    cached_at = int(row["member_count_updated_at"] or 0) if row else 0
+
+    if (
+        not bool(force)
+        and cached_at > 0
+        and (now - cached_at) < BOT_GROUP_MEMBER_COUNT_TTL_SEC
+    ):
+        return max(0, cached_count)
+
+    try:
+        try:
+            actual_count = int(bot.get_chat_member_count(cid))
+        except AttributeError:
+            actual_count = int(bot.get_chat_members_count(cid))
+    except Exception:
+        if row:
+            db_exec(
+                "UPDATE bot_group_chats SET member_count_updated_at=? WHERE chat_id=?",
+                (now, cid),
+                commit=True
+            )
+        return max(0, cached_count)
+
+    db_exec(
+        "UPDATE bot_group_chats "
+        "SET member_count=?, member_count_updated_at=? "
+        "WHERE chat_id=?",
+        (max(0, actual_count), now, cid),
+        commit=True
+    )
+    return max(0, actual_count)
+
 def forget_bot_channel(chat_id: int):
     cid = int(chat_id)
 
@@ -13786,7 +14948,16 @@ def forget_bot_channel(chat_id: int):
         pass
 
 def _users_total_count() -> int:
-    row = db_one("SELECT COUNT(*) AS c FROM users WHERE COALESCE(is_bot,0)=0")
+    row = db_one(
+        "SELECT COUNT(*) AS c FROM users "
+        "WHERE user_id>0 "
+        "  AND COALESCE(is_bot,0)=0 "
+        "  AND ("
+        "      COALESCE(NULLIF(TRIM(first_name),''),'')<>'' "
+        "      OR COALESCE(NULLIF(TRIM(last_name),''),'')<>'' "
+        "      OR COALESCE(NULLIF(TRIM(username),''),'')<>''"
+        "  )"
+    )
     return int(row["c"] or 0) if row else 0
 
 def _users_bot_count() -> int:
@@ -14131,6 +15302,18 @@ def post_draft_clear(user_id: int):
 def post_meta_clear(user_id: int):
     db_exec("DELETE FROM post_meta WHERE user_id=?", (int(user_id),), commit=True)
 
+def post_publication_settings_clear(user_id: int):
+    try:
+        post_publication_settings_delete_screen_message(int(user_id))
+    except Exception:
+        pass
+
+    db_exec(
+        "DELETE FROM post_publication_settings WHERE user_id=?",
+        (int(user_id),),
+        commit=True
+    )
+
 def post_update_delete_menu_message(user_id: int):
     row = db_one(
         "SELECT COALESCE(menu_chat_id,0) AS chat_id, COALESCE(menu_message_id,0) AS message_id "
@@ -14168,6 +15351,7 @@ def post_state_clear(user_id: int):
 
     post_draft_clear(uid)
     post_meta_clear(uid)
+    post_publication_settings_clear(uid)
     post_update_clear(uid)
     db_exec("DELETE FROM post_state WHERE user_id=?", (uid,), commit=True)
 
@@ -14215,6 +15399,1346 @@ def post_meta_set(user_id: int, post_kind: str, *, promo_enabled: int = "POST_PR
 
 def post_meta_kind(user_id: int) -> str:
     return str(post_meta_get(int(user_id)).get("post_kind") or POST_KIND_UPDATE)
+
+def post_kind_supports_publication_settings(post_kind: str) -> bool:
+    return str(post_kind or "").strip().lower() in (POST_KIND_PROJECTS, POST_KIND_AD)
+
+def post_publication_settings_available(user_id: int) -> bool:
+    stage, _created_ts = post_state_get(int(user_id))
+    if str(stage or "") != POST_STAGE_CHANNEL:
+        return False
+    return post_kind_supports_publication_settings(post_meta_kind(int(user_id)))
+
+def _post_publication_settings_default(user_id: int) -> dict:
+    return {
+        "user_id": int(user_id),
+        "preview_enabled": 1,
+        "links_as_buttons_enabled": 1,
+        "buttons_json": "[]",
+        "hashtags_json": "[]",
+        "hashtags_vertical": 1,
+        "selected_button_index": None,
+        "selected_hashtag_index": None,
+        "screen_mode": "",
+        "screen_chat_id": 0,
+        "screen_message_id": 0,
+        "updated_at": 0,
+    }
+
+def _post_publication_settings_row(user_id: int):
+    return db_one(
+        "SELECT user_id, preview_enabled, links_as_buttons_enabled, buttons_json, hashtags_json, "
+        "hashtags_vertical, selected_button_index, selected_hashtag_index, screen_mode, "
+        "screen_chat_id, screen_message_id, updated_at "
+        "FROM post_publication_settings WHERE user_id=? LIMIT 1",
+        (int(user_id),)
+    )
+
+def _post_publication_settings_to_dict(row, user_id: int) -> dict:
+    if not row:
+        return _post_publication_settings_default(int(user_id))
+
+    selected_button_index = row["selected_button_index"]
+    selected_hashtag_index = row["selected_hashtag_index"]
+
+    return {
+        "user_id": int(row["user_id"] or user_id),
+        "preview_enabled": 1 if int(row["preview_enabled"] or 0) == 1 else 0,
+        "links_as_buttons_enabled": 1 if int(row["links_as_buttons_enabled"] or 0) == 1 else 0,
+        "buttons_json": str(row["buttons_json"] or "[]"),
+        "hashtags_json": str(row["hashtags_json"] or "[]"),
+        "hashtags_vertical": 1 if int(row["hashtags_vertical"] or 0) == 1 else 0,
+        "selected_button_index": None if selected_button_index is None else int(selected_button_index),
+        "selected_hashtag_index": None if selected_hashtag_index is None else int(selected_hashtag_index),
+        "screen_mode": str(row["screen_mode"] or ""),
+        "screen_chat_id": int(row["screen_chat_id"] or 0),
+        "screen_message_id": int(row["screen_message_id"] or 0),
+        "updated_at": int(row["updated_at"] or 0),
+    }
+
+def post_publication_settings_get(user_id: int) -> dict:
+    uid = int(user_id)
+    db_exec(
+        "INSERT OR IGNORE INTO post_publication_settings(user_id, updated_at) VALUES (?,?)",
+        (uid, int(now_ts())),
+        commit=True
+    )
+    return _post_publication_settings_to_dict(_post_publication_settings_row(uid), uid)
+
+def post_publication_settings_set_flag(user_id: int, field_name: str, value: int):
+    uid = int(user_id)
+    field = str(field_name or "").strip()
+    if field not in ("preview_enabled", "links_as_buttons_enabled"):
+        return
+
+    post_publication_settings_get(uid)
+    db_exec(
+        f"UPDATE post_publication_settings SET {field}=?, updated_at=? WHERE user_id=?",
+        (1 if int(value or 0) == 1 else 0, int(now_ts()), uid),
+        commit=True
+    )
+
+def post_publication_settings_store_screen(user_id: int, mode: str, chat_id: int, message_id: int):
+    uid = int(user_id)
+    post_publication_settings_get(uid)
+    db_exec(
+        "UPDATE post_publication_settings "
+        "SET screen_mode=?, screen_chat_id=?, screen_message_id=?, updated_at=? "
+        "WHERE user_id=?",
+        (
+            str(mode or ""),
+            int(chat_id or 0),
+            int(message_id or 0),
+            int(now_ts()),
+            uid
+        ),
+        commit=True
+    )
+
+def post_publication_settings_delete_screen_message(user_id: int):
+    uid = int(user_id)
+    row = _post_publication_settings_row(uid)
+    if not row:
+        return
+
+    chat_id = int(row["screen_chat_id"] or 0)
+    message_id = int(row["screen_message_id"] or 0)
+
+    if chat_id != 0 and message_id > 0:
+        try:
+            bot.delete_message(chat_id, message_id)
+        except Exception:
+            pass
+
+    db_exec(
+        "UPDATE post_publication_settings "
+        "SET screen_mode='', screen_chat_id=0, screen_message_id=0, updated_at=? "
+        "WHERE user_id=?",
+        (int(now_ts()), uid),
+        commit=True
+    )
+
+def post_publication_settings_screen_matches(user_id: int, chat_id: int, message_id: int) -> bool:
+    row = _post_publication_settings_row(int(user_id))
+    if not row:
+        return False
+    return (
+        int(row["screen_chat_id"] or 0) == int(chat_id or 0)
+        and int(row["screen_message_id"] or 0) == int(message_id or 0)
+    )
+
+def _post_publication_button_empty_slots() -> list:
+    return [None for _ in range(POST_PUBLICATION_BUTTON_SLOTS)]
+
+def _post_publication_button_normalize(item) -> Optional[dict]:
+    if not isinstance(item, dict):
+        return None
+
+    source_url = _post_url_normalize(str(item.get("source_url") or item.get("url") or ""))
+    if not source_url:
+        return None
+
+    kind, username = _post_link_kind_and_username(source_url)
+    button_url = _post_link_button_url(source_url, kind)
+    source = "auto" if str(item.get("source") or "").strip().lower() == "auto" else "manual"
+    label = str(item.get("label") or "").strip() or _post_default_button_text(kind)
+
+    return {
+        "url": button_url,
+        "source_url": source_url,
+        "kind": kind,
+        "username": username,
+        "label": label,
+        "source": source,
+    }
+
+def _post_publication_buttons_load(raw_json: str) -> dict:
+    slots = _post_publication_button_empty_slots()
+    initialized = False
+    changed = False
+    raw_slots = []
+
+    try:
+        data = json.loads(str(raw_json or "[]"))
+    except Exception:
+        data = []
+
+    if isinstance(data, dict):
+        initialized = bool(data.get("initialized", False))
+        changed = bool(data.get("changed", False))
+        raw_slots = data.get("slots") or []
+    elif isinstance(data, list):
+        # Совместимость с ранним пустым форматом [].
+        raw_slots = data
+        initialized = bool(raw_slots)
+        changed = bool(raw_slots)
+
+    if not isinstance(raw_slots, list):
+        raw_slots = []
+
+    for index, item in enumerate(raw_slots[:POST_PUBLICATION_BUTTON_SLOTS]):
+        slots[index] = _post_publication_button_normalize(item)
+
+    return {
+        "initialized": bool(initialized),
+        "changed": bool(changed),
+        "slots": slots,
+    }
+
+def _post_publication_buttons_dump(slots: list, *, initialized: bool, changed: bool) -> str:
+    prepared = _post_publication_button_empty_slots()
+
+    for index, item in enumerate(list(slots or [])[:POST_PUBLICATION_BUTTON_SLOTS]):
+        prepared[index] = _post_publication_button_normalize(item)
+
+    return json.dumps(
+        {
+            "initialized": bool(initialized),
+            "changed": bool(changed),
+            "slots": prepared,
+        },
+        ensure_ascii=False
+    )
+
+def _post_publication_button_default_slots(user_id: int, links_enabled: bool) -> list:
+    slots = _post_publication_button_empty_slots()
+    if not bool(links_enabled):
+        return slots
+
+    draft = post_draft_get(int(user_id))
+    links = _post_collect_links_for_buttons(
+        str(draft.get("text_html") or ""),
+        max_links=POST_PUBLICATION_BUTTON_SLOTS
+    )
+
+    for index, link in enumerate(links[:POST_PUBLICATION_BUTTON_SLOTS]):
+        source_url = _post_url_normalize(str(link.get("source_url") or link.get("url") or ""))
+        if not source_url:
+            continue
+
+        kind, username = _post_link_kind_and_username(source_url)
+        slots[index] = {
+            "url": _post_link_button_url(source_url, kind),
+            "source_url": source_url,
+            "kind": kind,
+            "username": username,
+            "label": _post_default_button_text(kind),
+            "source": "auto",
+        }
+
+    return slots
+
+def post_publication_buttons_save(
+    user_id: int,
+    slots: list,
+    *,
+    initialized: bool,
+    changed: bool,
+    selected_index: Optional[int] = None
+):
+    uid = int(user_id)
+    post_publication_settings_get(uid)
+
+    selected = selected_index
+    if selected is not None:
+        try:
+            selected = int(selected)
+        except Exception:
+            selected = None
+
+    if selected is not None and not (0 <= selected < POST_PUBLICATION_BUTTON_SLOTS):
+        selected = None
+
+    db_exec(
+        "UPDATE post_publication_settings "
+        "SET buttons_json=?, selected_button_index=?, updated_at=? "
+        "WHERE user_id=?",
+        (
+            _post_publication_buttons_dump(
+                slots,
+                initialized=bool(initialized),
+                changed=bool(changed)
+            ),
+            selected,
+            int(now_ts()),
+            uid
+        ),
+        commit=True
+    )
+
+def post_publication_buttons_state(user_id: int, *, refresh_defaults: bool = False) -> dict:
+    uid = int(user_id)
+    settings = post_publication_settings_get(uid)
+    payload = _post_publication_buttons_load(str(settings.get("buttons_json") or "[]"))
+
+    selected = settings.get("selected_button_index")
+    if selected is not None:
+        try:
+            selected = int(selected)
+        except Exception:
+            selected = None
+
+    if selected is not None and not (0 <= selected < POST_PUBLICATION_BUTTON_SLOTS):
+        selected = None
+
+    should_build_defaults = (
+        (not bool(payload.get("initialized")))
+        or (bool(refresh_defaults) and not bool(payload.get("changed")))
+    )
+
+    if should_build_defaults:
+        slots = _post_publication_button_default_slots(
+            uid,
+            bool(int(settings.get("links_as_buttons_enabled") or 0) == 1)
+        )
+        post_publication_buttons_save(
+            uid,
+            slots,
+            initialized=True,
+            changed=False,
+            selected_index=selected
+        )
+        payload = {
+            "initialized": True,
+            "changed": False,
+            "slots": slots,
+        }
+
+    return {
+        "initialized": bool(payload.get("initialized")),
+        "changed": bool(payload.get("changed")),
+        "slots": list(payload.get("slots") or _post_publication_button_empty_slots()),
+        "selected_index": selected,
+    }
+
+def post_publication_buttons_clear_selection(user_id: int):
+    state = post_publication_buttons_state(int(user_id))
+    if state.get("selected_index") is None:
+        return
+
+    post_publication_buttons_save(
+        int(user_id),
+        state["slots"],
+        initialized=bool(state["initialized"]),
+        changed=bool(state["changed"]),
+        selected_index=None
+    )
+
+def post_publication_buttons_select(user_id: int, slot_index: int) -> tuple[bool, str]:
+    uid = int(user_id)
+
+    try:
+        target_index = int(slot_index)
+    except Exception:
+        return False, "Некорректная позиция кнопки."
+
+    if not (0 <= target_index < POST_PUBLICATION_BUTTON_SLOTS):
+        return False, "Некорректная позиция кнопки."
+
+    state = post_publication_buttons_state(uid)
+    slots = list(state["slots"])
+    selected = state.get("selected_index")
+
+    if selected is None:
+        next_selected = target_index
+        changed = bool(state["changed"])
+    elif int(selected) == target_index:
+        next_selected = None
+        changed = bool(state["changed"])
+    else:
+        slots[int(selected)], slots[target_index] = slots[target_index], slots[int(selected)]
+        next_selected = None
+        changed = True
+
+    post_publication_buttons_save(
+        uid,
+        slots,
+        initialized=True,
+        changed=changed,
+        selected_index=next_selected
+    )
+    return True, ""
+
+def post_publication_buttons_delete_selected(user_id: int) -> tuple[bool, str]:
+    uid = int(user_id)
+    state = post_publication_buttons_state(uid)
+    selected = state.get("selected_index")
+
+    if selected is None:
+        return False, "Сначала выберите заполненную позицию."
+
+    if not (0 <= int(selected) < POST_PUBLICATION_BUTTON_SLOTS):
+        return False, "Некорректная позиция кнопки."
+
+    slots = list(state["slots"])
+    if not slots[int(selected)]:
+        return False, "В выбранной позиции нет кнопки."
+
+    slots[int(selected)] = None
+
+    post_publication_buttons_save(
+        uid,
+        slots,
+        initialized=True,
+        changed=True,
+        selected_index=None
+    )
+    return True, ""
+
+def post_publication_buttons_reset_to_default(user_id: int):
+    uid = int(user_id)
+    settings = post_publication_settings_get(uid)
+
+    slots = _post_publication_button_default_slots(
+        uid,
+        bool(int(settings.get("links_as_buttons_enabled") or 0) == 1)
+    )
+
+    post_publication_buttons_save(
+        uid,
+        slots,
+        initialized=True,
+        changed=False,
+        selected_index=None
+    )
+
+def _post_publication_button_slot_action(slot_index: int) -> str:
+    return f"{POST_SETTINGS_ACTION_BUTTON_SLOT_PREFIX}{int(slot_index)}"
+
+def _post_publication_button_slot_from_action(action: str) -> Optional[int]:
+    raw = str(action or "").strip()
+    prefix = str(POST_SETTINGS_ACTION_BUTTON_SLOT_PREFIX)
+
+    if not raw.startswith(prefix):
+        return None
+
+    tail = raw[len(prefix):]
+    if not tail.isdigit():
+        return None
+
+    index = int(tail)
+    if not (0 <= index < POST_PUBLICATION_BUTTON_SLOTS):
+        return None
+
+    return index
+
+def _post_publication_button_parse_input(raw_text: str) -> tuple[Optional[dict], str]:
+    lines = [str(line or "").strip() for line in str(raw_text or "").splitlines()]
+
+    while lines and not lines[0]:
+        lines.pop(0)
+
+    while lines and not lines[-1]:
+        lines.pop()
+
+    if not lines:
+        return None, "📑 Отправьте ссылку или нажмите «Отмена»."
+
+    source_url = _post_url_normalize(lines[0])
+    if not source_url:
+        return (
+            None,
+            "📑 В первой строке должна быть корректная ссылка: "
+            "<code>https://...</code>, <code>t.me/...</code> или <code>@username</code>."
+        )
+
+    custom_label = re.sub(r"\s+", " ", " ".join(lines[1:])).strip()
+    if custom_label and len(custom_label) > POST_PUBLICATION_BUTTON_TITLE_MAX_LEN:
+        return (
+            None,
+            f"📑 Название кнопки может содержать не более "
+            f"{POST_PUBLICATION_BUTTON_TITLE_MAX_LEN} символов."
+        )
+
+    kind, username = _post_link_kind_and_username(source_url)
+
+    return {
+        "url": _post_link_button_url(source_url, kind),
+        "source_url": source_url,
+        "kind": kind,
+        "username": username,
+        "label": custom_label or _post_default_button_text(kind),
+        "source": "manual",
+    }, ""
+
+def post_publication_buttons_accept_input(user_id: int, raw_text: str) -> tuple[bool, bool, str]:
+    uid = int(user_id)
+
+    if not post_publication_settings_available(uid):
+        return False, False, ""
+
+    settings = post_publication_settings_get(uid)
+    if str(settings.get("screen_mode") or "") != POST_SETTINGS_MODE_BUTTONS:
+        return False, False, ""
+
+    state = post_publication_buttons_state(uid)
+    selected = state.get("selected_index")
+
+    if selected is None:
+        return False, False, ""
+
+    if not (0 <= int(selected) < POST_PUBLICATION_BUTTON_SLOTS):
+        post_publication_buttons_clear_selection(uid)
+        return False, False, ""
+
+    item, error_text = _post_publication_button_parse_input(raw_text)
+    if item is None:
+        return True, False, error_text
+
+    slots = list(state["slots"])
+    slots[int(selected)] = item
+
+    post_publication_buttons_save(
+        uid,
+        slots,
+        initialized=True,
+        changed=True,
+        selected_index=None
+    )
+    return True, True, "✅ Кнопка сохранена."
+
+def render_post_publication_buttons_text(user_id: int) -> str:
+    state = post_publication_buttons_state(int(user_id), refresh_defaults=True)
+    selected = state.get("selected_index")
+
+    if selected is None:
+        hint = (
+            "Выберите позицию. Повторное нажатие снимает выбор, "
+            "а нажатие на другую позицию меняет их местами."
+        )
+    else:
+        hint = (
+            f"Выбрана позиция <b>{int(selected) + 1}</b>.\n"
+            "Отправьте ссылку в первой строке и название кнопки во второй. "
+            "Название можно не указывать."
+        )
+
+    return (
+        "🔗 Кнопки публикации\n\n"
+        "<blockquote expandable>ИНСТРУКЦИЯ\n\n"
+        f"{hint}\n"
+        "Пустая позиция обозначается «—». "
+        "Автоматические кнопки формируются из ссылок текущего черновика."
+        "</blockquote>"
+    )
+
+def kb_post_publication_buttons_editor(user_id: int) -> InlineKeyboardMarkup:
+    uid = int(user_id)
+    state = post_publication_buttons_state(uid, refresh_defaults=True)
+    slots = list(state["slots"])
+    selected = state.get("selected_index")
+
+    kb = InlineKeyboardMarkup(row_width=POST_PUBLICATION_BUTTONS_PER_ROW)
+
+    for row_start in range(0, POST_PUBLICATION_BUTTON_SLOTS, POST_PUBLICATION_BUTTONS_PER_ROW):
+        row = []
+
+        for index in range(row_start, row_start + POST_PUBLICATION_BUTTONS_PER_ROW):
+            item = slots[index]
+            title = str(item.get("label") or "") if item else "—"
+            style = "primary" if selected is not None and int(selected) == index else None
+
+            row.append(
+                _ikb(
+                    title,
+                    callback_data=_post_publication_settings_cb(
+                        uid,
+                        _post_publication_button_slot_action(index)
+                    ),
+                    style=style
+                )
+            )
+
+        kb.row(*row)
+
+    system_row = []
+
+    if bool(state.get("changed")):
+        system_row.append(
+            _ikb(
+                "По умолчанию",
+                callback_data=_post_publication_settings_cb(uid, POST_SETTINGS_ACTION_BUTTON_DEFAULT),
+                style="danger"
+            )
+        )
+
+    if (
+        selected is not None
+        and 0 <= int(selected) < POST_PUBLICATION_BUTTON_SLOTS
+        and slots[int(selected)]
+    ):
+        system_row.append(
+            _ikb(
+                "Удалить",
+                callback_data=_post_publication_settings_cb(uid, POST_SETTINGS_ACTION_BUTTON_DELETE),
+                style="danger"
+            )
+        )
+
+    if system_row:
+        kb.row(*system_row)
+
+    kb.row(
+        _ikb(
+            "❰ К настройкам",
+            callback_data=_post_publication_settings_cb(uid, POST_SETTINGS_ACTION_BUTTON_BACK)
+        )
+    )
+    return kb
+
+def _post_publication_settings_edit_screen(
+    user_id: int,
+    text: str,
+    reply_markup,
+    mode: str,
+    *,
+    cq=None
+) -> bool:
+    uid = int(user_id)
+    chat_id = 0
+    message_id = 0
+
+    if cq is not None and getattr(cq, "message", None):
+        chat_id = int(cq.message.chat.id)
+        message_id = int(cq.message.message_id)
+    else:
+        settings = post_publication_settings_get(uid)
+        chat_id = int(settings.get("screen_chat_id") or 0)
+        message_id = int(settings.get("screen_message_id") or 0)
+
+    if chat_id == 0 or message_id <= 0:
+        return False
+
+    limited_edit_message_text(
+        text=str(text or ""),
+        chat_id=chat_id,
+        msg_id=message_id,
+        parse_mode="HTML",
+        reply_markup=reply_markup,
+        disable_web_page_preview=True
+    )
+    post_publication_settings_store_screen(uid, str(mode or ""), chat_id, message_id)
+    return True
+
+def edit_post_publication_buttons_message(cq, user_id: int) -> bool:
+    uid = int(user_id)
+    return _post_publication_settings_edit_screen(
+        uid,
+        render_post_publication_buttons_text(uid),
+        kb_post_publication_buttons_editor(uid),
+        POST_SETTINGS_MODE_BUTTONS,
+        cq=cq
+    )
+
+def refresh_post_publication_buttons_screen(user_id: int) -> bool:
+    uid = int(user_id)
+    return _post_publication_settings_edit_screen(
+        uid,
+        render_post_publication_buttons_text(uid),
+        kb_post_publication_buttons_editor(uid),
+        POST_SETTINGS_MODE_BUTTONS
+    )
+
+def kb_post_publication_buttons(user_id: int) -> Optional[InlineKeyboardMarkup]:
+    uid = int(user_id)
+    settings = post_publication_settings_get(uid)
+    state = post_publication_buttons_state(uid, refresh_defaults=True)
+    slots = list(state["slots"])
+    links_enabled = int(settings.get("links_as_buttons_enabled") or 0) == 1
+
+    kb = InlineKeyboardMarkup(row_width=POST_PUBLICATION_BUTTONS_PER_ROW)
+    has_buttons = False
+
+    for row_start in range(0, POST_PUBLICATION_BUTTON_SLOTS, POST_PUBLICATION_BUTTONS_PER_ROW):
+        row = []
+
+        for index in range(row_start, row_start + POST_PUBLICATION_BUTTONS_PER_ROW):
+            item = slots[index]
+            if not item:
+                continue
+
+            if str(item.get("source") or "") == "auto" and not links_enabled:
+                continue
+
+            label = str(item.get("label") or _post_default_button_text(str(item.get("kind") or "")))
+            style = None
+
+            if (
+                str(item.get("source") or "") == "auto"
+                and str(item.get("kind") or "") == "bot"
+                and label == _post_default_button_text("bot")
+            ):
+                style = "success"
+
+            row.append(
+                _ikb(
+                    label,
+                    url=str(item.get("url") or ""),
+                    style=style
+                )
+            )
+
+        if row:
+            kb.row(*row)
+            has_buttons = True
+
+    return kb if has_buttons else None
+
+# РЕДАКТОР ХЕШТЕГОВ ПУБЛИКАЦИИ
+def _post_publication_hashtag_empty_slots() -> list:
+    return [None for _ in range(POST_PUBLICATION_HASHTAG_SLOTS)]
+
+def _post_publication_hashtag_name_normalize(raw_name: str) -> str:
+    name = str(raw_name or "").strip()
+
+    while name.startswith("#"):
+        name = name[1:].strip()
+
+    if not name or any(ch.isspace() for ch in name):
+        return ""
+
+    if not re.fullmatch(r"[\w]+", name, flags=re.UNICODE):
+        return ""
+
+    return name
+
+def _post_publication_hashtag_username_clean(raw_username: str) -> str:
+    username = str(raw_username or "").strip().lstrip("@")
+    if not re.fullmatch(r"[A-Za-z0-9_]{3,64}", username):
+        return ""
+    return username
+
+def _post_publication_hashtag_username_from_link(raw_link: str) -> str:
+    source = str(raw_link or "").strip()
+    if not source:
+        return ""
+
+    if source.startswith("@"):
+        return _post_publication_hashtag_username_clean(source)
+
+    normalized = _post_url_normalize(source)
+    if not normalized:
+        return ""
+
+    m = re.search(
+        r"(?:https?://)?(?:t\.me|telegram\.me)/(?:s/)?([A-Za-z0-9_]{3,64})",
+        normalized,
+        flags=re.IGNORECASE
+    )
+    if not m:
+        return ""
+
+    return _post_publication_hashtag_username_clean(m.group(1))
+
+def _post_publication_hashtag_normalize(item) -> Optional[dict]:
+    if not isinstance(item, dict):
+        return None
+
+    name = _post_publication_hashtag_name_normalize(
+        str(item.get("name") or item.get("label") or "")
+    )
+    if not name:
+        return None
+
+    raw_username = str(item.get("username") or "").strip()
+    username = _post_publication_hashtag_username_clean(raw_username)
+
+    if not username and raw_username:
+        username = _post_publication_hashtag_username_from_link(raw_username)
+
+    source = (
+        "default"
+        if str(item.get("source") or "").strip().lower() == "default"
+        else "manual"
+    )
+
+    return {
+        "name": name,
+        "username": username,
+        "source": source,
+    }
+
+def _post_publication_hashtags_load(raw_json: str) -> dict:
+    slots = _post_publication_hashtag_empty_slots()
+    initialized = False
+    changed = False
+    raw_slots = []
+
+    try:
+        data = json.loads(str(raw_json or "[]"))
+    except Exception:
+        data = []
+
+    if isinstance(data, dict):
+        initialized = bool(data.get("initialized", False))
+        changed = bool(data.get("changed", False))
+        raw_slots = data.get("slots") or []
+    elif isinstance(data, list):
+        raw_slots = data
+        initialized = bool(raw_slots)
+        changed = bool(raw_slots)
+
+    if not isinstance(raw_slots, list):
+        raw_slots = []
+
+    for index, item in enumerate(raw_slots[:POST_PUBLICATION_HASHTAG_SLOTS]):
+        slots[index] = _post_publication_hashtag_normalize(item)
+
+    return {
+        "initialized": bool(initialized),
+        "changed": bool(changed),
+        "slots": slots,
+    }
+
+def _post_publication_hashtags_dump(slots: list, *, initialized: bool, changed: bool) -> str:
+    prepared = _post_publication_hashtag_empty_slots()
+
+    for index, item in enumerate(list(slots or [])[:POST_PUBLICATION_HASHTAG_SLOTS]):
+        prepared[index] = _post_publication_hashtag_normalize(item)
+
+    return json.dumps(
+        {
+            "initialized": bool(initialized),
+            "changed": bool(changed),
+            "slots": prepared,
+        },
+        ensure_ascii=False
+    )
+
+def _post_publication_hashtag_default_slots(user_id: int) -> list:
+    uid = int(user_id)
+    slots = _post_publication_hashtag_empty_slots()
+    selected_channel = _post_channel_selected_row(uid)
+    channel_id = int(selected_channel["channel_id"] or 0) if selected_channel else 0
+    draft = post_draft_get(uid)
+
+    items = _post_default_hashtag_items(
+        post_meta_kind(uid),
+        channel_id,
+        str(draft.get("text_html") or "")
+    )
+
+    for index, item in enumerate(items[:POST_PUBLICATION_HASHTAG_SLOTS]):
+        slots[index] = _post_publication_hashtag_normalize(item)
+
+    return slots
+
+def post_publication_hashtags_save(
+    user_id: int,
+    slots: list,
+    *,
+    initialized: bool,
+    changed: bool,
+    selected_index: Optional[int] = None
+):
+    uid = int(user_id)
+    post_publication_settings_get(uid)
+
+    selected = selected_index
+    if selected is not None:
+        try:
+            selected = int(selected)
+        except Exception:
+            selected = None
+
+    if selected is not None and not (0 <= selected < POST_PUBLICATION_HASHTAG_SLOTS):
+        selected = None
+
+    db_exec(
+        "UPDATE post_publication_settings "
+        "SET hashtags_json=?, selected_hashtag_index=?, updated_at=? "
+        "WHERE user_id=?",
+        (
+            _post_publication_hashtags_dump(
+                slots,
+                initialized=bool(initialized),
+                changed=bool(changed)
+            ),
+            selected,
+            int(now_ts()),
+            uid
+        ),
+        commit=True
+    )
+
+def post_publication_hashtags_state(user_id: int, *, refresh_defaults: bool = False) -> dict:
+    uid = int(user_id)
+    settings = post_publication_settings_get(uid)
+    payload = _post_publication_hashtags_load(str(settings.get("hashtags_json") or "[]"))
+
+    selected = settings.get("selected_hashtag_index")
+    if selected is not None:
+        try:
+            selected = int(selected)
+        except Exception:
+            selected = None
+
+    if selected is not None and not (0 <= selected < POST_PUBLICATION_HASHTAG_SLOTS):
+        selected = None
+
+    should_build_defaults = (
+        (not bool(payload.get("initialized")))
+        or (bool(refresh_defaults) and not bool(payload.get("changed")))
+    )
+
+    if should_build_defaults:
+        slots = _post_publication_hashtag_default_slots(uid)
+        post_publication_hashtags_save(
+            uid,
+            slots,
+            initialized=True,
+            changed=False,
+            selected_index=selected
+        )
+        payload = {
+            "initialized": True,
+            "changed": False,
+            "slots": slots,
+        }
+
+    return {
+        "initialized": bool(payload.get("initialized")),
+        "changed": bool(payload.get("changed")),
+        "slots": list(payload.get("slots") or _post_publication_hashtag_empty_slots()),
+        "selected_index": selected,
+    }
+
+def post_publication_hashtags_clear_selection(user_id: int):
+    state = post_publication_hashtags_state(int(user_id))
+    if state.get("selected_index") is None:
+        return
+
+    post_publication_hashtags_save(
+        int(user_id),
+        state["slots"],
+        initialized=bool(state["initialized"]),
+        changed=bool(state["changed"]),
+        selected_index=None
+    )
+
+def post_publication_hashtags_select(user_id: int, slot_index: int) -> tuple[bool, str]:
+    uid = int(user_id)
+
+    try:
+        target_index = int(slot_index)
+    except Exception:
+        return False, "Некорректная позиция хештега."
+
+    if not (0 <= target_index < POST_PUBLICATION_HASHTAG_SLOTS):
+        return False, "Некорректная позиция хештега."
+
+    state = post_publication_hashtags_state(uid)
+    slots = list(state["slots"])
+    selected = state.get("selected_index")
+
+    if selected is None:
+        next_selected = target_index
+        changed = bool(state["changed"])
+    elif int(selected) == target_index:
+        next_selected = None
+        changed = bool(state["changed"])
+    else:
+        slots[int(selected)], slots[target_index] = slots[target_index], slots[int(selected)]
+        next_selected = None
+        changed = True
+
+    post_publication_hashtags_save(
+        uid,
+        slots,
+        initialized=True,
+        changed=changed,
+        selected_index=next_selected
+    )
+    return True, ""
+
+def post_publication_hashtags_delete_selected(user_id: int) -> tuple[bool, str]:
+    uid = int(user_id)
+    state = post_publication_hashtags_state(uid)
+    selected = state.get("selected_index")
+
+    if selected is None:
+        return False, "Сначала выберите заполненную позицию."
+
+    if not (0 <= int(selected) < POST_PUBLICATION_HASHTAG_SLOTS):
+        return False, "Некорректная позиция хештега."
+
+    slots = list(state["slots"])
+    if not slots[int(selected)]:
+        return False, "В выбранной позиции нет хештега."
+
+    slots[int(selected)] = None
+
+    post_publication_hashtags_save(
+        uid,
+        slots,
+        initialized=True,
+        changed=True,
+        selected_index=None
+    )
+    return True, ""
+
+def post_publication_hashtags_reset_to_default(user_id: int):
+    uid = int(user_id)
+    post_publication_hashtags_save(
+        uid,
+        _post_publication_hashtag_default_slots(uid),
+        initialized=True,
+        changed=False,
+        selected_index=None
+    )
+
+def post_publication_hashtags_toggle_format(user_id: int):
+    uid = int(user_id)
+    settings = post_publication_settings_get(uid)
+    vertical = 0 if int(settings.get("hashtags_vertical") or 0) == 1 else 1
+
+    db_exec(
+        "UPDATE post_publication_settings "
+        "SET hashtags_vertical=?, updated_at=? WHERE user_id=?",
+        (int(vertical), int(now_ts()), uid),
+        commit=True
+    )
+
+def _post_publication_hashtag_slot_action(slot_index: int) -> str:
+    return f"{POST_SETTINGS_ACTION_HASHTAG_SLOT_PREFIX}{int(slot_index)}"
+
+def _post_publication_hashtag_slot_from_action(action: str) -> Optional[int]:
+    raw = str(action or "").strip()
+    prefix = str(POST_SETTINGS_ACTION_HASHTAG_SLOT_PREFIX)
+
+    if not raw.startswith(prefix):
+        return None
+
+    tail = raw[len(prefix):]
+    if not tail.isdigit():
+        return None
+
+    index = int(tail)
+    if not (0 <= index < POST_PUBLICATION_HASHTAG_SLOTS):
+        return None
+
+    return index
+
+def _post_publication_hashtag_parse_input(raw_text: str) -> tuple[Optional[dict], str]:
+    lines = [str(line or "").strip() for line in str(raw_text or "").splitlines()]
+
+    while lines and not lines[0]:
+        lines.pop(0)
+
+    while lines and not lines[-1]:
+        lines.pop()
+
+    if not lines:
+        return None, "📑 Отправьте название хештега или нажмите «Отмена»."
+
+    if len(lines) > 2:
+        return None, "📑 Для хештега используйте не более двух строк: название и ссылка."
+
+    name = _post_publication_hashtag_name_normalize(lines[0])
+    if not name:
+        return (
+            None,
+            "📑 Название хештега может содержать только буквы, цифры и символ подчёркивания."
+        )
+
+    username = ""
+    if len(lines) == 2 and lines[1]:
+        username = _post_publication_hashtag_username_from_link(lines[1])
+        if not username:
+            return (
+                None,
+                "📑 Во второй строке укажите ссылку на Telegram-канал или бота, "
+                "например <code>https://t.me/example</code> или <code>@example</code>."
+            )
+
+    return {
+        "name": name,
+        "username": username,
+        "source": "manual",
+    }, ""
+
+def post_publication_hashtags_accept_input(user_id: int, raw_text: str) -> tuple[bool, bool, str]:
+    uid = int(user_id)
+
+    if not post_publication_settings_available(uid):
+        return False, False, ""
+
+    settings = post_publication_settings_get(uid)
+    if str(settings.get("screen_mode") or "") != POST_SETTINGS_MODE_HASHTAGS:
+        return False, False, ""
+
+    state = post_publication_hashtags_state(uid)
+    selected = state.get("selected_index")
+
+    if selected is None:
+        return False, False, ""
+
+    if not (0 <= int(selected) < POST_PUBLICATION_HASHTAG_SLOTS):
+        post_publication_hashtags_clear_selection(uid)
+        return False, False, ""
+
+    item, error_text = _post_publication_hashtag_parse_input(raw_text)
+    if item is None:
+        return True, False, error_text
+
+    slots = list(state["slots"])
+    slots[int(selected)] = item
+
+    post_publication_hashtags_save(
+        uid,
+        slots,
+        initialized=True,
+        changed=True,
+        selected_index=None
+    )
+    return True, True, "✅ Хештег сохранён."
+
+def _post_publication_hashtag_label(item: Optional[dict]) -> str:
+    if not item:
+        return "—"
+    return f"#{str(item.get('name') or '')}"
+
+def _post_publication_hashtag_html(item: Optional[dict]) -> str:
+    if not item:
+        return ""
+
+    name = _post_publication_hashtag_name_normalize(str(item.get("name") or ""))
+    if not name:
+        return ""
+
+    username = _post_publication_hashtag_username_clean(str(item.get("username") or ""))
+    return f"#{h(name)}@{h(username)}" if username else f"#{h(name)}"
+
+def render_post_publication_hashtags_text(user_id: int) -> str:
+    state = post_publication_hashtags_state(int(user_id), refresh_defaults=True)
+    slots = list(state.get("slots") or [])
+    selected = state.get("selected_index")
+
+    if selected is None:
+        hint = (
+            "Выберите позицию. Повторное нажатие снимает выбор, "
+            "а нажатие на другую позицию меняет их местами."
+        )
+    else:
+        selected_item = (
+            slots[int(selected)]
+            if 0 <= int(selected) < len(slots)
+            else None
+        )
+        selected_tag = _post_publication_hashtag_html(selected_item)
+
+        if selected_tag:
+            hint = (
+                f"Выбран хештег: <code>{selected_tag}</code>\n\n"
+                "Отправьте название в первой строке и Telegram-ссылку во второй. "
+                "Ссылка необязательна."
+            )
+        else:
+            hint = (
+                f"Выбрана позиция <b>{int(selected) + 1}</b>.\n"
+                "Отправьте название в первой строке и Telegram-ссылку во второй. "
+                "Ссылка необязательна."
+            )
+
+    return (
+        "🏷️ Хештеги публикации\n\n"
+        "<blockquote expandable>ИНСТРУКЦИЯ\n\n"
+        f"{hint}\n"
+        "Пустая позиция обозначается «—»."
+        "</blockquote>"
+    )
+
+def kb_post_publication_hashtags_editor(user_id: int) -> InlineKeyboardMarkup:
+    uid = int(user_id)
+    state = post_publication_hashtags_state(uid, refresh_defaults=True)
+    settings = post_publication_settings_get(uid)
+    slots = list(state["slots"])
+    selected = state.get("selected_index")
+    vertical = int(settings.get("hashtags_vertical") or 0) == 1
+
+    kb = InlineKeyboardMarkup(row_width=POST_PUBLICATION_HASHTAG_SLOTS)
+    slot_buttons = []
+
+    for index in range(POST_PUBLICATION_HASHTAG_SLOTS):
+        style = "primary" if selected is not None and int(selected) == index else None
+        slot_buttons.append(
+            _ikb(
+                _post_publication_hashtag_label(slots[index]),
+                callback_data=_post_publication_settings_cb(
+                    uid,
+                    _post_publication_hashtag_slot_action(index)
+                ),
+                style=style
+            )
+        )
+
+    kb.row(*slot_buttons)
+
+    system_row = [
+        _ikb(
+            "По умолчанию",
+            callback_data=_post_publication_settings_cb(uid, POST_SETTINGS_ACTION_HASHTAG_DEFAULT),
+            style="danger"
+        )
+    ]
+
+    if (
+        selected is not None
+        and 0 <= int(selected) < POST_PUBLICATION_HASHTAG_SLOTS
+        and slots[int(selected)]
+    ):
+        system_row.append(
+            _ikb(
+                "Удалить",
+                callback_data=_post_publication_settings_cb(uid, POST_SETTINGS_ACTION_HASHTAG_DELETE),
+                style="danger"
+            )
+        )
+
+    system_row.append(
+        _ikb(
+            f"Формат {'↕️' if vertical else '↔️'}",
+            callback_data=_post_publication_settings_cb(uid, POST_SETTINGS_ACTION_HASHTAG_FORMAT)
+        )
+    )
+    kb.row(*system_row)
+
+    kb.row(
+        _ikb(
+            "❰ К настройкам",
+            callback_data=_post_publication_settings_cb(uid, POST_SETTINGS_ACTION_HASHTAG_BACK)
+        )
+    )
+    return kb
+
+def edit_post_publication_hashtags_message(cq, user_id: int) -> bool:
+    uid = int(user_id)
+    return _post_publication_settings_edit_screen(
+        uid,
+        render_post_publication_hashtags_text(uid),
+        kb_post_publication_hashtags_editor(uid),
+        POST_SETTINGS_MODE_HASHTAGS,
+        cq=cq
+    )
+
+def refresh_post_publication_hashtags_screen(user_id: int) -> bool:
+    uid = int(user_id)
+    return _post_publication_settings_edit_screen(
+        uid,
+        render_post_publication_hashtags_text(uid),
+        kb_post_publication_hashtags_editor(uid),
+        POST_SETTINGS_MODE_HASHTAGS
+    )
+
+def post_publication_hashtags_html(user_id: int) -> str:
+    uid = int(user_id)
+    settings = post_publication_settings_get(uid)
+    state = post_publication_hashtags_state(uid, refresh_defaults=True)
+    tags = [
+        _post_publication_hashtag_html(item)
+        for item in list(state.get("slots") or [])
+        if item
+    ]
+    tags = [tag for tag in tags if tag]
+
+    separator = "\n" if int(settings.get("hashtags_vertical") or 0) == 1 else " "
+    return separator.join(tags)
+
+# РЕДАКТОР НАСТРОЕК ПУБЛИКАЦИИ
+def _post_publication_settings_cb(user_id: int, action: str) -> str:
+    return f"{POSTSETUI_TAG}:{int(user_id)}:{str(action or '').strip()}"
+
+def _post_publication_settings_parse_cb(data: str):
+    try:
+        p = (data or "").split(":")
+        if len(p) != 3 or p[0] != POSTSETUI_TAG:
+            return None, ""
+        return int(p[1]), str(p[2] or "").strip()
+    except Exception:
+        return None, ""
+
+def render_post_publication_settings_text(user_id: int) -> str:
+    uid = int(user_id)
+    settings = post_publication_settings_get(uid)
+    kind = post_meta_kind(uid)
+    links_icon = "⭕" if int(settings.get("links_as_buttons_enabled") or 0) == 1 else "❌"
+    preview_icon = "⭕" if int(settings.get("preview_enabled") or 0) == 1 else "❌"
+
+    return (
+        "📰 Настройки публикации\n"
+        f"Тип: <b>{h(post_kind_title(kind))}</b>\n\n"
+        f"Кнопки из ссылок: {links_icon}\n"
+        f"Предпросмотр ссылок: {preview_icon}\n\n"
+        "Эти настройки относятся только к текущему черновику. "
+        "После отправки или отмены они будут сброшены."
+    )
+
+def kb_post_publication_settings_menu(user_id: int) -> InlineKeyboardMarkup:
+    uid = int(user_id)
+    settings = post_publication_settings_get(uid)
+    preview_on = int(settings.get("preview_enabled") or 0) == 1
+    links_on = int(settings.get("links_as_buttons_enabled") or 0) == 1
+
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.row(
+        _ikb("Кнопки", callback_data=_post_publication_settings_cb(uid, POST_SETTINGS_ACTION_BUTTONS)),
+        _ikb("Хештеги", callback_data=_post_publication_settings_cb(uid, POST_SETTINGS_ACTION_HASHTAGS))
+    )
+    kb.row(
+        _ikb(
+            f"Превью: {'вкл' if preview_on else 'выкл'}",
+            callback_data=_post_publication_settings_cb(uid, POST_SETTINGS_ACTION_PREVIEW)
+        ),
+        _ikb(
+            f"Ссылка-кнопка: {'вкл' if links_on else 'выкл'}",
+            callback_data=_post_publication_settings_cb(uid, POST_SETTINGS_ACTION_LINKS)
+        )
+    )
+    kb.row(
+        _ikb("❰ К черновику", callback_data=_post_publication_settings_cb(uid, POST_SETTINGS_ACTION_BACK))
+    )
+    return kb
+
+def send_post_publication_settings_menu(user_id: int, chat_id: int, *, reply_to_message_id: int = 0):
+    uid = int(user_id)
+    if not post_publication_settings_available(uid):
+        return None
+
+    post_publication_settings_delete_screen_message(uid)
+
+    kwargs = {
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+        "reply_markup": kb_post_publication_settings_menu(uid),
+    }
+    if int(reply_to_message_id or 0) > 0:
+        kwargs["reply_to_message_id"] = int(reply_to_message_id)
+
+    msg = bot.send_message(
+        int(chat_id),
+        render_post_publication_settings_text(uid),
+        **kwargs
+    )
+    try:
+        post_publication_settings_store_screen(
+            uid,
+            POST_SETTINGS_MODE_MENU,
+            int(msg.chat.id),
+            int(msg.message_id)
+        )
+    except Exception:
+        pass
+    return msg
+
+def edit_post_publication_settings_menu_message(cq, user_id: int):
+    uid = int(user_id)
+    return _post_publication_settings_edit_screen(
+        uid,
+        render_post_publication_settings_text(uid),
+        kb_post_publication_settings_menu(uid),
+        POST_SETTINGS_MODE_MENU,
+        cq=cq
+    )
 
 def post_kind_title(post_kind: str) -> str:
     k = str(post_kind or "").strip().lower()
@@ -15041,8 +17565,17 @@ def _post_extract_media_from_message(message) -> tuple[str, str, int]:
 
     return "", "", 0
 
-def kb_post_draft() -> ReplyKeyboardMarkup:
+def kb_post_draft(user_id: int = 0) -> ReplyKeyboardMarkup:
     kb = ReplyKeyboardMarkup(resize_keyboard=True, selective=True)
+
+    try:
+        uid = int(user_id or 0)
+    except Exception:
+        uid = 0
+
+    if uid > 0 and post_kind_supports_publication_settings(post_meta_kind(uid)):
+        kb.row(KeyboardButton(POST_SETTINGS_TEXT))
+
     kb.row(
         KeyboardButton(POST_SUBMIT_TEXT),
         KeyboardButton(POST_CANCEL_TEXT)
@@ -15502,6 +18035,44 @@ def _post_create_publication_promo(creator_id: int) -> dict:
             raise last_err
         raise
 
+def _post_promo_bonus_to_extra_text(b) -> str:
+    if b is None:
+        return ""
+
+    if isinstance(b, dict):
+        kind = str(b.get("kind") or "")
+        amount = int(b.get("amount") or 0)
+        ref_code = str(b.get("ref_code") or "")
+    else:
+        kind = str(b["kind"] or "")
+        amount = int(b["amount"] or 0)
+        ref_code = str(b["ref_code"] or "")
+
+    if amount <= 0:
+        return ""
+
+    if kind == "skill":
+        skill = SKILLS.get(ref_code)
+        if skill:
+            reward_name = PROMO_SKILL_REWARD_NAMES.get(
+                ref_code,
+                str(skill.get("title_2") or ref_code)
+            )
+            return f"{skill['emoji']} +{amount} к {h(reward_name)}"
+        return f"🔹 +{amount} к {h(ref_code)}"
+
+    if kind == "points":
+        pts_word = _ru_form(amount, "очко навыка", "очка навыка", "очков навыка")
+        return f"🔹 +{amount} {pts_word}"
+
+    if kind == "res":
+        return f"🧬 +{amount} био-ресурсов"
+
+    if kind == "mat":
+        return f"💊 +{amount} био-материалов"
+
+    return ""
+
 def _post_promo_extra_html(promo_info: dict, *, expandable: bool = False) -> str:
     code = str(promo_info.get("code") or "").strip()
     expires_ts = int(promo_info.get("expires_ts") or 0)
@@ -15509,7 +18080,7 @@ def _post_promo_extra_html(promo_info: dict, *, expandable: bool = False) -> str
 
     bonus_lines = []
     for b in bonuses:
-        bt = _promo_bonus_to_text(b)
+        bt = _post_promo_bonus_to_extra_text(b)
         if bt:
             bonus_lines.append(bt)
 
@@ -15522,8 +18093,7 @@ def _post_promo_extra_html(promo_info: dict, *, expandable: bool = False) -> str
         f"❯ <code>/promo {h(code)}</code> ❮\n"
         f"<u>Действителен до {h(_fmt_ts(expires_ts))}</u>\n"
         f"Награды:\n"
-        f"{bonus_txt}\n"
-        f"{_post_update_tag_html()}"
+        f"{bonus_txt}"
     )
 
     text = premiumize_html_text(text)
@@ -15533,13 +18103,18 @@ def _post_promo_extra_html(promo_info: dict, *, expandable: bool = False) -> str
 
     return text
 
-def _post_text_with_promo_extra(text_html: str, promo_info: dict, *, expandable_extra: bool = True) -> str:
-    base = str(text_html or "").strip()
-    extra = _post_promo_extra_html(promo_info, expandable=bool(expandable_extra))
-
-    if base:
-        return f"{base}\n\n{extra}"
-    return extra
+def _post_text_with_promo_extra(
+    text_html: str,
+    promo_extra_html: str,
+    *,
+    tag_html: str = ""
+) -> str:
+    parts = [
+        str(text_html or "").strip(),
+        str(tag_html or "").strip(),
+        str(promo_extra_html or "").strip(),
+    ]
+    return "\n\n".join(part for part in parts if part)
 
 def _post_channel_username(channel_id: int) -> str:
     try:
@@ -15549,46 +18124,81 @@ def _post_channel_username(channel_id: int) -> str:
     except Exception:
         return ""
 
-def _post_channel_tag_suffix(channel_id: int) -> str:
-    un = _post_channel_username(int(channel_id))
-    return f"@{h(un)}" if un else ""
+def _post_default_hashtag_items(post_kind: str, channel_id: int, text_html: str = "") -> list[dict]:
+    kind = str(post_kind or "").strip().lower()
+    channel_username = _post_publication_hashtag_username_clean(
+        _post_channel_username(int(channel_id))
+    )
+
+    if kind == POST_KIND_PROJECTS:
+        return [{
+            "name": "проекты",
+            "username": channel_username,
+            "source": "default",
+        }]
+
+    if kind == POST_KIND_OTHER:
+        return [{
+            "name": "щитпостинг",
+            "username": channel_username,
+            "source": "default",
+        }]
+
+    if kind != POST_KIND_AD:
+        return []
+
+    tags = []
+    links = _post_collect_links_for_buttons(
+        text_html,
+        max_links=POST_PUBLICATION_HASHTAG_SLOTS
+    )
+    tg_channel = ""
+    tg_bot = ""
+
+    for item in links:
+        kind2 = str(item.get("kind") or "")
+        username = _post_publication_hashtag_username_clean(
+            str(item.get("username") or "")
+        )
+
+        if kind2 == "channel" and not tg_channel:
+            tg_channel = username
+        elif kind2 == "bot" and not tg_bot:
+            tg_bot = username
+
+    if tg_channel:
+        tags.append({
+            "name": "реклама",
+            "username": tg_channel,
+            "source": "default",
+        })
+
+    if tg_bot:
+        tags.append({
+            "name": "реклама",
+            "username": tg_bot,
+            "source": "default",
+        })
+
+    if not tags:
+        tags.append({
+            "name": "реклама",
+            "username": channel_username,
+            "source": "default",
+        })
+
+    return tags[:POST_PUBLICATION_HASHTAG_SLOTS]
 
 def _post_kind_tag_html(post_kind: str, channel_id: int, text_html: str = "") -> str:
     kind = str(post_kind or "").strip().lower()
-    suffix = _post_channel_tag_suffix(int(channel_id))
+    if kind == POST_KIND_UPDATE:
+        return _post_update_tag_html()
 
-    if kind == POST_KIND_PROJECTS:
-        return f"#проекты{suffix}"
-
-    if kind == POST_KIND_OTHER:
-        return f"#щитпостинг{suffix}"
-
-    if kind == POST_KIND_AD:
-        tags = []
-        links = _post_extract_links_for_buttons(text_html)
-        tg_channel = ""
-        tg_bot = ""
-
-        for item in links:
-            url = str(item.get("url") or "")
-            kind2 = str(item.get("kind") or "")
-
-            if kind2 == "channel" and not tg_channel:
-                tg_channel = str(item.get("username") or "").lstrip("@")
-            elif kind2 == "bot" and not tg_bot:
-                tg_bot = str(item.get("username") or "").lstrip("@")
-
-        if tg_channel:
-            tags.append(f"#реклама@{h(tg_channel)}")
-        if tg_bot:
-            tags.append(f"#реклама@{h(tg_bot)}")
-
-        if not tags:
-            tags.append(f"#реклама{suffix}")
-
-        return "\n".join(tags)
-
-    return _post_update_tag_html()
+    tags = [
+        _post_publication_hashtag_html(item)
+        for item in _post_default_hashtag_items(kind, int(channel_id), text_html)
+    ]
+    return "\n".join(tag for tag in tags if tag)
 
 def _post_url_normalize(raw: str) -> str:
     s = str(raw or "").strip()
@@ -15640,16 +18250,6 @@ def _post_link_button_url(url: str, link_kind: str) -> str:
             return f"https://t.me/{m.group(1)}?start=1"
     return url
 
-def _post_button_text_sanitize(text: str, fallback: str) -> str:
-    s = str(text or "").strip()
-    if not s:
-        return fallback
-
-    if len(s) > 64:
-        s = s[:64].rstrip()
-
-    return s or fallback
-
 _POST_LINK_BUTTON_PATTERN = re.compile(
     r"(?:(?:https?://)?(?:t\.me|telegram\.me)/[A-Za-z0-9_]{3,64}"
     r"|https?://[^\s<>()]+"
@@ -15682,173 +18282,13 @@ def _post_plain_link_matches(plain_text: str) -> list[dict]:
 
     return out
 
-def _post_first_line_custom_links(text_html: str) -> list[dict]:
-    plain = _post_html_visible_text(text_html)
-    first_line, _body = _timer_first_line_and_body(plain)
-
-    first_line = str(first_line or "").strip()
-    if not first_line:
-        return []
-
-    matches = _post_plain_link_matches(first_line)
-    if not matches:
-        return []
-
-    out = []
-
-    for i, item in enumerate(matches):
-        label_start = int(item["end"])
-        label_end = int(matches[i + 1]["start"]) if i + 1 < len(matches) else len(first_line)
-
-        raw_label = first_line[label_start:label_end].strip(" \t\r\n—-–|:;")
-        fallback = _post_default_button_text(str(item.get("kind") or ""))
-        label = _post_button_text_sanitize(raw_label, fallback)
-
-        out.append({
-            "url": str(item.get("url") or ""),
-            "kind": str(item.get("kind") or ""),
-            "username": str(item.get("username") or ""),
-            "label": label,
-            "custom": bool(raw_label),
-        })
-
-        if len(out) >= POST_MAX_LINK_BUTTONS:
-            break
-
-    return out
-
-def _post_hidden_first_line_urls(text_html: str) -> set[str]:
-    out = set()
-
-    for item in _post_first_line_custom_links(text_html):
-        url = str(item.get("url") or "").strip()
-        if url:
-            out.add(url)
-
-    return out
-
-def _post_has_hidden_first_line_links(text_html: str) -> bool:
-    return bool(_post_hidden_first_line_urls(text_html))
-
-def _post_remove_hidden_first_line_html(text_html: str) -> str:
-    raw = str(text_html or "")
-
-    if not _post_has_hidden_first_line_links(raw):
-        return raw.strip()
-
-    if "\n" not in raw:
-        return ""
-
-    _first, body = raw.split("\n", 1)
-    return str(body or "").lstrip()
-
-def _post_display_text_for_kind(post_kind: str, text_html: str) -> str:
-    kind = str(post_kind or "").strip().lower()
-
-    if kind in (POST_KIND_PROJECTS, POST_KIND_AD):
-        return _post_remove_hidden_first_line_html(text_html)
-
-    return str(text_html or "").strip()
-
-def _post_link_notice_html(text_html: str) -> str:
-    raw = str(text_html or "")
-    hidden_urls = _post_hidden_first_line_urls(raw)
-
-    links = []
-
-    # 1) Скрытые ссылки первой строки.
-    for item in _post_first_line_custom_links(raw):
-        url = str(item.get("url") or "").strip()
-        if not url:
-            continue
-
-        links.append({
-            "url": url,
-            "hidden": True,
-        })
-
-    # 2) HTML-ссылки из видимой части.
-    visible_html = _post_remove_hidden_first_line_html(raw)
-
-    for m in re.finditer(
-        r'<a\s+[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
-        visible_html,
-        flags=re.IGNORECASE | re.DOTALL
-    ):
-        url = _post_url_normalize(html_lib.unescape(m.group(1)))
-        if not url:
-            continue
-
-        kind, _username = _post_link_kind_and_username(url)
-        links.append({
-            "url": _post_link_button_url(url, kind),
-            "hidden": False,
-        })
-
-    # 3) Чистые ссылки из видимой части.
-    visible_plain = _post_html_visible_text(visible_html)
-
-    for item in _post_plain_link_matches(visible_plain):
-        url = str(item.get("url") or "").strip()
-        if not url:
-            continue
-
-        links.append({
-            "url": url,
-            "hidden": False,
-        })
-
-    if not links:
-        return ""
-
-    dedup = []
-    seen = set()
-
-    for item in links:
-        url = str(item.get("url") or "").strip()
-        if not url or url in seen:
-            continue
-
-        seen.add(url)
-        dedup.append(item)
-
-    if not dedup:
-        return ""
-
-    lines = []
-
-    for i, item in enumerate(dedup[:6], 1):
-        is_hidden = bool(item.get("hidden"))
-
-        if i <= POST_MAX_LINK_BUTTONS:
-            if is_hidden:
-                lines.append(f"✅ Скрытая ссылка {i} обработана")
-            else:
-                lines.append(f"✅ Ссылка {i} обработана")
-        else:
-            if is_hidden:
-                lines.append(f"🚫 Скрытая ссылка {i} отклонена")
-            else:
-                lines.append(f"🚫 Ссылка {i} отклонена")
-
-    if len(dedup) > 6:
-        lines.append("…")
-
-    body = "\n".join(lines).strip()
-    if not body:
-        return ""
-
-    if len(dedup) > 4:
-        return f"<blockquote expandable>{h(body)}</blockquote>"
-
-    return body
-
-def _post_extract_links_for_buttons(text_html: str) -> list[dict]:
+def _post_collect_links_for_buttons(text_html: str, *, max_links: int = 0) -> list[dict]:
+    """
+    Возвращает уникальные ссылки из актуального текста черновика.
+    Первая строка не имеет специального назначения: она обрабатывается как обычный текст.
+    """
     raw = str(text_html or "")
     links = []
-
-    for item in _post_first_line_custom_links(raw):
-        links.append(item)
 
     for m in re.finditer(
         r'<a\s+[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
@@ -15856,30 +18296,32 @@ def _post_extract_links_for_buttons(text_html: str) -> list[dict]:
         flags=re.IGNORECASE | re.DOTALL
     ):
         url = _post_url_normalize(html_lib.unescape(m.group(1)))
-        label = _post_html_visible_text(m.group(2)).strip()
-
         if not url:
             continue
 
         kind, username = _post_link_kind_and_username(url)
         links.append({
             "url": _post_link_button_url(url, kind),
+            "source_url": url,
             "kind": kind,
             "username": username,
-            "label": _post_button_text_sanitize(label, _post_default_button_text(kind)),
-            "custom": bool(label),
+            "label": _post_default_button_text(kind),
         })
 
-    visible_html = _post_remove_hidden_first_line_html(raw)
-    plain = _post_html_visible_text(visible_html)
+    plain = _post_html_visible_text(raw)
 
     for item in _post_plain_link_matches(plain):
+        url = str(item.get("url") or "").strip()
+        source_url = str(item.get("base_url") or url).strip()
+        if not url:
+            continue
+
         links.append({
-            "url": str(item.get("url") or ""),
+            "url": url,
+            "source_url": source_url,
             "kind": str(item.get("kind") or ""),
             "username": str(item.get("username") or ""),
             "label": _post_default_button_text(str(item.get("kind") or "")),
-            "custom": False,
         })
 
     out = []
@@ -15893,27 +18335,10 @@ def _post_extract_links_for_buttons(text_html: str) -> list[dict]:
         seen.add(url)
         out.append(item)
 
-        if len(out) >= POST_MAX_LINK_BUTTONS:
+        if int(max_links or 0) > 0 and len(out) >= int(max_links):
             break
 
     return out
-
-def kb_post_external_links(text_html: str) -> Optional[InlineKeyboardMarkup]:
-    links = _post_extract_links_for_buttons(text_html)
-    if not links:
-        return None
-
-    kb = InlineKeyboardMarkup(row_width=1)
-    for item in links[:POST_MAX_LINK_BUTTONS]:
-        kb.add(
-            _ikb(
-                str(item.get("label") or _post_default_button_text(str(item.get("kind") or ""))),
-                url=str(item.get("url") or ""),
-                style="primary"
-            )
-        )
-
-    return kb
 
 def _post_append_tag(text_html: str, tag_html: str) -> str:
     base = str(text_html or "").strip()
@@ -15955,7 +18380,7 @@ def kb_post_publication(promo_code: str) -> Optional[InlineKeyboardMarkup]:
     if add_url:
         kb.add(
             _ikb(
-                "Добавить в чат",
+                "➕ Добавить бота в чат",
                 url=add_url,
                 style="primary"
             )
@@ -16133,7 +18558,7 @@ def _post_publish_draft(user_id: int, overflow_mode: str = "") -> tuple[bool, st
     else:
         text_html = str(draft.get("text_html") or "").strip()
         source_text_html = text_html
-        display_text_html = _post_display_text_for_kind(post_kind, source_text_html)
+        display_text_html = source_text_html
 
     media_items = _post_normalize_media_items(list(draft.get("media") or []))
 
@@ -16147,21 +18572,41 @@ def _post_publish_draft(user_id: int, overflow_mode: str = "") -> tuple[bool, st
 
     try:
         rm = None
-        extra_html = ""
+        promo_extra_html = ""
+        promo_tail_html = ""
         full_text_html = text_html
+
+        publication_settings = {}
+        if post_kind_supports_publication_settings(post_kind):
+            publication_settings = post_publication_settings_get(uid)
 
         if use_promo:
             promo_info = _post_create_publication_promo(uid)
             promo_code = str(promo_info.get("code") or "").strip()
-            extra_html = _post_promo_extra_html(promo_info)
-            full_text_html = _post_text_with_promo_extra(display_text_html, promo_info)
+            promo_extra_html = _post_promo_extra_html(promo_info)
+            promo_tag_html = _post_kind_tag_html(post_kind, int(channel_id), source_text_html)
+
+            full_text_html = _post_text_with_promo_extra(
+                display_text_html,
+                f"<blockquote expandable>{promo_extra_html}</blockquote>",
+                tag_html=promo_tag_html
+            )
+            promo_tail_html = _post_text_with_promo_extra(
+                "",
+                promo_extra_html,
+                tag_html=promo_tag_html
+            )
             rm = kb_post_publication(promo_code)
         else:
-            tag_html = _post_kind_tag_html(post_kind, int(channel_id), source_text_html)
+            if post_kind_supports_publication_settings(post_kind):
+                tag_html = post_publication_hashtags_html(uid)
+            else:
+                tag_html = _post_kind_tag_html(post_kind, int(channel_id), source_text_html)
+
             full_text_html = _post_append_tag(display_text_html, tag_html)
 
-            if post_kind in (POST_KIND_PROJECTS, POST_KIND_AD):
-                rm = kb_post_external_links(source_text_html)
+            if post_kind_supports_publication_settings(post_kind):
+                rm = kb_post_publication_buttons(uid)
 
         text_len = _post_html_visible_len(display_text_html)
         full_len = _post_html_visible_len(full_text_html)
@@ -16170,10 +18615,8 @@ def _post_publish_draft(user_id: int, overflow_mode: str = "") -> tuple[bool, st
         has_group = media_count > 1
 
         disable_preview = True
-        if post_kind == POST_KIND_PROJECTS and not has_media:
-            disable_preview = False
-        if post_kind == POST_KIND_AD and not has_media:
-            disable_preview = False
+        if post_kind_supports_publication_settings(post_kind) and not has_media:
+            disable_preview = int(publication_settings.get("preview_enabled", 1) or 0) != 1
 
         needs_choice = False
 
@@ -16219,8 +18662,8 @@ def _post_publish_draft(user_id: int, overflow_mode: str = "") -> tuple[bool, st
             if not ok_media:
                 return False, "❎ Не удалось опубликовать вложения поста."
 
-            if use_promo and extra_html:
-                ok_extra = _post_send_message_raw(int(channel_id), extra_html, reply_markup=rm)
+            if use_promo and promo_tail_html:
+                ok_extra = _post_send_message_raw(int(channel_id), promo_tail_html, reply_markup=rm)
                 return bool(ok_extra), "✅ Пост опубликован." if ok_extra else "❎ Не удалось опубликовать экстра-строку."
 
             return True, "✅ Пост опубликован."
@@ -16240,8 +18683,8 @@ def _post_publish_draft(user_id: int, overflow_mode: str = "") -> tuple[bool, st
                         if ch.strip() and not _post_send_message_raw(int(channel_id), ch):
                             return False, "❎ Не удалось опубликовать одну из частей поста."
 
-                if media_count > 1 and use_promo and extra_html:
-                    ok_extra = _post_send_message_raw(int(channel_id), extra_html, reply_markup=rm)
+                if media_count > 1 and use_promo and promo_tail_html:
+                    ok_extra = _post_send_message_raw(int(channel_id), promo_tail_html, reply_markup=rm)
                     return bool(ok_extra), "✅ Пост опубликован." if ok_extra else "❎ Не удалось опубликовать экстра-строку."
 
                 return True, "✅ Пост опубликован."
@@ -16305,11 +18748,14 @@ def _post_publish_draft(user_id: int, overflow_mode: str = "") -> tuple[bool, st
             tail_html = ""
             tail_rm = None
 
-            if use_promo and extra_html:
-                tail_html = extra_html
+            if use_promo and promo_tail_html:
+                tail_html = promo_tail_html
                 tail_rm = rm
             elif post_kind in (POST_KIND_PROJECTS, POST_KIND_AD, POST_KIND_OTHER):
-                tail_html = _post_kind_tag_html(post_kind, int(channel_id), source_text_html)
+                if post_kind_supports_publication_settings(post_kind):
+                    tail_html = post_publication_hashtags_html(uid)
+                else:
+                    tail_html = _post_kind_tag_html(post_kind, int(channel_id), source_text_html)
                 tail_rm = rm
 
             if tail_html:
@@ -16382,7 +18828,12 @@ def _statpost_stats_row() -> sqlite3.Row:
             (SELECT COUNT(*) FROM users
              WHERE user_id>0
                AND COALESCE(is_bot,0)=0
-               AND COALESCE(is_placeholder,0)=0) AS users_total,
+               AND COALESCE(is_placeholder,0)=0
+               AND (
+                   COALESCE(NULLIF(TRIM(first_name),''),'')<>''
+                   OR COALESCE(NULLIF(TRIM(last_name),''),'')<>''
+                   OR COALESCE(NULLIF(TRIM(username),''),'')<>''
+               )) AS users_total,
 
             (SELECT COUNT(*)
              FROM labs l
@@ -16390,7 +18841,12 @@ def _statpost_stats_row() -> sqlite3.Row:
              WHERE l.user_id>0
                AND COALESCE(l.lab_active,0)=1
                AND COALESCE(u.is_bot,0)=0
-               AND COALESCE(u.is_placeholder,0)=0) AS labs_total,
+               AND COALESCE(u.is_placeholder,0)=0
+               AND (
+                   COALESCE(NULLIF(TRIM(u.first_name),''),'')<>''
+                   OR COALESCE(NULLIF(TRIM(u.last_name),''),'')<>''
+                   OR COALESCE(NULLIF(TRIM(u.username),''),'')<>''
+               )) AS labs_total,
 
             (SELECT COALESCE(SUM(COALESCE(l.bio_exp,0)),0)
              FROM labs l
@@ -16398,7 +18854,12 @@ def _statpost_stats_row() -> sqlite3.Row:
              WHERE l.user_id>0
                AND COALESCE(l.lab_active,0)=1
                AND COALESCE(u.is_bot,0)=0
-               AND COALESCE(u.is_placeholder,0)=0) AS bio_exp_total,
+               AND COALESCE(u.is_placeholder,0)=0
+               AND (
+                   COALESCE(NULLIF(TRIM(u.first_name),''),'')<>''
+                   OR COALESCE(NULLIF(TRIM(u.last_name),''),'')<>''
+                   OR COALESCE(NULLIF(TRIM(u.username),''),'')<>''
+               )) AS bio_exp_total,
 
             (SELECT COALESCE(SUM(COALESCE(l.all_bio_res,0)),0)
              FROM labs l
@@ -16406,7 +18867,12 @@ def _statpost_stats_row() -> sqlite3.Row:
              WHERE l.user_id>0
                AND COALESCE(l.lab_active,0)=1
                AND COALESCE(u.is_bot,0)=0
-               AND COALESCE(u.is_placeholder,0)=0) AS bio_res_total,
+               AND COALESCE(u.is_placeholder,0)=0
+               AND (
+                   COALESCE(NULLIF(TRIM(u.first_name),''),'')<>''
+                   OR COALESCE(NULLIF(TRIM(u.last_name),''),'')<>''
+                   OR COALESCE(NULLIF(TRIM(u.username),''),'')<>''
+               )) AS bio_res_total,
 
             (SELECT COALESCE(SUM(COALESCE(l.all_bio_mater,0)),0)
              FROM labs l
@@ -16414,7 +18880,12 @@ def _statpost_stats_row() -> sqlite3.Row:
              WHERE l.user_id>0
                AND COALESCE(l.lab_active,0)=1
                AND COALESCE(u.is_bot,0)=0
-               AND COALESCE(u.is_placeholder,0)=0) AS bio_mater_total
+               AND COALESCE(u.is_placeholder,0)=0
+               AND (
+                   COALESCE(NULLIF(TRIM(u.first_name),''),'')<>''
+                   OR COALESCE(NULLIF(TRIM(u.last_name),''),'')<>''
+                   OR COALESCE(NULLIF(TRIM(u.username),''),'')<>''
+               )) AS bio_mater_total
         """
     )
 
@@ -16992,29 +19463,21 @@ def _post_start_common_draft_message(user_id: int, chat_id: int, selected: dict,
     preview_line = ""
     if kind == POST_KIND_PROJECTS:
         preview_line = (
-                        "<blockquote expandable>Отправте текст поста следующим образом:\n"
-                        "・ 1-я строка — ссылка + название для кастомной кнопки (по желанию)\n"
-                        "・ со 2-й строки — текст с HTML-форматированием\n"
+                        "<blockquote expandable>Отправьте текст поста с обычным HTML-форматированием.\n"
                         "Ссылки внутри текста поста автоматически преобразуются в кнопки со стандартным названием.\n"
-                        "❗Очень важное уточнение: не указывать ссылку первой, если не требуется устанавливать кастомные кнопки. В противном случае бот расценит весь текст, как название для кнопки, и обрежет его!\n\n"
-                        "Максимальное кол-во поддерживаемых для кнопок ссылок: 3.\n"
-                        "#️⃣ Для этого типа поста действуют <b><i>простые</i></b> хештеги.</blockquote>"
+                        "#️⃣ Для этого типа поста действуют <b><i>простой</i></b> хештег.</blockquote>"
                         )
     elif kind == POST_KIND_AD:
         preview_line = (
-                        "<blockquote expandable>Отправте текст поста следующим образом:\n"
-                        "・ 1-я строка — ссылка + название для кастомной кнопки (по желанию)\n"
-                        "・ со 2-й строки — текст с HTML-форматированием\n"
+                        "<blockquote expandable>Отправьте текст поста с обычным HTML-форматированием.\n"
                         "Ссылки внутри текста поста автоматически преобразуются в кнопки со стандартным названием.\n"
-                        "❗Очень важное уточнение: не указывать ссылку первой, если не требуется устанавливать кастомные кнопки. В противном случае бот расценит весь текст, как название для кнопки, и обрежет его!\n\n"
-                        "Максимальное кол-во поддерживаемых для кнопок ссылок: 3.\n"
-                        "#️⃣ Для этого типа поста действуют <b><i>умные рекламные</i></b> хештеги.</blockquote>"
+                        "#️⃣ Для этого типа поста действуют <b><i>умный рекламный</i></b> хештег.</blockquote>"
                         )
     elif kind == POST_KIND_OTHER:
         preview_line = (
                         "<blockquote expandable>Для этого типа поддерживается публикация с промокодом или без него.\n"
                         "Стандартный тип черновика.\n"
-                        "#️⃣ Для этого типа поста действуют <b><i>простые</i></b> хештеги.</blockquote>"
+                        "#️⃣ Для этого типа поста действуют <b><i>простой</i></b> хештег.</blockquote>"
                         )
 
     bot.send_message(
@@ -17028,7 +19491,7 @@ def _post_start_common_draft_message(user_id: int, chat_id: int, selected: dict,
         f"Когда всё будет готово, нажмите «{POST_SUBMIT_TEXT}».",
         parse_mode="HTML",
         disable_web_page_preview=True,
-        reply_markup=kb_post_draft()
+        reply_markup=kb_post_draft(int(user_id))
     )
 
 def handle_post_command(message):
@@ -17116,7 +19579,7 @@ def _handle_post_update_version_message(message, raw_plain: str) -> bool:
         "Теперь выберите раздел черновика.",
         parse_mode="HTML",
         disable_web_page_preview=True,
-        reply_markup=kb_post_draft()
+        reply_markup=kb_post_draft(uid)
     )
 
     send_post_update_menu(uid, int(message.chat.id))
@@ -17343,6 +19806,18 @@ def _handle_post_content_message(message) -> bool:
             )
             return True
 
+        if (
+            low == str(POST_SETTINGS_TEXT).casefold()
+            and (not is_agents_post)
+            and post_publication_settings_available(uid)
+        ):
+            send_post_publication_settings_menu(
+                uid,
+                int(message.chat.id),
+                reply_to_message_id=int(getattr(message, "message_id", 0) or 0)
+            )
+            return True
+
         if low == str(POST_SUBMIT_TEXT).casefold():
             if is_agents_post:
                 ok, msg = _post_agents_publish_draft(uid)
@@ -17382,6 +19857,38 @@ def _handle_post_content_message(message) -> bool:
             )
             return True
 
+        handled_button_input, button_saved, button_notice = post_publication_buttons_accept_input(
+            uid,
+            raw_plain
+        )
+        if handled_button_input:
+            if button_saved:
+                refresh_post_publication_buttons_screen(uid)
+
+            bot.reply_to(
+                message,
+                button_notice,
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
+            return True
+
+        handled_hashtag_input, hashtag_saved, hashtag_notice = post_publication_hashtags_accept_input(
+            uid,
+            raw_plain
+        )
+        if handled_hashtag_input:
+            if hashtag_saved:
+                refresh_post_publication_hashtags_screen(uid)
+
+            bot.reply_to(
+                message,
+                hashtag_notice,
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
+            return True
+
         html_text = _post_message_html_payload(message)
         if not html_text:
             bot.reply_to(
@@ -17405,19 +19912,11 @@ def _handle_post_content_message(message) -> bool:
         else:
             next_hint = f"Можно добавить фото или видео и затем нажать «{POST_SUBMIT_TEXT}»."
 
-        link_notice = ""
-        kind = post_meta_kind(uid)
-        if kind in (POST_KIND_PROJECTS, POST_KIND_AD):
-            link_notice = _post_link_notice_html(str(draft.get("text_html") or ""))
-
-        extra_notice = f"\n{link_notice}" if link_notice else ""
-
         bot.reply_to(
             message,
             f"✅ Текст добавлен к черновику.\n"
             f"Вложений: {media_count}/{media_limit}\n"
-            f"{next_hint}"
-            f"{extra_notice}",
+            f"{next_hint}",
             parse_mode="HTML",
             disable_web_page_preview=True
         )
@@ -17541,19 +20040,6 @@ def _known_chat_member_count(chat_id: int, exclude_user_id: int = 0) -> int:
         "SELECT COUNT(*) AS c "
         "FROM chat_members "
         "WHERE chat_id=? AND user_id>0 AND user_id<>?",
-        (int(chat_id), int(exclude_user_id))
-    )
-    return int(row["c"] or 0) if row else 0
-
-def _known_chat_user_count(chat_id: int, exclude_user_id: int = 0) -> int:
-    row = db_one(
-        "SELECT COUNT(*) AS c "
-        "FROM chat_members cm "
-        "LEFT JOIN users u ON u.user_id=cm.user_id "
-        "WHERE cm.chat_id=? "
-        "  AND cm.user_id>0 "
-        "  AND cm.user_id<>? "
-        "  AND COALESCE(u.is_bot,0)=0",
         (int(chat_id), int(exclude_user_id))
     )
     return int(row["c"] or 0) if row else 0
@@ -17701,13 +20187,14 @@ def _entity_slice_text(raw: str, ent) -> str:
     except Exception:
         return ""
 
-def _collect_reply_target_ids(message, *, exclude_user_ids=None) -> list[int]:
+def _collect_reply_target_ids(message, *, exclude_user_ids=None, token_resolver=None) -> list[int]:
     rm = getattr(message, "reply_to_message", None)
     if not rm:
         return []
 
     exclude = {int(x) for x in (exclude_user_ids or []) if int(x or 0) != 0}
     raw, ents = _reply_message_text_and_entities(rm)
+    resolver = token_resolver or _strict_single_target_token
 
     out: list[int] = []
     seen = set()
@@ -17744,28 +20231,33 @@ def _collect_reply_target_ids(message, *, exclude_user_ids=None) -> list[int]:
 
         if token:
             try:
-                tid = _strict_single_target_token(token)
+                tid = resolver(token)
             except Exception:
                 tid = None
             _add(tid)
 
     for tok in _collect_target_tokens_from_text(raw):
         try:
-            tid = _strict_single_target_token(tok)
+            tid = resolver(tok)
         except Exception:
             tid = None
         _add(tid)
 
     return out
 
-def _pick_reply_target_id(message, *, exclude_user_ids=None) -> Optional[int]:
-    ids = _collect_reply_target_ids(message, exclude_user_ids=exclude_user_ids)
+def _pick_reply_target_id(message, *, exclude_user_ids=None, token_resolver=None) -> Optional[int]:
+    ids = _collect_reply_target_ids(
+        message,
+        exclude_user_ids=exclude_user_ids,
+        token_resolver=token_resolver
+    )
     if not ids:
         return None
     if len(ids) == 1:
         return int(ids[0])
     return int(random.choice(ids))
 
+# РЕЗОЛВЕРЫ
 def resolve_target_from_reply_or_args(message, parsed: Optional["Parsed"]):
     """
     Возвращает (target_id, target_user_obj_or_None).
@@ -17807,6 +20299,51 @@ def resolve_target_from_reply_or_args(message, parsed: Optional["Parsed"]):
 
     if parsed and parsed.args:
         tid = _resolve_single_target_from_text((parsed.args or "").strip(), _strict_single_target_token)
+        if tid is not None:
+            return int(tid), None
+
+    return None, None
+
+def resolve_infect_target_from_reply_or_args(message, parsed: Optional["Parsed"]):
+    """
+    Resolver только для заражения.
+    Reply на живого пользователя сохраняет его как известную цель,
+    а user_id/@username/ссылки принимаются лишь для уже известных боту пользователей.
+    """
+    actor_id = int(getattr(getattr(message, "from_user", None), "id", 0) or 0)
+
+    if message.reply_to_message:
+        u = getattr(message.reply_to_message, "from_user", None)
+
+        if (
+            u
+            and not bool(getattr(u, "is_bot", False))
+            and int(getattr(u, "id", 0) or 0) != actor_id
+        ):
+            capture_user_context(message, u)
+            return int(u.id), u
+
+        tid = _pick_reply_target_id(
+            message,
+            exclude_user_ids={actor_id},
+            token_resolver=_resolve_known_infect_target
+        )
+        if tid is not None:
+            return int(tid), None
+
+        if (
+            u
+            and not bool(getattr(u, "is_bot", False))
+            and int(getattr(u, "id", 0) or 0) == actor_id
+        ):
+            capture_user_context(message, u)
+            return int(u.id), u
+
+    if parsed and parsed.args:
+        tid = _resolve_single_target_from_text(
+            (parsed.args or "").strip(),
+            _resolve_known_infect_target
+        )
         if tid is not None:
             return int(tid), None
 
@@ -18047,6 +20584,18 @@ def _group_short_alias_needs_prefix(message, parsed: "Parsed") -> bool:
     if cmd in ("autoanswer_on", "autoanswer_off", "autoanswer_status"):
         return _group_alias_any(low, ("ао", "аз"))
 
+    # Игровые уведомления
+    if cmd in ("game_notify_on", "game_notify_off"):
+        return _group_alias_any(low, ("лу",))
+
+    # Быстрая клавиатура
+    if cmd in ("quick_keyboard", "quick_keyboard_enable", "quick_keyboard_disable"):
+        return _group_alias_any(low, ("мк",))
+    
+    # Корпоративные уведомления
+    if cmd in ("corp_notify_off", "corp_notify_on"):
+        return _group_alias_any(low, ("коу",))
+
     # Калькуляторы 
     if cmd in ("calc", "calc_upg", "calc_chance", "calc_exp", "calc_duel", "calc_buff"):
         return _group_alias_any(low, ("к", "ку", "кпк", "кш", "кпц", "ко", "кдл", "кс", "кус"))
@@ -18087,7 +20636,9 @@ SIGNED_COMMANDS_ALLOWED = {
     "chat_autodel_set", "chat_autodel_off",
     "balance_show", "balance_hide", "lab_show", "lab_hide",
     "notify_on", "notify_off",
+    "game_notify_on", "game_notify_off",
     "corp_notify_on", "corp_notify_off",
+    "game_on", "game_off",
     "rp_on", "rp_off",
     "mrp_add", "mrp_delete",
     "autoanswer_on", "autoanswer_off",
@@ -18098,6 +20649,7 @@ SIGNED_COMMANDS_ALLOWED = {
     "chatname_set", "chatname_clear",
     "name_lock_user", "name_lock_lab", "name_lock_pat", "name_lock_corp",
     "upgrade_preview", "upgrade_buy",
+    "quick_keyboard", "quick_keyboard_enable", "quick_keyboard_disable",
 }
 
 def _strip_command_bot_suffix(command_name: str) -> str:
@@ -18149,7 +20701,7 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
             "agent", "агент", "agent_remove",
             "agents",
             "blacklist", "users", "users_cof", "bot_ban", "bot_unban", "remake_lab",
-            "db_fife", "db_fife_stat", "db_fife_msg", "db_fife_upd", "its", "delete"
+            "db_fife", "db_fife_stat", "db_fife_msg", "db_fife_upd", "its", "delete", "reguser"
         ):
             cmd_map = {
                 "owner": "owner",
@@ -18172,6 +20724,7 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
                 "db_fife_upd": "db_fife_upd",
                 "its": "its",
                 "delete": "delete_user_db",
+                "reguser": "reguser",
             }
             return Parsed(raw=raw_multiline, has_prefix_char=True, prefix_char=pch, cmd=cmd_map[c], args=a)
 
@@ -18210,7 +20763,7 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
             return Parsed(raw=raw, has_prefix_char=True, prefix_char=prefix_char, cmd=cmd_map[c], args=a)
 
         if c in ("bot_ban", "bot_unban", "remake_lab",
-                 "db_fife", "db_fife_stat", "db_fife_msg", "db_fife_upd", "its", "users_cof"):
+                 "db_fife", "db_fife_stat", "db_fife_msg", "db_fife_upd", "its", "users_cof", "reguser"):
             return Parsed(raw=raw, has_prefix_char=True, prefix_char=prefix_char, cmd=c, args=a)
 
         if c == "delete":
@@ -18264,6 +20817,14 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
         t = t[1:].lstrip()
 
     low = t.lower()
+
+    qk_alias, qk_args = _quick_keyboard_parse_alias(t)
+    if qk_alias:
+        if sign == "+":
+            return Parsed(raw=raw_multiline, has_prefix_char=False, prefix_char=None, cmd="quick_keyboard_enable", args=qk_args)
+        if sign == "-":
+            return Parsed(raw=raw_multiline, has_prefix_char=False, prefix_char=None, cmd="quick_keyboard_disable", args=qk_args)
+        return Parsed(raw=raw_multiline, has_prefix_char=False, prefix_char=None, cmd="quick_keyboard", args=qk_args)
 
     # автоудаление
     if sign == "+" and (low == "автоудаление" or low == "ау" or low.startswith("автоудаление ") or low.startswith("ау ")):
@@ -18639,13 +21200,79 @@ def parse_message_as_command(text: str) -> Optional[Parsed]:
             )
         
     # уведомления
-    if sign in ("+", "-") and low in ("уведомления", "уведы"):
-        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None,
-                      cmd=("notify_on" if sign == "+" else "notify_off"), args="")
+    game_notify_aliases = {
+        "лу",
 
-    if sign in ("+", "-") and low in ("корп уведы", "корп уведомления", "корп уведомление"):
-        return Parsed(raw=raw, has_prefix_char=False, prefix_char=None,
-                      cmd=("corp_notify_on" if sign == "+" else "corp_notify_off"), args="")
+        "лаб уведы",
+        "лаб уведомления",
+        "лаб уведомление",
+
+        "лаба уведы",
+        "лаба уведомления",
+        "лаба уведомление",
+
+        "лаборатория уведы",
+        "лаборатория уведомления",
+        "лаборатория уведомление",
+    }
+
+    if sign in ("+", "-") and low in game_notify_aliases:
+        return Parsed(
+            raw=raw,
+            has_prefix_char=False,
+            prefix_char=None,
+            cmd=(
+                "game_notify_on"
+                if sign == "+"
+                else "game_notify_off"
+            ),
+            args=""
+        )
+
+    if sign in ("+", "-") and low in ("уведомления", "уведы"):
+        return Parsed(
+            raw=raw,
+            has_prefix_char=False,
+            prefix_char=None,
+            cmd=(
+                "notify_on"
+                if sign == "+"
+                else "notify_off"
+            ),
+            args=""
+        )
+
+    if sign in ("+", "-") and low in (
+        "коу",
+        "корп уведы",
+        "корп уведомления",
+        "корп уведомление"
+    ):
+        return Parsed(
+            raw=raw,
+            has_prefix_char=False,
+            prefix_char=None,
+            cmd=(
+                "corp_notify_on"
+                if sign == "+"
+                else "corp_notify_off"
+            ),
+            args=""
+        )
+
+    # основная игра
+    if sign in ("+", "-") and low in ("игра", "игра вирусы"):
+        return Parsed(
+            raw=raw,
+            has_prefix_char=False,
+            prefix_char=None,
+            cmd=(
+                "game_on"
+                if sign == "+"
+                else "game_off"
+            ),
+            args=""
+        )
 
     # рп
     if sign in ("+", "-") and low == "рп":
@@ -19208,7 +21835,10 @@ def build_start_text(user, *, is_private_context: bool = True) -> str:
         seen.add(uid)
         support_rows.append(r)
 
-    primary_rows, secondary_rows = _agents_sort_rows_by_status(support_rows)
+    primary_rows, secondary_rows = _agents_sort_rows_by_status(
+        support_rows,
+        hide_hidden=True
+    )
 
     u_name = user_full_name(user)
 
@@ -19261,48 +21891,1227 @@ def build_start_text(user, *, is_private_context: bool = True) -> str:
 
     return "\n".join(lines)
 
+# CUSTOM QUICK KEYBOARD
+QUICKKB_SLOT_COUNT = 12
+QUICKKB_ROW_SIZE = 3
+QUICKKB_CONFIG_ID_LEN = 10
+QUICKKB_ID_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+QUICKKB_TAG = "QK"
+QUICKKB_EDITOR_TTL_SEC = 6 * 3600
+QUICKKB_EDITOR_CANCEL_TEXT = "Завершить настройку"
+
+QUICKKB_TITLE_LATIN_LOOKALIKES = str.maketrans(
+    {
+        "а": "a",
+        "о": "o",
+        "у": "y",
+        "е": "e",
+        "А": "A",
+        "О": "O",
+        "Т": "T",
+        "Е": "E",
+        "К": "K",
+        "М": "M",
+        "Н": "H",
+        "Р": "P",
+        "С": "C",
+        "с": "c",
+        "В": "B",
+        "х": "x",
+        "Х": "X",
+    }
+)
+
+QUICKKB_DEFAULT_SLOTS = [
+    {"label": "ℹ️ Помощь", "command_text": "помощь", "is_standard": 1},
+    {"label": "👨‍⚕️ Техподдержка", "command_text": "обращение", "is_standard": 1},
+    {"label": "📚 Быстрый поиск", "command_text": "📚 Быстрый поиск", "is_standard": 1},
+    {"label": "⚙️ Параметры", "command_text": "параметры", "is_standard": 1},
+    {"label": "🔗 Команды", "command_text": "команды", "is_standard": 1},
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+]
+
+QUICKKB_ALIASES = (
+    "моя клавиатура",
+    "моя клавиатур",
+    "моя клава",
+    "мк",
+)
+
+# Белый список быстрой клавиатуры
+QUICKKB_ALLOWED_COMMANDS = {
+    # Навигация, помощь и настройки.
+    "help", "contact", "quick_search_stub", "settings", "commands_link",
+    "balance_hide", "balance_show", "lab_hide", "lab_show",
+    "notify_on", "notify_off", "game_notify_on", "game_notify_off",
+    "corp_notify_on", "corp_notify_off", "game_on", "game_off", "rp_on", "rp_off",
+    "gender_set",
+
+    # Лаборатория, патогены, баланс, заражение, синтез и вакцины.
+    "lab", "mylab", "my_victims", "my_diseases",
+    "pathogens_info", "pathogen_info",
+    "balance", "infect", "synth", "upgrade_preview", "upgrade_buy",
+    "buy_vaccine", "use_vaccine",
+    "lab_delete", "restore_lab",
+    "labname", "labname_set", "labname_clear",
+    "pathogenname", "pathogenname_set", "pathogenname_clear",
+    "chatname_set", "chatname_show", "my_chatname_show", "chatname_clear",
+
+    # Корпорации и переводы ресурсов.
+    "corp_create", "corp_delete", "corp_open", "corp_close", "corp_rename",
+    "corp_reg", "corp_info", "corp_my", "corp_join", "corp_invite",
+    "corp_req_accept", "corp_req_reject", "corp_req_list",
+    "corp_deputy", "corp_deputy_remove", "corp_kick", "corp_leave",
+    "corp_transfer_owner", "corp_send_res", "corp_send_mat",
+
+    # Таймеры, автоудаление и автоответчик.
+    "timer_add_rel", "timer_add_abs", "timer_add_cycle",
+    "timer_delete", "timer_clear_all", "timer_list",
+    "chat_autodel_set", "chat_autodel_status", "chat_autodel_off",
+    "autoanswer_status", "autoanswer_on", "autoanswer_off",
+
+    # Статистика, топы, дуэли, РП/МРП и калькуляторы.
+    "agent_status", "rp_stats", "cof_inf_stats",
+    "top_users", "top_users_chat", "top_diseases", "top_diseases_chat",
+    "top_corps", "top_corps_chat",
+    "duel_call", "duel_call_stake", "duel_accept", "duel_decline", "duel_cancel",
+    "duel_fire", "duel_aim", "duel_break_aim", "duel_surrender",
+    "duel_bets_list", "duel_bet", "duel_stats",
+    "mrp_add", "mrp_delete", "mrp_clear_all", "mrp_list",
+    "calc", "calc_upg", "calc_chance", "calc_buff", "calc_exp", "calc_duel",
+
+    # Публикации.
+    "post", "post_agents", "post_channels", "statpost",
+
+    # Агентские и служебные команды.
+    "agents_panel", "users_list", "users_cof",
+    "my_owner", "my_owner_remove", "owner", "owner_remove", "agent", "agent_remove",
+    "bot_ban", "bot_unban", "remake_lab", "delete_user_db", "blacklist",
+    "name_lock_user", "name_lock_lab", "name_lock_pat", "name_lock_corp",
+    "db_fife", "db_fife_stat", "db_fife_msg", "db_fife_upd", "its",
+    "edit_k", "edit_b", "duel_cof_stats", "duel_cof_break", "duel_cof_break_bon",
+    "duel_cof_aim", "duel_cof_base_pts", "duel_rounds",
+}
+
+QUICKKB_PRIVATE_ONLY_CMDS = {
+    "contact",
+    "quick_search_stub",
+    "agents_panel",
+    "users_list",
+    "users_cof",
+    "agent_status",
+    "post",
+    "post_agents",
+    "post_channels",
+    "statpost",
+    "my_owner",
+    "my_owner_remove",
+    "owner",
+    "owner_remove",
+    "agent",
+    "agent_remove",
+    "blacklist",
+    "db_fife",
+    "db_fife_stat",
+    "db_fife_msg",
+    "db_fife_upd",
+    "its",
+    "delete_user_db",
+}
+
+QUICKKB_GROUP_ONLY_CMDS = {
+    "top_users_chat",
+    "top_diseases_chat",
+    "top_corps_chat",
+}
+
+def _quick_keyboard_parse_alias(text: str) -> tuple[bool, str]:
+    raw = re.sub(r"\s+", " ", str(text or "").strip())
+    low = raw.casefold()
+    if not low:
+        return False, ""
+
+    for alias in QUICKKB_ALIASES:
+        a = alias.casefold()
+        if low == a:
+            return True, ""
+        if low.startswith(a + " "):
+            return True, raw[len(alias):].strip()
+    return False, ""
+
+def _quick_keyboard_random_config_id() -> str:
+    for _ in range(64):
+        code = "".join(random.choice(QUICKKB_ID_ALPHABET) for _i in range(QUICKKB_CONFIG_ID_LEN))
+        if not db_one("SELECT 1 FROM quick_keyboard_configs WHERE config_id=? LIMIT 1", (code,)):
+            return code
+    return hashlib.sha1(f"{now_ts()}:{random.random()}".encode("utf-8")).hexdigest()[:QUICKKB_CONFIG_ID_LEN]
+
+def quick_keyboard_default_slot(slot_index: int) -> dict:
+    idx = int(slot_index)
+    if idx < 0 or idx >= QUICKKB_SLOT_COUNT:
+        return {"slot_index": idx, "label": "", "command_text": "", "is_standard": 0}
+
+    row = QUICKKB_DEFAULT_SLOTS[idx]
+    if not row:
+        return {"slot_index": idx, "label": "", "command_text": "", "is_standard": 0}
+
+    return {
+        "slot_index": idx,
+        "label": str(row.get("label") or ""),
+        "command_text": str(row.get("command_text") or ""),
+        "is_standard": int(row.get("is_standard", 0) or 0),
+    }
+
+def quick_keyboard_ensure_config(user_id: int) -> str:
+    uid = int(user_id)
+    row = db_one(
+        "SELECT config_id FROM quick_keyboard_configs WHERE user_id=? LIMIT 1",
+        (uid,)
+    )
+
+    if not row:
+        code = _quick_keyboard_random_config_id()
+        db_exec(
+            "INSERT INTO quick_keyboard_configs(user_id, config_id, group_enabled, updated_at) VALUES (?,?,0,?)",
+            (uid, code, int(now_ts())),
+            commit=True
+        )
+        quick_keyboard_save_default_slots(uid)
+        return code
+
+    cnt = db_one("SELECT COUNT(*) AS c FROM quick_keyboard_slots WHERE user_id=?", (uid,))
+    if int(cnt["c"] or 0) == 0:
+        quick_keyboard_save_default_slots(uid)
+
+    return str(row["config_id"] or "")
+
+def quick_keyboard_save_default_slots(user_id: int):
+    uid = int(user_id)
+    now = int(now_ts())
+    db_exec("DELETE FROM quick_keyboard_slots WHERE user_id=?", (uid,), commit=True)
+
+    for idx in range(QUICKKB_SLOT_COUNT):
+        row = quick_keyboard_default_slot(idx)
+        label = str(row.get("label") or "").strip()
+        command_text = str(row.get("command_text") or "").strip()
+        if not label:
+            continue
+        db_exec(
+            "INSERT OR REPLACE INTO quick_keyboard_slots(user_id, slot_index, label, command_text, is_standard, updated_at) "
+            "VALUES (?,?,?,?,?,?)",
+            (uid, idx, label, command_text, int(row.get("is_standard", 0) or 0), now),
+            commit=True
+        )
+
+def quick_keyboard_config_id(user_id: int) -> str:
+    return quick_keyboard_ensure_config(int(user_id))
+
+def quick_keyboard_group_enabled(user_id: int) -> int:
+    quick_keyboard_ensure_config(int(user_id))
+    row = db_one(
+        "SELECT COALESCE(group_enabled,0) AS g FROM quick_keyboard_configs WHERE user_id=? LIMIT 1",
+        (int(user_id),)
+    )
+    return int(row["g"] or 0) if row else 0
+
+def quick_keyboard_set_group_enabled(user_id: int, enabled: bool):
+    quick_keyboard_ensure_config(int(user_id))
+    db_exec(
+        "UPDATE quick_keyboard_configs SET group_enabled=?, updated_at=? WHERE user_id=?",
+        (1 if bool(enabled) else 0, int(now_ts()), int(user_id)),
+        commit=True
+    )
+    if not bool(enabled):
+        quick_keyboard_disable_group_chats(int(user_id))
+
+def quick_keyboard_slots(user_id: int) -> list[dict]:
+    uid = int(user_id)
+    quick_keyboard_ensure_config(uid)
+
+    rows = db_all(
+        "SELECT slot_index, label, command_text, is_standard "
+        "FROM quick_keyboard_slots WHERE user_id=?",
+        (uid,)
+    ) or []
+
+    by_idx = {int(r["slot_index"]): r for r in rows}
+    out = []
+    invalid_indexes = []
+
+    for idx in range(QUICKKB_SLOT_COUNT):
+        row = by_idx.get(idx)
+        if not row:
+            out.append({
+                "slot_index": idx,
+                "label": "",
+                "command_text": "",
+                "is_standard": 0
+            })
+            continue
+
+        label = str(row["label"] or "").strip()
+        command_text = str(row["command_text"] or "").strip()
+
+        if (
+            not label
+            or not quick_keyboard_command_allowed_in_chat(
+                command_text,
+                "",
+                uid
+            )
+        ):
+            invalid_indexes.append(idx)
+            out.append({
+                "slot_index": idx,
+                "label": "",
+                "command_text": "",
+                "is_standard": 0
+            })
+            continue
+
+        out.append({
+            "slot_index": idx,
+            "label": label,
+            "command_text": command_text,
+            "is_standard": int(row["is_standard"] or 0),
+        })
+
+    if invalid_indexes:
+        placeholders = ",".join("?" for _ in invalid_indexes)
+
+        db_exec(
+            "DELETE FROM quick_keyboard_slots "
+            f"WHERE user_id=? AND slot_index IN ({placeholders})",
+            (uid, *invalid_indexes),
+            commit=True
+        )
+        db_exec(
+            "UPDATE quick_keyboard_configs SET updated_at=? WHERE user_id=?",
+            (int(now_ts()), uid),
+            commit=True
+        )
+
+    return out
+
+def quick_keyboard_cleanup_invalid_slots_all():
+    rows = db_all(
+        "SELECT DISTINCT user_id "
+        "FROM quick_keyboard_slots"
+    ) or []
+
+    for row in rows:
+        try:
+            quick_keyboard_slots(int(row["user_id"]))
+        except Exception:
+            pass
+
+def quick_keyboard_has_changes(user_id: int) -> bool:
+    uid = int(user_id)
+    if quick_keyboard_group_enabled(uid) != 0:
+        return True
+
+    current = quick_keyboard_slots(uid)
+    for idx in range(QUICKKB_SLOT_COUNT):
+        cur = current[idx]
+        default = quick_keyboard_default_slot(idx)
+        if (cur.get("label") or "") != (default.get("label") or ""):
+            return True
+        if (cur.get("command_text") or "") != (default.get("command_text") or ""):
+            return True
+        if int(cur.get("is_standard", 0) or 0) != int(default.get("is_standard", 0) or 0):
+            return True
+    return False
+
+def quick_keyboard_reset_to_default(user_id: int) -> str:
+    uid = int(user_id)
+    db_exec("DELETE FROM quick_keyboard_slots WHERE user_id=?", (uid,), commit=True)
+    db_exec("DELETE FROM quick_keyboard_configs WHERE user_id=?", (uid,), commit=True)
+    db_exec("DELETE FROM quick_keyboard_editor_state WHERE user_id=?", (uid,), commit=True)
+    db_exec("DELETE FROM quick_keyboard_chat_state WHERE user_id=?", (uid,), commit=True)
+
+    code = _quick_keyboard_random_config_id()
+    db_exec(
+        "INSERT INTO quick_keyboard_configs(user_id, config_id, group_enabled, updated_at) VALUES (?,?,0,?)",
+        (uid, code, int(now_ts())),
+        commit=True
+    )
+    quick_keyboard_save_default_slots(uid)
+    return code
+
+def quick_keyboard_editor_state(user_id: int):
+    return db_one(
+        "SELECT user_id, selected_index, opened_from_settings, chat_id, message_id, updated_at "
+        "FROM quick_keyboard_editor_state WHERE user_id=? LIMIT 1",
+        (int(user_id),)
+    )
+
+def quick_keyboard_set_editor_state(
+    user_id: int,
+    *,
+    selected_index=None,
+    opened_from_settings: bool = False,
+    chat_id: int = 0,
+    message_id: int = 0
+):
+    uid = int(user_id)
+    sel = None
+    if selected_index is not None:
+        try:
+            x = int(selected_index)
+            if 0 <= x < QUICKKB_SLOT_COUNT:
+                sel = x
+        except Exception:
+            sel = None
+
+    db_exec(
+        "INSERT INTO quick_keyboard_editor_state(user_id, selected_index, opened_from_settings, chat_id, message_id, updated_at) "
+        "VALUES (?,?,?,?,?,?) "
+        "ON CONFLICT(user_id) DO UPDATE SET "
+        "selected_index=excluded.selected_index, opened_from_settings=excluded.opened_from_settings, "
+        "chat_id=excluded.chat_id, message_id=excluded.message_id, updated_at=excluded.updated_at",
+        (uid, sel, 1 if bool(opened_from_settings) else 0, int(chat_id or 0), int(message_id or 0), int(now_ts())),
+        commit=True
+    )
+
+def quick_keyboard_clear_editor_state(user_id: int):
+    db_exec("DELETE FROM quick_keyboard_editor_state WHERE user_id=?", (int(user_id),), commit=True)
+
+def quick_keyboard_editor_cancel_reply_markup() -> ReplyKeyboardMarkup:
+    kb = ReplyKeyboardMarkup(resize_keyboard=True, selective=True)
+    kb.row(KeyboardButton(QUICKKB_EDITOR_CANCEL_TEXT))
+    return kb
+
+def quick_keyboard_show_editor_cancel_reply_keyboard(chat_id: int):
+    try:
+        bot.send_message(
+            int(chat_id),
+            "⌨️ Чтобы закрыть настройку быстрой клавиатуры, нажмите «Отмена».",
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=quick_keyboard_editor_cancel_reply_markup()
+        )
+    except Exception:
+        pass
+
+def quick_keyboard_handle_editor_cancel(message) -> bool:
+    if (getattr(getattr(message, "chat", None), "type", "") or "").lower() != "private":
+        return False
+
+    if str(getattr(message, "text", "") or "").strip().casefold() != QUICKKB_EDITOR_CANCEL_TEXT.casefold():
+        return False
+
+    uid = int(getattr(getattr(message, "from_user", None), "id", 0) or 0)
+    if uid <= 0:
+        return False
+
+    state = quick_keyboard_editor_state(uid)
+    if not state:
+        return False
+
+    editor_chat_id = int(state["chat_id"] or 0)
+    editor_message_id = int(state["message_id"] or 0)
+    quick_keyboard_clear_editor_state(uid)
+
+    if editor_chat_id != 0 and editor_message_id > 0:
+        try:
+            bot.delete_message(editor_chat_id, editor_message_id)
+        except Exception:
+            pass
+
+    sent = bot.reply_to(
+        message,
+        "⌨️ Настройка быстрой клавиатуры закрыта.",
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+        reply_markup=quick_keyboard_reply_markup(uid, "private")
+    )
+
+    try:
+        quick_keyboard_mark_chat_enabled(uid, int(message.chat.id), int(sent.message_id))
+    except Exception:
+        pass
+
+    return True
+
+def quick_keyboard_selected_index(user_id: int):
+    row = quick_keyboard_editor_state(int(user_id))
+    if not row:
+        return None
+    if row["selected_index"] is None:
+        return None
+    try:
+        idx = int(row["selected_index"])
+    except Exception:
+        return None
+    return idx if 0 <= idx < QUICKKB_SLOT_COUNT else None
+
+def quick_keyboard_slot_label_for_editor(slot: dict) -> str:
+    label = str(slot.get("label") or "").strip()
+    return label if label else "—"
+
+def quick_keyboard_config_id_html(user_id: int) -> str:
+    return f"<code><tg-spoiler>{h(quick_keyboard_config_id(int(user_id)))}</tg-spoiler></code>"
+
+def quick_keyboard_render_editor_text(user_id: int) -> str:
+    uid = int(user_id)
+    group_status = "⭕" if quick_keyboard_group_enabled(uid) == 1 else "❌"
+    selected = quick_keyboard_selected_index(uid)
+
+    lines = [
+        "⌨️ Персонализация быстрой клавиатуры",
+        "",
+        f"Групповая клавиатура: {group_status}",
+        f"ID конфигурации: {quick_keyboard_config_id_html(uid)}",
+        "",
+        "<blockquote expandable> ИНСТРУКЦИЯ\nВыберите слот, чтобы переместить, удалить или заменить кнопку.",
+        "Пустой слот можно выбрать и отправить сообщение в формате:",
+        "1-я строка – Название кнопки\nсо 2-ой строки – Команда</blockquote>",
+    ]
+
+    if selected is not None:
+        slot = quick_keyboard_slots(uid)[int(selected)]
+        lines.append("")
+        lines.append(f"Выбран слот: №<b>{int(selected)}</b> | {h(quick_keyboard_slot_label_for_editor(slot))}")
+
+    return "\n".join(lines)
+
+def quick_keyboard_editor_kb(user_id: int) -> InlineKeyboardMarkup:
+    uid = int(user_id)
+    selected = quick_keyboard_selected_index(uid)
+    slots = quick_keyboard_slots(uid)
+    state = quick_keyboard_editor_state(uid)
+    opened_from_settings = bool(state and int(state["opened_from_settings"] or 0) == 1)
+
+    kb = InlineKeyboardMarkup(row_width=3)
+
+    for row_start in range(0, QUICKKB_SLOT_COUNT, QUICKKB_ROW_SIZE):
+        row_buttons = []
+        for idx in range(row_start, min(row_start + QUICKKB_ROW_SIZE, QUICKKB_SLOT_COUNT)):
+            slot = slots[idx]
+            text = quick_keyboard_slot_label_for_editor(slot)
+            if selected is not None and int(selected) == int(idx):
+                text = f"{text}" # пометка активной кнопки в редакторе
+            row_buttons.append(
+                _ikb(
+                    text,
+                    callback_data=f"{QUICKKB_TAG}:{uid}:S:{idx}",
+                    style=("primary" if selected is not None and int(selected) == int(idx) else None)
+                )
+            )
+        kb.row(*row_buttons)
+
+    sys_row = []
+    if quick_keyboard_has_changes(uid):
+        sys_row.append(_ikb("По умолчанию", callback_data=f"{QUICKKB_TAG}:{uid}:DEF", style="danger"))
+
+    if selected is not None:
+        slot = slots[int(selected)]
+        if str(slot.get("label") or "").strip():
+            sys_row.append(_ikb("Удалить", callback_data=f"{QUICKKB_TAG}:{uid}:DEL", style="danger"))
+
+    if sys_row:
+        kb.row(*sys_row)
+
+    if quick_keyboard_group_enabled(uid) == 1:
+        kb.add(_ikb("Выкл группы", callback_data=f"{QUICKKB_TAG}:{uid}:GR", style="danger"))
+    else:
+        kb.add(_ikb("Вкл группы", callback_data=f"{QUICKKB_TAG}:{uid}:GR", style="success"))
+
+    if opened_from_settings:
+        kb.add(_ikb("❰ К параметрам", callback_data=f"{QUICKKB_TAG}:{uid}:BACK"))
+
+    return kb
+
+def quick_keyboard_edit_editor(cq, user_id: int):
+    uid = int(user_id)
+    text = quick_keyboard_render_editor_text(uid)
+    rm = quick_keyboard_editor_kb(uid)
+
+    if getattr(cq, "inline_message_id", None):
+        limited_edit_message_text(
+            text=text,
+            inline_id=cq.inline_message_id,
+            parse_mode="HTML",
+            reply_markup=rm,
+            disable_web_page_preview=True
+        )
+        return
+
+    if getattr(cq, "message", None):
+        limited_edit_message_text(
+            text=text,
+            chat_id=cq.message.chat.id,
+            msg_id=cq.message.message_id,
+            parse_mode="HTML",
+            reply_markup=rm,
+            disable_web_page_preview=True
+        )
+
+def quick_keyboard_open_editor(message, *, opened_from_settings: bool = False):
+    uid = int(message.from_user.id)
+    quick_keyboard_ensure_config(uid)
+    quick_keyboard_set_editor_state(
+        uid,
+        selected_index=None,
+        opened_from_settings=opened_from_settings,
+        chat_id=int(message.chat.id),
+        message_id=0
+    )
+
+    sent = bot.send_message(
+        int(message.chat.id),
+        quick_keyboard_render_editor_text(uid),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+        reply_markup=quick_keyboard_editor_kb(uid)
+    )
+
+    quick_keyboard_set_editor_state(
+        uid,
+        selected_index=None,
+        opened_from_settings=opened_from_settings,
+        chat_id=int(sent.chat.id),
+        message_id=int(sent.message_id)
+    )
+    quick_keyboard_show_editor_cancel_reply_keyboard(int(message.chat.id))
+
+def quick_keyboard_open_editor_from_callback(cq, user_id: int):
+    uid = int(user_id)
+    chat_id = int(cq.message.chat.id) if getattr(cq, "message", None) else 0
+    message_id = int(cq.message.message_id) if getattr(cq, "message", None) else 0
+
+    quick_keyboard_ensure_config(uid)
+    quick_keyboard_set_editor_state(
+        uid,
+        selected_index=None,
+        opened_from_settings=True,
+        chat_id=chat_id,
+        message_id=message_id
+    )
+    quick_keyboard_edit_editor(cq, uid)
+    if chat_id != 0:
+        quick_keyboard_show_editor_cancel_reply_keyboard(chat_id)
+
+def quick_keyboard_set_slot(
+    user_id: int,
+    slot_index: int,
+    label: str,
+    command_text: str,
+    is_standard: int = 0
+) -> bool:
+    uid = int(user_id)
+    idx = int(slot_index)
+
+    if idx < 0 or idx >= QUICKKB_SLOT_COUNT:
+        return False
+
+    label = str(label or "").strip()
+    command_text = str(command_text or "").strip()
+
+    if not label:
+        db_exec(
+            "DELETE FROM quick_keyboard_slots "
+            "WHERE user_id=? AND slot_index=?",
+            (uid, idx),
+            commit=True
+        )
+        return True
+
+    if not quick_keyboard_command_allowed_in_chat(
+        command_text,
+        "",
+        uid
+    ):
+        return False
+
+    db_exec(
+        "INSERT OR REPLACE INTO quick_keyboard_slots("
+        "user_id, slot_index, label, command_text, is_standard, updated_at"
+        ") VALUES (?,?,?,?,?,?)",
+        (
+            uid,
+            idx,
+            label,
+            command_text,
+            int(is_standard or 0),
+            int(now_ts())
+        ),
+        commit=True
+    )
+    db_exec(
+        "UPDATE quick_keyboard_configs SET updated_at=? WHERE user_id=?",
+        (int(now_ts()), uid),
+        commit=True
+    )
+    return True
+
+def quick_keyboard_swap_slots(user_id: int, a: int, b: int):
+    uid = int(user_id)
+    ia = int(a)
+    ib = int(b)
+    if ia == ib:
+        return
+    if ia < 0 or ia >= QUICKKB_SLOT_COUNT or ib < 0 or ib >= QUICKKB_SLOT_COUNT:
+        return
+
+    slots = quick_keyboard_slots(uid)
+    sa = slots[ia]
+    sb = slots[ib]
+
+    with DB_LOCK:
+        c = conn.cursor()
+        try:
+            c.execute("BEGIN")
+            c.execute("DELETE FROM quick_keyboard_slots WHERE user_id=? AND slot_index IN (?,?)", (uid, ia, ib))
+            for idx, row in ((ia, sb), (ib, sa)):
+                label = str(row.get("label") or "").strip()
+                if not label:
+                    continue
+                c.execute(
+                    "INSERT OR REPLACE INTO quick_keyboard_slots(user_id, slot_index, label, command_text, is_standard, updated_at) "
+                    "VALUES (?,?,?,?,?,?)",
+                    (
+                        uid,
+                        idx,
+                        label,
+                        str(row.get("command_text") or "").strip(),
+                        int(row.get("is_standard", 0) or 0),
+                        int(now_ts())
+                    )
+                )
+            c.execute("UPDATE quick_keyboard_configs SET updated_at=? WHERE user_id=?", (int(now_ts()), uid))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            try:
+                c.close()
+            except Exception:
+                pass
+
+def quick_keyboard_delete_selected_slot(user_id: int):
+    uid = int(user_id)
+    selected = quick_keyboard_selected_index(uid)
+    if selected is None:
+        return False
+
+    state = quick_keyboard_editor_state(uid)
+    opened_from_settings = bool(state and int(state["opened_from_settings"] or 0) == 1)
+    chat_id = int(state["chat_id"] or 0) if state else 0
+    message_id = int(state["message_id"] or 0) if state else 0
+
+    db_exec("DELETE FROM quick_keyboard_slots WHERE user_id=? AND slot_index=?", (uid, int(selected)), commit=True)
+    quick_keyboard_set_editor_state(
+        uid,
+        selected_index=None,
+        opened_from_settings=opened_from_settings,
+        chat_id=chat_id,
+        message_id=message_id
+    )
+    db_exec("UPDATE quick_keyboard_configs SET updated_at=? WHERE user_id=?", (int(now_ts()), uid), commit=True)
+    return True
+
+def _quick_keyboard_title_limits_ok(title: str) -> tuple[bool, str]:
+    raw = str(title or "").strip()
+    if not raw:
+        return False, "📑 Название кнопки не может быть пустым."
+
+    emoji_count = 0
+    text_count = 0
+    for ch in raw:
+        if ch in ("\ufe0e", "\ufe0f", "\u200d"):
+            continue
+        if _is_emoji_char(ch):
+            emoji_count += 1
+        else:
+            text_count += 1
+
+    if text_count > 30:
+        return False, "📑 В названии кнопки может быть не больше 30 текстовых символов."
+    if emoji_count > 20:
+        return False, "📑 В названии кнопки может быть не больше 20 эмодзи."
+    return True, ""
+
+def quick_keyboard_parse_button_input(text: str) -> tuple[bool, str, str, str]:
+    raw = str(text or "").strip("\n")
+    lines = raw.splitlines()
+    if len(lines) < 2:
+        return False, "", "", "📑 Отправьте две строки: название кнопки и команду."
+
+    label = (
+        str(lines[0] or "")
+        .strip()
+        .translate(QUICKKB_TITLE_LATIN_LOOKALIKES)
+    )
+    ok, err = _quick_keyboard_title_limits_ok(label)
+    
+    if not ok:
+        return False, "", "", err
+
+    command_text = "\n".join(lines[1:]).strip("\n")
+    if not command_text.strip():
+        return False, "", "", "📑 Команда кнопки не может быть пустой."
+
+    return True, label, command_text, ""
+
+def quick_keyboard_handle_editor_input(message) -> bool:
+    if (getattr(getattr(message, "chat", None), "type", "") or "").lower() != "private":
+        return False
+
+    uid = int(getattr(getattr(message, "from_user", None), "id", 0) or 0)
+    if uid <= 0:
+        return False
+
+    selected = quick_keyboard_selected_index(uid)
+    if selected is None:
+        return False
+
+    ok, label, command_text, err = quick_keyboard_parse_button_input(getattr(message, "text", "") or "")
+    if not ok:
+        bot.reply_to(message, err, parse_mode="HTML", disable_web_page_preview=True)
+        return True
+
+    state = quick_keyboard_editor_state(uid)
+    opened_from_settings = bool(state and int(state["opened_from_settings"] or 0) == 1)
+    chat_id = int(state["chat_id"] or 0) if state else 0
+    message_id = int(state["message_id"] or 0) if state else 0
+
+    if not quick_keyboard_set_slot(
+        uid,
+        int(selected),
+        label,
+        command_text,
+        is_standard=0
+    ):
+        bot.reply_to(
+            message,
+            "📑 Команда не поддерживается. Используйте другую команду или повторите попытку.",
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
+        return True
+
+    quick_keyboard_set_editor_state(
+        uid,
+        selected_index=None,
+        opened_from_settings=opened_from_settings,
+        chat_id=chat_id,
+        message_id=message_id
+    )
+
+    state = quick_keyboard_editor_state(uid)
+    if state and int(state["chat_id"] or 0) != 0 and int(state["message_id"] or 0) != 0:
+        try:
+            limited_edit_message_text(
+                text=quick_keyboard_render_editor_text(uid),
+                chat_id=int(state["chat_id"]),
+                msg_id=int(state["message_id"]),
+                parse_mode="HTML",
+                reply_markup=quick_keyboard_editor_kb(uid),
+                disable_web_page_preview=True
+            )
+        except Exception:
+            pass
+
+    bot.reply_to(message, "✅ Кнопка сохранена.", parse_mode="HTML", disable_web_page_preview=True)
+    return True
+
+def quick_keyboard_reply_markup(user_id: int, chat_type: str = "private") -> ReplyKeyboardMarkup:
+    uid = int(user_id)
+    chat_type = str(chat_type or "private").lower()
+    kb = ReplyKeyboardMarkup(resize_keyboard=True, selective=True)
+
+    slots = quick_keyboard_slots(uid)
+    for row_start in range(0, QUICKKB_SLOT_COUNT, QUICKKB_ROW_SIZE):
+        row_buttons = []
+        for idx in range(row_start, min(row_start + QUICKKB_ROW_SIZE, QUICKKB_SLOT_COUNT)):
+            slot = slots[idx]
+            label = str(slot.get("label") or "").strip()
+            command_text = str(slot.get("command_text") or "").strip()
+            if not label:
+                continue
+            if not quick_keyboard_command_allowed_in_chat(command_text, chat_type, uid):
+                continue
+            row_buttons.append(KeyboardButton(label))
+        if row_buttons:
+            kb.row(*row_buttons)
+
+    if is_creator(uid) or is_support(uid):
+        agent_buttons = []
+        if quick_keyboard_command_allowed_in_chat("техкоманды", chat_type, uid):
+            agent_buttons.append(KeyboardButton("🥼 Техкоманды"))
+        if quick_keyboard_command_allowed_in_chat("👥 Пользователи", chat_type, uid):
+            agent_buttons.append(KeyboardButton("👥 Пользователи"))
+        if agent_buttons:
+            kb.row(*agent_buttons)
+
+    kb.row(KeyboardButton("Скрыть клавиатуру"))
+
+    return kb
+
+def quick_keyboard_command_allowed_in_chat(
+    command_text: str,
+    chat_type: str,
+    user_id: int = 0
+) -> bool:
+    text = str(command_text or "").strip()
+    if not text:
+        return False
+
+    parsed = parse_message_as_command(text)
+
+    if parsed is None:
+        action, _tail, _comment = _parse_rp_message(
+            text,
+            int(user_id or 0)
+        )
+        return bool(action)
+
+    if parsed.cmd not in QUICKKB_ALLOWED_COMMANDS:
+        return False
+
+    if (
+        leading_sign_after_bot_prefix(text)
+        and parsed.cmd not in SIGNED_COMMANDS_ALLOWED
+    ):
+        return False
+
+    ctype = str(chat_type or "").lower()
+    is_private = ctype == "private"
+    is_group = ctype in ("group", "supergroup")
+
+    if is_group and parsed.cmd in QUICKKB_PRIVATE_ONLY_CMDS:
+        return False
+
+    if is_private and parsed.cmd in QUICKKB_GROUP_ONLY_CMDS:
+        return False
+
+    low = text.casefold()
+    if (
+        is_private
+        and re.search(r"(^|\s)чат($|\s)", low)
+        and parsed.cmd in (
+            "infect",
+            "top_users_chat",
+            "top_diseases_chat",
+            "top_corps_chat",
+        )
+    ):
+        return False
+
+    return True
+
+def quick_keyboard_mark_chat_enabled(user_id: int, chat_id: int, message_id: int = 0):
+    db_exec(
+        "INSERT INTO quick_keyboard_chat_state(user_id, chat_id, enabled, message_chat_id, message_id, updated_at) "
+        "VALUES (?,?,?,?,?,?) "
+        "ON CONFLICT(user_id, chat_id) DO UPDATE SET "
+        "enabled=1, message_chat_id=excluded.message_chat_id, message_id=excluded.message_id, updated_at=excluded.updated_at",
+        (int(user_id), int(chat_id), 1, int(chat_id), int(message_id or 0), int(now_ts())),
+        commit=True
+    )
+
+def quick_keyboard_mark_chat_disabled(user_id: int, chat_id: int):
+    db_exec(
+        "INSERT INTO quick_keyboard_chat_state(user_id, chat_id, enabled, message_chat_id, message_id, updated_at) "
+        "VALUES (?,?,0,0,0,?) "
+        "ON CONFLICT(user_id, chat_id) DO UPDATE SET "
+        "enabled=0, message_chat_id=0, message_id=0, updated_at=excluded.updated_at",
+        (int(user_id), int(chat_id), int(now_ts())),
+        commit=True
+    )
+
+def quick_keyboard_chat_enabled(user_id: int, chat_id: int) -> bool:
+    row = db_one(
+        "SELECT COALESCE(enabled,0) AS e FROM quick_keyboard_chat_state WHERE user_id=? AND chat_id=? LIMIT 1",
+        (int(user_id), int(chat_id))
+    )
+    return bool(row and int(row["e"] or 0) == 1)
+
+def quick_keyboard_disable_group_chats(user_id: int):
+    db_exec(
+        "UPDATE quick_keyboard_chat_state SET enabled=0, message_chat_id=0, message_id=0, updated_at=? "
+        "WHERE user_id=? AND chat_id<0",
+        (int(now_ts()), int(user_id)),
+        commit=True
+    )
+
+def quick_keyboard_protected_autodelete_message(chat_id: int, message_id: int) -> bool:
+    cid = int(chat_id or 0)
+    mid = int(message_id or 0)
+    if cid >= 0 or mid <= 0:
+        return False
+
+    row = db_one(
+        "SELECT 1 FROM quick_keyboard_chat_state "
+        "WHERE chat_id=? AND message_id=? AND enabled=1 LIMIT 1",
+        (cid, mid)
+    )
+    return bool(row)
+
+def quick_keyboard_editor_hold_active(chat_id: int) -> bool:
+    cid = int(chat_id or 0)
+    if cid <= 0:
+        return False
+
+    row = db_one(
+        "SELECT updated_at FROM quick_keyboard_editor_state WHERE user_id=? LIMIT 1",
+        (cid,)
+    )
+    if not row:
+        return False
+
+    updated_at = int(row["updated_at"] or 0)
+    if updated_at <= 0 or updated_at < int(now_ts()) - QUICKKB_EDITOR_TTL_SEC:
+        db_exec("DELETE FROM quick_keyboard_editor_state WHERE user_id=?", (cid,), commit=True)
+        return False
+
+    return True
+
+def quick_keyboard_resolve_button_command(user_id: int, chat_id: int, chat_type: str, label: str) -> tuple[bool, str]:
+    uid = int(user_id)
+    cid = int(chat_id)
+    ctype = str(chat_type or "private").lower()
+    raw_label = str(label or "").strip()
+    if not raw_label:
+        return False, ""
+
+    if not quick_keyboard_chat_enabled(uid, cid):
+        return False, ""
+
+    for slot in quick_keyboard_slots(uid):
+        if str(slot.get("label") or "").strip() != raw_label:
+            continue
+        command_text = str(slot.get("command_text") or "").strip()
+        if not quick_keyboard_command_allowed_in_chat(command_text, ctype, uid):
+            return True, ""
+        return True, command_text
+
+    return False, ""
+
+def quick_keyboard_copy_by_id(user_id: int, config_id: str) -> tuple[bool, str]:
+    uid = int(user_id)
+    code = re.sub(r"\s+", "", str(config_id or "").strip())
+    if not code:
+        return False, "📑 Укажите ID конфигурации."
+
+    source = db_one(
+        "SELECT user_id, config_id FROM quick_keyboard_configs WHERE config_id=? LIMIT 1",
+        (code,)
+    )
+    if not source:
+        return False, "📑 Конфигурация не найдена."
+
+    source_uid = int(source["user_id"])
+    quick_keyboard_ensure_config(uid)
+
+    rows = quick_keyboard_slots(source_uid)
+
+    with DB_LOCK:
+        c = conn.cursor()
+        try:
+            c.execute("BEGIN")
+            c.execute("DELETE FROM quick_keyboard_slots WHERE user_id=?", (uid,))
+            for r in rows:
+                idx = int(r.get("slot_index", -1))
+                label = str(r.get("label") or "").strip()
+                command_text = str(r.get("command_text") or "").strip()
+            
+                if idx < 0 or idx >= QUICKKB_SLOT_COUNT:
+                    continue
+            
+                if (
+                    not label
+                    or not quick_keyboard_command_allowed_in_chat(
+                        command_text,
+                        "",
+                        uid
+                    )
+                ):
+                    continue
+            
+                c.execute(
+                    "INSERT OR REPLACE INTO quick_keyboard_slots("
+                    "user_id, slot_index, label, command_text, is_standard, updated_at"
+                    ") VALUES (?,?,?,?,?,?)",
+                    (
+                        uid,
+                        idx,
+                        label,
+                        command_text,
+                        int(r.get("is_standard", 0) or 0),
+                        int(now_ts())
+                    )
+                )
+            c.execute("UPDATE quick_keyboard_configs SET updated_at=? WHERE user_id=?", (int(now_ts()), uid))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            try:
+                c.close()
+            except Exception:
+                pass
+
+    quick_keyboard_set_editor_state(uid, selected_index=None)
+    return True, "✅ Конфигурация клавиатуры скопирована."
+
+def handle_quick_keyboard_command(message, parsed: "Parsed"):
+    uid = int(message.from_user.id)
+    chat_id = int(message.chat.id)
+    chat_type = (getattr(message.chat, "type", "") or "").lower()
+    args = str(parsed.args or "").strip()
+
+    quick_keyboard_ensure_config(uid)
+
+    if parsed.cmd == "quick_keyboard_enable":
+        if (
+            chat_type in ("group", "supergroup")
+            and quick_keyboard_group_enabled(uid) != 1
+        ):
+            reply_markup = None
+            pm_url = _bot_pm_url()
+
+            if pm_url:
+                reply_markup = InlineKeyboardMarkup()
+                reply_markup.add(
+                    _ikb(
+                        "Перейти к редактированию",
+                        url=f"{pm_url}?start=qk_edit_{uid}",
+                        style="primary"
+                    )
+                )
+
+            bot.reply_to(
+                message,
+                "📑 Групповая клавиатура отключена в ваших настройках. "
+                "Включите её в редакторе клавиатуры.",
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=reply_markup
+            )
+            return
+
+        send_quick_nav_keyboard(chat_id, uid, chat_type)
+        return
+
+    if parsed.cmd == "quick_keyboard_disable":
+        quick_keyboard_mark_chat_disabled(uid, chat_id)
+
+        bot.reply_to(
+            message,
+            "⌨️ Быстрая клавиатура отключена в этом чате.",
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=report_reply_remove_markup()
+        )
+        return
+
+    if chat_type in ("group", "supergroup"):
+        if args:
+            return
+
+        reply_markup = None
+        pm_url = _bot_pm_url()
+
+        if pm_url:
+            config_id = quick_keyboard_config_id(uid)
+            reply_markup = InlineKeyboardMarkup()
+
+            reply_markup.add(
+                _ikb(
+                    "Перейти к редактированию",
+                    url=f"{pm_url}?start=qk_edit_{uid}",
+                    style="primary"
+                )
+            )
+            reply_markup.add(
+                _ikb(
+                    "Скопировать ID",
+                    url=f"{pm_url}?start=qk_copy_{uid}_{config_id}",
+                    style="success"
+                )
+            )
+
+        bot.reply_to(
+            message,
+            "⌨️ ID вашей быстрой клавиатуры: "
+            f"{quick_keyboard_config_id_html(uid)}\n\n"
+            "Редактор доступен только в личных сообщениях с ботом.",
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=reply_markup
+        )
+        return
+
+    if args:
+        ok, text = quick_keyboard_copy_by_id(uid, args)
+        bot.reply_to(
+            message,
+            text,
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
+        return
+
+    quick_keyboard_open_editor(message, opened_from_settings=False)
+
+# KEYBOARDS
 def add_to_chat_keyboard() -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup()
     if BOT_USERNAME:
         url = f"https://t.me/{BOT_USERNAME}?startgroup=1"
     else:
         url = "https://t.me/"
-    kb.add(InlineKeyboardButton("Добавить в свой чат", url=url, style="success"))
+    kb.add(_ikb_premium_counter("➕", "Добавить в свой чат", url=url, style="success"))
     return kb
 
-def kb_quick_nav(user_id: int) -> ReplyKeyboardMarkup:
+def kb_quick_nav(user_id: int, chat_type: str = "private") -> ReplyKeyboardMarkup:
+    return quick_keyboard_reply_markup(int(user_id), str(chat_type or "private"))
+
+def send_quick_nav_keyboard(
+    chat_id: int,
+    user_id: int,
+    chat_type: str = "private",
+    text: str = ""
+):
     uid = int(user_id)
+    ctype = str(chat_type or "private").lower()
 
-    kb = ReplyKeyboardMarkup(resize_keyboard=True, selective=True)
+    message_text = str(text or "").strip()
 
-    kb.row(
-        KeyboardButton("ℹ️ Помощь"),
-        KeyboardButton("👨‍⚕️ Техподдержка"),
-        KeyboardButton("📚 Быстрый поиск")
-    )
+    if not message_text:
+        if ctype in ("group", "supergroup"):
+            message_text = (
+                "⌨️ Быстрая клавиатура "
+                f"<b>{public_user_tag(uid)}</b> включена."
+            )
+        else:
+            message_text = "⌨️ Быстрая клавиатура включена."
 
-    kb.row(
-        KeyboardButton("⚙️ Параметры"),
-        KeyboardButton("🔗 Команды")
-    )
-
-    if is_creator(uid) or is_support(uid):
-        kb.row(
-            KeyboardButton("🥼 Техкоманды"),
-            KeyboardButton("👥 Пользователи")
-        )
-
-    kb.row(KeyboardButton("Скрыть клавиатуру"))
-
-    return kb
-
-def send_quick_nav_keyboard(chat_id: int, user_id: int):
-    bot.send_message(
+    msg = bot.send_message(
         int(chat_id),
-        "⌨️ Быстрая клавиатура включена.",
-        reply_markup=kb_quick_nav(int(user_id)),
-        disable_notification=True
+        message_text,
+        parse_mode="HTML",
+        reply_markup=kb_quick_nav(uid, ctype),
+        disable_notification=True,
+        disable_web_page_preview=True
     )
+
+    quick_keyboard_mark_chat_enabled(
+        uid,
+        int(chat_id),
+        int(getattr(msg, "message_id", 0) or 0)
+    )
+    return msg
 
 def _quick_nav_button_text_is_private_only(text: str) -> bool:
     low = (text or "").strip().casefold()
@@ -19315,10 +23124,17 @@ def _quick_nav_button_text_is_private_only(text: str) -> bool:
         "🔗 команды",
         "🥼 техкоманды",
         "👥 пользователи",
-        "скрыть клавиатуру",
     }
 
 def handle_hide_quick_nav_keyboard(message):
+    try:
+        quick_keyboard_mark_chat_disabled(
+            int(message.from_user.id),
+            int(message.chat.id)
+        )
+    except Exception:
+        pass
+
     bot.reply_to(
         message,
         "⌨️ Клавиатура скрыта.",
@@ -19868,6 +23684,12 @@ def try_handle_rp_action_message(message) -> bool:
         return False
     
     if rp_commands_enabled(int(actor_id)) != 1:
+        bot.reply_to(
+            message,
+            "🔒 Вы запретили использование РП-команд. Для включения используйте команду «<code>Био +рп</code>».",
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
         return True
     
     marker_mode = _mrp_marker_mode(str(action.get("action_text") or ""))
@@ -19968,6 +23790,19 @@ def try_handle_rp_action_message(message) -> bool:
             return True
 
         return False
+
+    if (
+        chat_type == "private"
+        and int(target_id or 0) > 0
+        and not bool(target_is_bot)
+    ):
+        _try_send_rp_result_to_pm_users(
+            int(actor_id),
+            int(target_id),
+            text,
+            target_is_bot=False,
+            include_actor=False
+        )
 
     _rp_insert_event(action["trigger_key"], int(actor_id), int(target_id or 0))
     return True
@@ -20767,6 +24602,61 @@ def _handle_start_payload(message, payload: str) -> bool:
     uid = int(message.from_user.id)
     payload = str(payload or "").strip()
 
+    qk_editor_match = re.fullmatch(r"qk_edit_(\d+)", payload)
+    if qk_editor_match:
+        owner_id = int(qk_editor_match.group(1))
+
+        if owner_id != uid:
+            bot.send_message(
+                int(message.chat.id),
+                "📑 Эта кнопка предназначена другому пользователю.",
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
+            return True
+
+        quick_keyboard_open_editor(
+            message,
+            opened_from_settings=False
+        )
+        return True
+
+    qk_copy_match = re.fullmatch(
+        r"qk_copy_(\d+)_([A-Za-z0-9]{10})",
+        payload
+    )
+    if qk_copy_match:
+        owner_id = int(qk_copy_match.group(1))
+        config_id = qk_copy_match.group(2)
+
+        if owner_id == uid:
+            bot.send_message(
+                int(message.chat.id),
+                "📑 Нельзя скопировать собственную конфигурацию клавиатуры.",
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
+            return True
+
+        ok, text = quick_keyboard_copy_by_id(uid, config_id)
+
+        if ok:
+            send_quick_nav_keyboard(
+                int(message.chat.id),
+                uid,
+                "private",
+                text=text
+            )
+        else:
+            bot.send_message(
+                int(message.chat.id),
+                text,
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
+
+        return True
+
     role_payload = _agent_role_parse_payload(payload)
     if role_payload:
         if int(role_payload["user_id"]) != uid:
@@ -20873,9 +24763,9 @@ def _timer_create_one_from_block(user_id: int, chat_id: int, block_text: str) ->
         return False, "❎ Таймер не распознан/удалось создать."
 
     command_text = _timer_body_command(block)
-    ok_cmd, cmd_err = _timer_validate_body_command(command_text)
+    ok_cmd, cmd_err = _timer_validate_body_command(command_text, uid)
     if not ok_cmd:
-        return False, f"❎ Таймер не распознан/удалось создать.\nПричина: {h(cmd_err)}"
+        return False, f"❎ Таймер не распознан/удалось создать.\nПричина: {cmd_err}"
 
     current_rows = _timer_rows_for_user(uid)
     if len(current_rows) >= 10:
@@ -21008,9 +24898,14 @@ def handle_timer_commands(message, parsed: Parsed):
         return
 
     command_text = _timer_body_command(message.text or "")
-    ok_cmd, cmd_err = _timer_validate_body_command(command_text)
+    ok_cmd, cmd_err = _timer_validate_body_command(command_text, uid)
     if not ok_cmd:
-        bot.reply_to(message, cmd_err)
+        bot.reply_to(
+            message,
+            cmd_err,
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
         return
 
     current_rows = _timer_rows_for_user(uid)
@@ -21606,17 +25501,24 @@ def render_lab_infected_list(owner_id: int) -> str:
     lines.append(f"🧬 +{total_daily_res} {total_res_word}")
     return "\n".join(lines)
 
-def render_lab_diseases_list(owner_id: int) -> str:
+def render_lab_diseases_list(owner_id: int, *, visible_current_lab_only: bool = True) -> str:
+    params = [int(owner_id)]
+    where_extra = ""
+    if bool(visible_current_lab_only) and is_lab_active(int(owner_id)):
+        where_extra = "AND COALESCE(i.target_lab_epoch,0)=? "
+        params.append(int(get_lab_epoch(int(owner_id))))
+
     rows = db_all(
         "SELECT i.attacker_id, i.end_ts, i.start_ts, COALESCE(i.known_to_target,0) AS known_to_target, "
-        "COALESCE(la.pathogen_name,'') AS current_pathogen_name, "
+        "COALESCE(NULLIF(TRIM(la.pathogen_name),''), i.pathogen_name, '') AS current_pathogen_name, "
         "u.username, u.first_name, u.last_name "
         "FROM infections i "
         "LEFT JOIN labs la ON la.user_id=i.attacker_id "
         "LEFT JOIN users u ON u.user_id=i.attacker_id "
         "WHERE i.target_id=? "
+        + where_extra +
         "ORDER BY i.start_ts DESC LIMIT 30",
-        (int(owner_id),)
+        tuple(params)
     ) or []
 
     lines = ["🔬 СПИСОК ВАШИХ БОЛЕЗНЕЙ:"]
@@ -22033,9 +25935,18 @@ def autodelete_post_hold_active(chat_id: int) -> bool:
 
     try:
         stage, _created_ts = post_state_get(cid)
-        return _post_is_draft_stage(stage)
+        if _post_is_draft_stage(stage):
+            return True
     except Exception:
-        return False
+        pass
+
+    try:
+        if quick_keyboard_editor_hold_active(cid):
+            return True
+    except Exception:
+        pass
+
+    return False
 
 def _message_has_inline_buttons(msg) -> bool:
     try:
@@ -22124,6 +26035,11 @@ def run_chat_autodelete_once(chat_id: Optional[int] = None):
 
         for r in rows:
             mid = int(r["message_id"])
+            try:
+                if quick_keyboard_protected_autodelete_message(cid, mid):
+                    continue
+            except Exception:
+                pass
             try:
                 bot.delete_message(cid, mid)
             except Exception:
@@ -22418,7 +26334,7 @@ def _timer_body_command(text: str) -> str:
     _first, body = _timer_first_line_and_body(text)
     return (body or "").strip()
 
-def _timer_validate_body_command(cmd_text: str) -> tuple[bool, str]:
+def _timer_validate_body_command(cmd_text: str, user_id: int = 0) -> tuple[bool, str]:
     raw = (cmd_text or "").strip()
     if not raw:
         return False, "📑 Неверный формат команды. Я вас не понимаю."
@@ -22426,6 +26342,14 @@ def _timer_validate_body_command(cmd_text: str) -> tuple[bool, str]:
     parsed = parse_message_as_command(raw)
     if not parsed:
         return False, "📑 Команда для таймера не распознана."
+
+    uid = int(user_id or 0)
+    if (
+        uid > 0
+        and command_uses_main_game(parsed.cmd)
+        and main_game_enabled(uid) == 0
+    ):
+        return False, MAIN_GAME_TIMER_DISABLED_TEXT
 
     if parsed.cmd in (
         "timer_add_rel", "timer_add_abs", "timer_add_cycle",
@@ -22596,6 +26520,23 @@ def _execute_timer_command_text(user_id: int, chat_id: int, command_text: str):
     if not parsed:
         try:
             _REAL_BOT_SEND_MESSAGE(int(chat_id), "📑 Таймер сработал, но текст команды не распознан.")
+        except Exception as e:
+            if _is_chat_not_found_error(e):
+                raise RuntimeError("__TIMER_DEAD_CHAT__")
+            raise
+        return
+
+    if (
+        command_uses_main_game(parsed.cmd)
+        and main_game_enabled(int(user_id)) == 0
+    ):
+        try:
+            _REAL_BOT_SEND_MESSAGE(
+                int(chat_id),
+                MAIN_GAME_TIMER_DISABLED_TEXT,
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
         except Exception as e:
             if _is_chat_not_found_error(e):
                 raise RuntimeError("__TIMER_DEAD_CHAT__")
@@ -22830,6 +26771,7 @@ CHATSUI_TAG = "UC"
 CHANNELSUI_TAG = "UN"
 POSTCHUI_TAG = "PCH"
 POSTPUBUI_TAG = "PP"
+POSTSETUI_TAG = "PST"
 POSTTYPEUI_TAG = "PTY"
 POSTPROMOUI_TAG = "PPR"
 POSTUPDUI_TAG = "PUP"
@@ -22851,6 +26793,7 @@ PROMO_PAGE_SIZE = 15
 #           report
 REPORT_CANCEL_TEXT = "Отмена"
 REPORT_SUBMIT_TEXT = "Отправить"
+POST_SETTINGS_TEXT = "Настроить публикацию"
 REPORT_MAX_MEDIA = 5
 REPORT_MEDIA_GROUP_ACK_DELAY_SEC = 1.15
 _REPORT_MEDIA_GROUP_ACK_STATE: Dict[str, int] = {}
@@ -22866,10 +26809,27 @@ REPORT_CATS = {
 POST_CANCEL_TEXT = REPORT_CANCEL_TEXT
 POST_SUBMIT_TEXT = REPORT_SUBMIT_TEXT
 POST_MAX_MEDIA = REPORT_MAX_MEDIA
-POST_TEXT_LIMIT = 4096
+POST_TEXT_LIMIT = 4096 # лимиты
 POST_CAPTION_LIMIT = 1024
 POST_TRUNCATE_SUFFIX = "…"
 POST_LIMIT_CHOICE_TOKEN = "__POST_LIMIT_CHOICE__"
+POST_SETTINGS_MODE_MENU = "menu"
+POST_SETTINGS_MODE_BUTTONS = "buttons"
+POST_SETTINGS_MODE_HASHTAGS = "hashtags"
+POST_SETTINGS_ACTION_BACK = "back"
+POST_SETTINGS_ACTION_PREVIEW = "preview"
+POST_SETTINGS_ACTION_LINKS = "links"
+POST_SETTINGS_ACTION_BUTTONS = "buttons"
+POST_SETTINGS_ACTION_HASHTAGS = "hashtags"
+POST_SETTINGS_ACTION_BUTTON_SLOT_PREFIX = "slot"
+POST_SETTINGS_ACTION_BUTTON_DEFAULT = "button_default"
+POST_SETTINGS_ACTION_BUTTON_DELETE = "button_delete"
+POST_SETTINGS_ACTION_BUTTON_BACK = "button_back"
+POST_SETTINGS_ACTION_HASHTAG_SLOT_PREFIX = "htag"
+POST_SETTINGS_ACTION_HASHTAG_DEFAULT = "hashtag_default"
+POST_SETTINGS_ACTION_HASHTAG_DELETE = "hashtag_delete"
+POST_SETTINGS_ACTION_HASHTAG_FORMAT = "hashtag_format"
+POST_SETTINGS_ACTION_HASHTAG_BACK = "hashtag_back"
 POST_PUBLISH_PARTS_ACTION = "parts"
 POST_PUBLISH_TRUNCATE_ACTION = "cut"
 POST_PUBLISH_CANCEL_ACTION = "cancel"
@@ -22882,20 +26842,23 @@ POST_UPDATE_PART_INTRO = "intro"
 POST_UPDATE_PART_FIXES = "fixes"
 POST_UPDATE_PART_CHANGES = "changes"
 POST_UPDATE_PART_NEW = "new"
+POST_KIND_UPDATE = "update"
+POST_KIND_PROJECTS = "projects"
+POST_KIND_OTHER = "other"
+POST_KIND_AD = "ad"
 POST_UPDATE_TEXT_PARTS = {
     POST_UPDATE_PART_INTRO,
     POST_UPDATE_PART_FIXES,
     POST_UPDATE_PART_CHANGES,
     POST_UPDATE_PART_NEW,
 }
-POST_KIND_UPDATE = "update"
-POST_KIND_PROJECTS = "projects"
-POST_KIND_OTHER = "other"
-POST_KIND_AD = "ad"
 POST_PROMO_AUTO = -1
 POST_PROMO_OFF = 0
 POST_PROMO_ON = 1
-POST_MAX_LINK_BUTTONS = 3
+POST_PUBLICATION_BUTTON_SLOTS = 12
+POST_PUBLICATION_BUTTONS_PER_ROW = 4
+POST_PUBLICATION_BUTTON_TITLE_MAX_LEN = 15
+POST_PUBLICATION_HASHTAG_SLOTS = 3
 POST_MAX_PROJECT_MEDIA = 1
 POST_FILE_MAX_BYTES = 100 * 1024 * 1024
 POST_PROMO_TTL_SEC = 3 * 86400 # время пост промокода
@@ -23953,9 +27916,11 @@ def _pick_target_from_db(attacker_id: int, mode: str, chat_id: int, chat_filter:
         base = (
             "SELECT cm.user_id AS uid, COALESCE(l.bio_exp,0) AS be "
             "FROM chat_members cm "
+            "LEFT JOIN users u ON u.user_id = cm.user_id "
             "LEFT JOIN labs l ON l.user_id = cm.user_id "
             "LEFT JOIN infection_cooldowns ic ON ic.attacker_id=? AND ic.target_id=cm.user_id "
             "WHERE cm.chat_id=? AND cm.user_id!=? AND cm.user_id>0 "
+            "AND COALESCE(u.game_enabled,1)=1 "
             "AND (ic.until_ts IS NULL OR ic.until_ts<=?)"
         )
         params = [int(attacker_id), int(chat_id), int(attacker_id), int(now)]
@@ -24002,7 +27967,9 @@ def _pick_target_from_db(attacker_id: int, mode: str, chat_id: int, chat_filter:
         "FROM users u "
         "LEFT JOIN labs l ON l.user_id=u.user_id "
         "LEFT JOIN infection_cooldowns ic ON ic.attacker_id=? AND ic.target_id=u.user_id "
-        "WHERE u.user_id!=? AND (ic.until_ts IS NULL OR ic.until_ts<=?)"
+        "WHERE u.user_id!=? "
+        "AND COALESCE(u.game_enabled,1)=1 "
+        "AND (ic.until_ts IS NULL OR ic.until_ts<=?)"
     )
     params = [int(attacker_id), int(attacker_id), int(now)]
     if exclude_ids:
@@ -24075,7 +28042,7 @@ def _parse_infect_request(message, parsed: "Parsed", attacker_id: int) -> dict:
             cmd=parsed.cmd,
             args=fixed_target_expr
         )
-        tid, _target_user_obj = resolve_target_from_reply_or_args(message, fake)
+        tid, _target_user_obj = resolve_infect_target_from_reply_or_args(message, fake)
         if tid is not None:
             token = fixed_target_expr.split()[0].strip() if fixed_target_expr else ""
             return {"kind": "U", "target": int(tid), "token": token, "count": int(fixed_count)}
@@ -24206,6 +28173,21 @@ SKILLS = {
     "PAT": {"col": "total_pathogens", "ready_col": "ready_pathogens", "title_1": "Увеличение количества ячеек патогенов", "title_2": "патоген", "emoji": "🧪"},
     "VAC": {"col": "total_vaccines",  "ready_col": "ready_vaccines",  "title_1": "Увеличение количества ячеек вакцин", "title_2": "вакцина",  "emoji": "💉"},
 }
+
+PROMO_SKILL_REWARD_NAMES = {
+    "INF": "заразности",
+    "LET": "летальности",
+    "HEA": "тяжести",
+    "IMM": "иммунитету",
+    "REA": "реагированию",
+    "IDS": "обнаружению",
+    "IPS": "предотвращению",
+    "SYN": "синтезу",
+    "ACC": "ускорению",
+    "PAT": "патогенам",
+    "VAC": "вакцинам",
+}
+
 
 SKILL_SYNONYMS = {
     "заразность": "INF", "заразн": "INF",
@@ -24827,7 +28809,9 @@ STRICT_NO_EXTRA_ARGS_CMDS = {
     "synth",
     "balance_show", "balance_hide", "lab_show", "lab_hide",
     "notify_on", "notify_off",
+    "game_notify_on", "game_notify_off",
     "corp_notify_on", "corp_notify_off",
+    "game_on", "game_off",
     "rp_on", "rp_off",
     "promo_generate", "promo_all",
     "chat_autodel_status", "chat_autodel_off",
@@ -25842,6 +29826,10 @@ def cb_upgrade(cq):
             return
 
         uid = int(info["uid"])
+
+        if _main_game_callback_guard(cq, uid, edit_current=True):
+            return
+
         code = info["code"]
         steps = int(info["steps"])
         action = info["action"]
@@ -26446,6 +30434,11 @@ def _resume_balance_chain(cq, uid: int, *, force_attempt: bool = False):
         return False
 
     kind = str(state.get("chain_kind") or "").strip()
+
+    if kind in (BALCHAIN_UPGRADE, BALCHAIN_CORP_TRANSFER, BALCHAIN_VACCINE):
+        if _main_game_callback_guard(cq, int(uid), edit_current=True):
+            return True
+
     payload = state.get("payload") or {}
     if not isinstance(payload, dict):
         payload = {}
@@ -27293,50 +31286,117 @@ def handle_notify_toggle(message, cmd: str):
     uid = int(message.from_user.id)
     upsert_user(message.from_user)
 
+    # Общий переключатель всех уведомлений
     if cmd == "notify_on":
+        set_notifications_master_enabled(uid, 1)
+        bot.reply_to(
+            message,
+            "✅ Уведомления включены."
+        )
+        return
+
+    if cmd == "notify_off":
+        set_notifications_master_enabled(uid, 0)
+        bot.reply_to(
+            message,
+            "❎ Уведомления отключены."
+        )
+        return
+
+    # Включение игровых уведомлений
+    if cmd == "game_notify_on":
+        set_notifications_master_flag(uid, 1)
+
         if message.chat.type in ("group", "supergroup"):
             chat_id = int(message.chat.id)
-            ok = True
+            can_send = True
+
             if not _notify_chat_is_group_chat(chat_id):
                 set_notify_prefs(uid, 0, 0)
+
                 bot.reply_to(
                     message,
-                    "⚠️ Уведомления можно включить только в личных сообщениях или групповом чате."
+                    "⚠️ Игровые уведомления можно включить "
+                    "только в личных сообщениях или групповом чате."
                 )
                 return
+
             try:
                 me = bot.get_me()
-                cm = bot.get_chat_member(chat_id, me.id)
-                st = (getattr(cm, "status", "") or "").lower()
-                if st in ("left", "kicked"):
-                    ok = False
-                if hasattr(cm, "can_send_messages") and cm.can_send_messages is False:
-                    ok = False
-            except Exception:
-                ok = True
+                member = bot.get_chat_member(chat_id, me.id)
+                status = (
+                    getattr(member, "status", "") or ""
+                ).lower()
 
-            if not ok:
+                if status in ("left", "kicked"):
+                    can_send = False
+
+                if (
+                    hasattr(member, "can_send_messages")
+                    and member.can_send_messages is False
+                ):
+                    can_send = False
+
+            except Exception:
+                can_send = True
+
+            if not can_send:
                 set_notify_prefs(uid, 0, 0)
-                bot.reply_to(message, "⚠️ Я не могу отправлять сообщения в этот чат. Уведомления будут приходить в личные сообщения.")
-            else:
-                set_notify_prefs(uid, chat_id, 0)
-                bot.reply_to(message, "✅ Игровые уведомления включены для этого чата.")
-        else:
-            set_notify_prefs(uid, 0, 0)
-            bot.reply_to(message, "✅ Игровые уведомления включены в личных сообщениях.")
+
+                bot.reply_to(
+                    message,
+                    "⚠️ Я не могу отправлять сообщения в этот чат. "
+                    "Игровые уведомления будут приходить "
+                    "в личные сообщения."
+                )
+                return
+
+            set_notify_prefs(uid, chat_id, 0)
+
+            bot.reply_to(
+                message,
+                "✅ Игровые уведомления включены для этого чата."
+            )
+            return
+
+        set_notify_prefs(uid, 0, 0)
+
+        bot.reply_to(
+            message,
+            "✅ Игровые уведомления включены "
+            "в личных сообщениях."
+        )
         return
 
-    chat_id, off = get_notify_prefs(uid)
+    # Отключение игровых уведомлений
+    notify_chat_id, notify_off = get_notify_prefs(uid)
+
     if message.chat.type in ("group", "supergroup"):
         set_notify_prefs(uid, 0, 0)
-        bot.reply_to(message, "❎ Игровые уведомления для этого чата отключены.")
+        sync_notifications_master_flag(uid)
+
+        bot.reply_to(
+            message,
+            "❎ Игровые уведомления для этого чата отключены. "
+            "Теперь они будут приходить в личные сообщения."
+        )
         return
 
-    if int(chat_id) == 0:
+    if int(notify_chat_id) == 0:
         set_notify_prefs(uid, 0, 1)
-        bot.reply_to(message, "❎ Игровые уведомления отключены.")
-    else:
-        bot.reply_to(message, "ℹ️ Уведомления уже включены для группового чата.")
+        sync_notifications_master_flag(uid)
+
+        bot.reply_to(
+            message,
+            "❎ Игровые уведомления отключены."
+        )
+        return
+
+    bot.reply_to(
+        message,
+        "ℹ️ Игровые уведомления уже включены "
+        "для группового чата."
+    )
 
 def handle_user_pref_command(message, parsed: Parsed):
     uid = int(message.from_user.id)
@@ -27349,7 +31409,12 @@ def handle_user_pref_command(message, parsed: Parsed):
             return
 
         set_corp_notify_enabled(int(uid), 1)
-        bot.reply_to(message, "✅ Корпоративные уведомления включены.")
+        set_notifications_master_flag(int(uid), 1)
+
+        bot.reply_to(
+            message,
+            "✅ Корпоративные уведомления включены."
+        )
         return
 
     if parsed.cmd == "corp_notify_off":
@@ -27359,7 +31424,27 @@ def handle_user_pref_command(message, parsed: Parsed):
             return
 
         set_corp_notify_enabled(int(uid), 0)
-        bot.reply_to(message, "❎ Корпоративные уведомления отключены.")
+        sync_notifications_master_flag(int(uid))
+
+        bot.reply_to(
+            message,
+            "❎ Корпоративные уведомления отключены."
+        )
+        return
+
+    if parsed.cmd in ("game_on", "game_off"):
+        status, text, rm = apply_main_game_preference(
+            int(uid),
+            1 if parsed.cmd == "game_on" else 0
+        )
+
+        bot.reply_to(
+            message,
+            text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=rm
+        )
         return
 
     if parsed.cmd == "rp_on":
@@ -27481,7 +31566,8 @@ def cmd_start(message):
 
         send_quick_nav_keyboard(
             int(message.chat.id),
-            int(message.from_user.id)
+            int(message.from_user.id),
+            str(message.chat.type or "private")
         )
 
     except Exception as e:
@@ -27635,7 +31721,7 @@ def on_my_chat_member_update(update):
             fake_user.last_name = None
             upsert_user(fake_user)
             set_pm_opened(int(chat_id), 1)
-            set_notify_prefs(int(chat_id), 0, 0)
+            set_notify_private_destination(int(chat_id))
 
     except Exception as e:
         send_error_report("on_my_chat_member_update", e)
@@ -27652,6 +31738,9 @@ def cb_buy_vaccine(cq):
             return
         upsert_user(cq.from_user)
         _merge_placeholder_for_uid_if_possible(cq.from_user)
+
+        if _main_game_callback_guard(cq, uid, edit_current=True):
+            return
 
         fever_until, fever_pat, vac_cnt = get_fever_and_vaccines(uid)
         now = now_ts()
@@ -27773,6 +31862,9 @@ def cb_use_vaccine(cq):
         upsert_user(cq.from_user)
         _merge_placeholder_for_uid_if_possible(cq.from_user)
 
+        if _main_game_callback_guard(cq, uid, edit_current=True):
+            return
+
         fever_until, fever_pat, vac_cnt = get_fever_and_vaccines(uid)
         now = now_ts()
 
@@ -27836,6 +31928,9 @@ def cb_use_vaccine_x(cq):
             return
         upsert_user(cq.from_user)
         _merge_placeholder_for_uid_if_possible(cq.from_user)
+
+        if _main_game_callback_guard(cq, uid, edit_current=True):
+            return
 
         doses = 1
         try:
@@ -27908,6 +32003,9 @@ def cb_autoanswer_menu(cq):
             bot.answer_callback_query(cq.id)
             return
 
+        if _main_game_callback_guard(cq, uid, edit_current=True):
+            return
+
         text = render_autoanswer_status(uid)
         rm = kb_autoanswer_status(uid)
 
@@ -27934,6 +32032,9 @@ def cb_autoanswer_toggle(cq):
         val = int(parts[3]) if len(parts) >= 4 and parts[3].isdigit() else 0
         if tgt_uid != uid:
             bot.answer_callback_query(cq.id)
+            return
+
+        if _main_game_callback_guard(cq, uid, edit_current=True):
             return
 
         now = now_ts()
@@ -28043,6 +32144,9 @@ def cb_infect_retry(cq):
             _safe_answer_callback_query(cq.id)
             return
 
+        if _main_game_callback_guard(cq, int(info.get("attacker", 0)), edit_current=True):
+            return
+
         class _P:
             cmd = "infect"
             has_prefix_char = False
@@ -28142,6 +32246,9 @@ def cb_pathogens_ui(cq):
 
         if int(cq.from_user.id) != int(owner_id):
             bot.answer_callback_query(cq.id)
+            return
+
+        if _main_game_callback_guard(cq, owner_id, edit_current=True):
             return
 
         if kind == "INFO":
@@ -28266,6 +32373,17 @@ def cb_lab_ui(cq):
             bot.answer_callback_query(cq.id)
             return
 
+        if _main_game_callback_guard(cq, viewer_id, edit_current=False):
+            return
+
+        if int(owner_id) != int(viewer_id) and _main_game_callback_guard(
+            cq,
+            int(owner_id),
+            target=True,
+            edit_current=True
+        ):
+            return
+
         if viewer_id != int(owner_id):
             if view in ("I", "B"):
                 bot.answer_callback_query(cq.id, "📑 Этот раздел доступен только владельцу лаборатории.")
@@ -28316,6 +32434,9 @@ def cb_corp_join(cq):
 
         if int(cq.from_user.id) != int(viewer_id):
             bot.answer_callback_query(cq.id)
+            return
+
+        if _main_game_callback_guard(cq, viewer_id, edit_current=False):
             return
 
         corp = corp_by_id(corp_id)
@@ -28423,6 +32544,9 @@ def cb_corp_req_approve(cq):
         return
 
     try:
+        if _main_game_callback_guard(cq, int(cq.from_user.id), edit_current=False):
+            return
+
         ok, msg = _corp_request_resolve(request_id, int(cq.from_user.id), True)
         bot.answer_callback_query(cq.id, msg, show_alert=not ok)
     except Exception as e:
@@ -28444,6 +32568,9 @@ def cb_corp_req_reject(cq):
         return
 
     try:
+        if _main_game_callback_guard(cq, int(cq.from_user.id), edit_current=False):
+            return
+
         ok, msg = _corp_request_resolve(request_id, int(cq.from_user.id), False)
         bot.answer_callback_query(cq.id, msg, show_alert=not ok)
     except Exception as e:
@@ -28465,6 +32592,9 @@ def cb_corp_inv_accept(cq):
         return
 
     try:
+        if _main_game_callback_guard(cq, int(cq.from_user.id), edit_current=False):
+            return
+
         ok, msg = _corp_invite_resolve(invite_id, int(cq.from_user.id), True)
         bot.answer_callback_query(cq.id, msg, show_alert=not ok)
     except Exception as e:
@@ -28486,6 +32616,9 @@ def cb_corp_inv_reject(cq):
         return
 
     try:
+        if _main_game_callback_guard(cq, int(cq.from_user.id), edit_current=False):
+            return
+
         ok, msg = _corp_invite_resolve(invite_id, int(cq.from_user.id), False)
         bot.answer_callback_query(cq.id, msg, show_alert=not ok)
     except Exception as e:
@@ -28512,6 +32645,9 @@ def cb_corp_transfer_mix(cq):
 
         if int(cq.from_user.id) != int(uid):
             bot.answer_callback_query(cq.id)
+            return
+
+        if _main_game_callback_guard(cq, uid, edit_current=False):
             return
 
         if cmd not in ("corp_send_res", "corp_send_mat") or target_id <= 0:
@@ -28601,6 +32737,9 @@ def cb_corpui(cq):
             bot.answer_callback_query(cq.id)
             return
 
+        if _main_game_callback_guard(cq, viewer_id, edit_current=False):
+            return
+
         corp = corp_by_id(corp_id)
         if not corp:
             bot.answer_callback_query(cq.id)
@@ -28671,6 +32810,9 @@ def cb_topui(cq):
         info = _topui_parse(cq.data or "")
         if not info:
             bot.answer_callback_query(cq.id)
+            return
+
+        if _main_game_callback_guard(cq, int(cq.from_user.id), edit_current=False):
             return
 
         kind = (info["kind"] or "").strip().upper()
@@ -28868,7 +33010,7 @@ def cb_post_type_choice(cq):
                 "ℹ️Название указывать не обязательно.</blockquote>",
                 parse_mode="HTML",
                 disable_web_page_preview=True,
-                reply_markup=kb_post_draft()
+                reply_markup=kb_post_draft(actor_uid)
             )
         elif kind == POST_KIND_OTHER:
             post_meta_set(actor_uid, POST_KIND_OTHER, promo_enabled=POST_PROMO_OFF)
@@ -28946,6 +33088,184 @@ def cb_post_other_promo_choice(cq):
         bot.answer_callback_query(cq.id)
     except Exception as e:
         send_error_report("cb_post_other_promo_choice", e)
+        try:
+            bot.answer_callback_query(cq.id)
+        except Exception:
+            pass
+
+@bot.callback_query_handler(func=lambda cq: (cq.data or "").startswith(f"{POSTSETUI_TAG}:"))
+def cb_post_publication_settings(cq):
+    try:
+        uid, action = _post_publication_settings_parse_cb(cq.data or "")
+        if uid is None:
+            bot.answer_callback_query(cq.id)
+            return
+
+        actor_uid = int(cq.from_user.id)
+        if actor_uid != int(uid):
+            bot.answer_callback_query(cq.id)
+            return
+
+        if not post_publication_settings_available(actor_uid):
+            if getattr(cq, "message", None):
+                try:
+                    bot.delete_message(int(cq.message.chat.id), int(cq.message.message_id))
+                except Exception:
+                    pass
+
+            bot.answer_callback_query(cq.id, "Черновик уже завершён.", show_alert=True)
+            return
+
+        if getattr(cq, "message", None):
+            if not post_publication_settings_screen_matches(
+                actor_uid,
+                int(cq.message.chat.id),
+                int(cq.message.message_id)
+            ):
+                try:
+                    bot.delete_message(int(cq.message.chat.id), int(cq.message.message_id))
+                except Exception:
+                    pass
+
+                bot.answer_callback_query(cq.id, "Экран настроек устарел.", show_alert=True)
+                return
+
+        settings = post_publication_settings_get(actor_uid)
+        screen_mode = str(settings.get("screen_mode") or "")
+
+        if action == POST_SETTINGS_ACTION_BACK:
+            post_publication_buttons_clear_selection(actor_uid)
+            post_publication_hashtags_clear_selection(actor_uid)
+            post_publication_settings_delete_screen_message(actor_uid)
+
+            bot.send_message(
+                int(actor_uid),
+                "📰 Возврат к черновику. Можно продолжить подготовку публикации.",
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=kb_post_draft(actor_uid)
+            )
+            bot.answer_callback_query(cq.id)
+            return
+
+        if action in (POST_SETTINGS_ACTION_BUTTONS, POST_SETTINGS_ACTION_HASHTAGS):
+            if screen_mode != POST_SETTINGS_MODE_MENU:
+                bot.answer_callback_query(cq.id, "Откройте общий экран настроек.", show_alert=True)
+                return
+
+            post_publication_buttons_clear_selection(actor_uid)
+            post_publication_hashtags_clear_selection(actor_uid)
+
+            if action == POST_SETTINGS_ACTION_BUTTONS:
+                post_publication_buttons_state(actor_uid, refresh_defaults=True)
+                edit_post_publication_buttons_message(cq, actor_uid)
+            else:
+                post_publication_hashtags_state(actor_uid, refresh_defaults=True)
+                edit_post_publication_hashtags_message(cq, actor_uid)
+
+            bot.answer_callback_query(cq.id)
+            return
+
+        if action in (POST_SETTINGS_ACTION_PREVIEW, POST_SETTINGS_ACTION_LINKS):
+            if screen_mode != POST_SETTINGS_MODE_MENU:
+                bot.answer_callback_query(cq.id, "Откройте общий экран настроек.", show_alert=True)
+                return
+
+            if action == POST_SETTINGS_ACTION_PREVIEW:
+                new_value = 0 if int(settings.get("preview_enabled") or 0) == 1 else 1
+                post_publication_settings_set_flag(actor_uid, "preview_enabled", new_value)
+            else:
+                new_value = 0 if int(settings.get("links_as_buttons_enabled") or 0) == 1 else 1
+                post_publication_settings_set_flag(actor_uid, "links_as_buttons_enabled", new_value)
+
+            edit_post_publication_settings_menu_message(cq, actor_uid)
+            bot.answer_callback_query(cq.id)
+            return
+
+        if screen_mode == POST_SETTINGS_MODE_BUTTONS:
+            if action == POST_SETTINGS_ACTION_BUTTON_BACK:
+                post_publication_buttons_clear_selection(actor_uid)
+                edit_post_publication_settings_menu_message(cq, actor_uid)
+                bot.answer_callback_query(cq.id)
+                return
+
+            slot_index = _post_publication_button_slot_from_action(action)
+            if slot_index is not None:
+                ok, error_text = post_publication_buttons_select(actor_uid, slot_index)
+                if not ok:
+                    bot.answer_callback_query(cq.id, error_text, show_alert=True)
+                    return
+
+                edit_post_publication_buttons_message(cq, actor_uid)
+                bot.answer_callback_query(cq.id)
+                return
+
+            if action == POST_SETTINGS_ACTION_BUTTON_DEFAULT:
+                post_publication_buttons_reset_to_default(actor_uid)
+                edit_post_publication_buttons_message(cq, actor_uid)
+                bot.answer_callback_query(cq.id)
+                return
+
+            if action == POST_SETTINGS_ACTION_BUTTON_DELETE:
+                ok, error_text = post_publication_buttons_delete_selected(actor_uid)
+                if not ok:
+                    bot.answer_callback_query(cq.id, error_text, show_alert=True)
+                    return
+
+                edit_post_publication_buttons_message(cq, actor_uid)
+                bot.answer_callback_query(cq.id)
+                return
+
+            bot.answer_callback_query(cq.id)
+            return
+
+        if screen_mode != POST_SETTINGS_MODE_HASHTAGS:
+            bot.answer_callback_query(cq.id, "Экран редактора хештегов устарел.", show_alert=True)
+            return
+
+        if action == POST_SETTINGS_ACTION_HASHTAG_BACK:
+            post_publication_hashtags_clear_selection(actor_uid)
+            edit_post_publication_settings_menu_message(cq, actor_uid)
+            bot.answer_callback_query(cq.id)
+            return
+
+        slot_index = _post_publication_hashtag_slot_from_action(action)
+        if slot_index is not None:
+            ok, error_text = post_publication_hashtags_select(actor_uid, slot_index)
+            if not ok:
+                bot.answer_callback_query(cq.id, error_text, show_alert=True)
+                return
+
+            edit_post_publication_hashtags_message(cq, actor_uid)
+            bot.answer_callback_query(cq.id)
+            return
+
+        if action == POST_SETTINGS_ACTION_HASHTAG_DEFAULT:
+            post_publication_hashtags_reset_to_default(actor_uid)
+            edit_post_publication_hashtags_message(cq, actor_uid)
+            bot.answer_callback_query(cq.id)
+            return
+
+        if action == POST_SETTINGS_ACTION_HASHTAG_DELETE:
+            ok, error_text = post_publication_hashtags_delete_selected(actor_uid)
+            if not ok:
+                bot.answer_callback_query(cq.id, error_text, show_alert=True)
+                return
+
+            edit_post_publication_hashtags_message(cq, actor_uid)
+            bot.answer_callback_query(cq.id)
+            return
+
+        if action == POST_SETTINGS_ACTION_HASHTAG_FORMAT:
+            post_publication_hashtags_toggle_format(actor_uid)
+            edit_post_publication_hashtags_message(cq, actor_uid)
+            bot.answer_callback_query(cq.id)
+            return
+
+        bot.answer_callback_query(cq.id)
+
+    except Exception as e:
+        send_error_report("cb_post_publication_settings", e)
         try:
             bot.answer_callback_query(cq.id)
         except Exception:
@@ -29095,6 +33415,130 @@ def cb_post_channel_ui(cq):
         except Exception:
             pass
 
+@bot.callback_query_handler(func=lambda cq: (cq.data or "").startswith(f"{QUICKKB_TAG}:"))
+def cb_quick_keyboard_ui(cq):
+    try:
+        parts = (cq.data or "").split(":")
+        if len(parts) < 3 or parts[0] != QUICKKB_TAG:
+            bot.answer_callback_query(cq.id)
+            return
+
+        uid = int(parts[1])
+        act = str(parts[2] or "").strip().upper()
+
+        if int(cq.from_user.id) != int(uid):
+            bot.answer_callback_query(cq.id)
+            return
+
+        quick_keyboard_ensure_config(uid)
+
+        if act == "S":
+            if len(parts) != 4:
+                bot.answer_callback_query(cq.id)
+                return
+            try:
+                idx = int(parts[3])
+            except Exception:
+                bot.answer_callback_query(cq.id)
+                return
+            if idx < 0 or idx >= QUICKKB_SLOT_COUNT:
+                bot.answer_callback_query(cq.id)
+                return
+
+            selected = quick_keyboard_selected_index(uid)
+            state = quick_keyboard_editor_state(uid)
+            opened_from_settings = bool(state and int(state["opened_from_settings"] or 0) == 1)
+            chat_id = int(cq.message.chat.id) if getattr(cq, "message", None) else 0
+            message_id = int(cq.message.message_id) if getattr(cq, "message", None) else 0
+
+            if selected is None:
+                quick_keyboard_set_editor_state(
+                    uid,
+                    selected_index=idx,
+                    opened_from_settings=opened_from_settings,
+                    chat_id=chat_id,
+                    message_id=message_id
+                )
+            elif int(selected) == int(idx):
+                quick_keyboard_set_editor_state(
+                    uid,
+                    selected_index=None,
+                    opened_from_settings=opened_from_settings,
+                    chat_id=chat_id,
+                    message_id=message_id
+                )
+            else:
+                quick_keyboard_swap_slots(uid, int(selected), idx)
+                quick_keyboard_set_editor_state(
+                    uid,
+                    selected_index=None,
+                    opened_from_settings=opened_from_settings,
+                    chat_id=chat_id,
+                    message_id=message_id
+                )
+
+            quick_keyboard_edit_editor(cq, uid)
+            bot.answer_callback_query(cq.id)
+            return
+
+        if act == "DEL":
+            quick_keyboard_delete_selected_slot(uid)
+            quick_keyboard_edit_editor(cq, uid)
+            bot.answer_callback_query(cq.id, "Кнопка удалена.")
+            return
+
+        if act == "DEF":
+            state = quick_keyboard_editor_state(uid)
+            opened_from_settings = bool(state and int(state["opened_from_settings"] or 0) == 1)
+            chat_id = int(cq.message.chat.id) if getattr(cq, "message", None) else 0
+            message_id = int(cq.message.message_id) if getattr(cq, "message", None) else 0
+
+            quick_keyboard_reset_to_default(uid)
+            if getattr(cq, "message", None):
+                quick_keyboard_set_editor_state(
+                    uid,
+                    selected_index=None,
+                    opened_from_settings=opened_from_settings,
+                    chat_id=chat_id,
+                    message_id=message_id
+                )
+            quick_keyboard_edit_editor(cq, uid)
+            bot.answer_callback_query(cq.id, "Клавиатура сброшена.")
+            return
+
+        if act == "GR":
+            quick_keyboard_set_group_enabled(uid, quick_keyboard_group_enabled(uid) != 1)
+            quick_keyboard_edit_editor(cq, uid)
+            bot.answer_callback_query(cq.id)
+            return
+
+        if act == "BACK":
+            quick_keyboard_clear_editor_state(uid)
+            if not getattr(cq, "message", None):
+                bot.answer_callback_query(cq.id)
+                return
+
+            text = render_settings_text(uid, int(cq.message.chat.id))
+            rm = kb_settings(uid, int(cq.message.chat.id), cq.message.chat.type)
+            limited_edit_message_text(
+                text=text,
+                chat_id=cq.message.chat.id,
+                msg_id=cq.message.message_id,
+                parse_mode="HTML",
+                reply_markup=rm,
+                disable_web_page_preview=True
+            )
+            bot.answer_callback_query(cq.id)
+            return
+
+        bot.answer_callback_query(cq.id)
+    except Exception as e:
+        send_error_report("cb_quick_keyboard_ui", e)
+        try:
+            bot.answer_callback_query(cq.id)
+        except Exception:
+            pass
+
 @bot.callback_query_handler(func=lambda cq: (cq.data or "").startswith(f"{SETUI_TAG}:"))
 def cb_settings_ui(cq):
     try:
@@ -29104,6 +33548,15 @@ def cb_settings_ui(cq):
             return
 
         if int(cq.from_user.id) != int(uid):
+            bot.answer_callback_query(cq.id)
+            return
+
+        if act == "QK":
+            if (not cq.message) or ((cq.message.chat.type or "").lower() != "private"):
+                bot.answer_callback_query(cq.id, "Редактор клавиатуры доступен в личных сообщениях.", show_alert=True)
+                return
+
+            quick_keyboard_open_editor_from_callback(cq, int(uid))
             bot.answer_callback_query(cq.id)
             return
 
@@ -29201,32 +33654,86 @@ def cb_settings_ui(cq):
             bot.answer_callback_query(cq.id, "Статус обновлён.")
             return
 
-        if act in ("HB", "HL"):
+        if act == "HB":
             lab_row = db_one(
-                "SELECT COALESCE(hide_balance,0) AS hb, COALESCE(hide_lab,0) AS hl, COALESCE(lab_active,0) AS la "
+                "SELECT COALESCE(hide_balance,0) AS hb "
+                "FROM labs WHERE user_id=? LIMIT 1",
+                (int(uid),)
+            )
+            hb = int(lab_row["hb"] or 0) if lab_row else 0
+
+            set_hide_balance(
+                int(uid),
+                not bool(hb)
+            )
+
+        elif act == "HL":
+            lab_row = db_one(
+                "SELECT COALESCE(hide_lab,0) AS hl, "
+                "COALESCE(lab_active,0) AS la "
                 "FROM labs WHERE user_id=? LIMIT 1",
                 (int(uid),)
             )
             if not lab_row or int(lab_row["la"] or 0) != 1:
-                bot.answer_callback_query(cq.id, "📑 У вас нет активной Лаборатории.", show_alert=True)
+                bot.answer_callback_query(
+                    cq.id,
+                    "📑 У вас нет активной Лаборатории.",
+                    show_alert=True
+                )
                 return
 
-            if act == "HB":
-                set_hide_balance(int(uid), not bool(int(lab_row["hb"] or 0)))
-            else:
-                set_hide_lab(int(uid), not bool(int(lab_row["hl"] or 0)))
+            set_hide_lab(
+                int(uid),
+                not bool(int(lab_row["hl"] or 0))
+            )
+
+        elif act == "NA":
+            cur = notifications_master_enabled(int(uid))
+
+            set_notifications_master_enabled(
+                int(uid),
+                0 if cur == 1 else 1
+            )
 
         elif act == "NPM":
-            set_notify_prefs(int(uid), 0, 0)
+            set_notify_prefs(
+                int(uid),
+                0,
+                0
+            )
+            set_notifications_master_flag(
+                int(uid),
+                1
+            )
 
         elif act == "NOFF":
-            set_notify_prefs(int(uid), 0, 1)
+            set_notify_prefs(
+                int(uid),
+                0,
+                1
+            )
+            sync_notifications_master_flag(
+                int(uid)
+            )
 
         elif act == "NCHAT":
-            if not cq.message or (cq.message.chat.type not in ("group", "supergroup")):
+            if (
+                not cq.message
+                or cq.message.chat.type
+                not in ("group", "supergroup")
+            ):
                 bot.answer_callback_query(cq.id)
                 return
-            set_notify_prefs(int(uid), int(cq.message.chat.id), 0)
+
+            set_notify_prefs(
+                int(uid),
+                int(cq.message.chat.id),
+                0
+            )
+            set_notifications_master_flag(
+                int(uid),
+                1
+            )
 
         elif act == "G":
             cur_g = get_user_gender(int(uid))
@@ -29240,7 +33747,52 @@ def cb_settings_ui(cq):
 
         elif act == "RP":
             cur = rp_commands_enabled(int(uid))
-            set_rp_commands_enabled(int(uid), 0 if cur == 1 else 1)
+
+            set_rp_commands_enabled(
+                int(uid),
+                0 if cur == 1 else 1
+            )
+
+        elif act == "GAME":
+            cur = main_game_enabled(int(uid))
+
+            status, result_text, result_rm = (
+                apply_main_game_preference(
+                    int(uid),
+                    0 if cur == 1 else 1
+                )
+            )
+
+            if status == "confirm":
+                if cq.inline_message_id:
+                    limited_edit_message_text(
+                        text=result_text,
+                        inline_id=cq.inline_message_id,
+                        parse_mode="HTML",
+                        reply_markup=result_rm,
+                        disable_web_page_preview=True
+                    )
+
+                elif cq.message:
+                    limited_edit_message_text(
+                        text=result_text,
+                        chat_id=cq.message.chat.id,
+                        msg_id=cq.message.message_id,
+                        parse_mode="HTML",
+                        reply_markup=result_rm,
+                        disable_web_page_preview=True
+                    )
+
+                bot.answer_callback_query(cq.id)
+                return
+
+            if status == "error":
+                bot.answer_callback_query(
+                    cq.id,
+                    result_text,
+                    show_alert=True
+                )
+                return
 
         elif act == "CN":
             _cid, _cname, role = _user_corp_role_soft(int(uid))
@@ -29248,7 +33800,22 @@ def cb_settings_ui(cq):
                 bot.answer_callback_query(cq.id, "📑 Вы не состоите в Корпорации.", show_alert=True)
                 return
             cur = corp_notify_enabled(int(uid))
-            set_corp_notify_enabled(int(uid), 0 if cur == 1 else 1)
+            new_value = 0 if cur == 1 else 1
+
+            set_corp_notify_enabled(
+                int(uid),
+                new_value
+            )
+
+            if new_value == 1:
+                set_notifications_master_flag(
+                    int(uid),
+                    1
+                )
+            else:
+                sync_notifications_master_flag(
+                    int(uid)
+                )
 
         else:
             bot.answer_callback_query(cq.id)
@@ -30059,9 +34626,9 @@ def cb_lab_delete_ok(cq):
             bot.answer_callback_query(cq.id)
             return
 
-        ok, text = _perform_lab_delete(int(target_uid))
-        out_text = build_inactive_lab_text(int(target_uid), after_delete=True) if ok else text
-        rm = kb_inactive_lab_actions(int(target_uid)) if ok else None
+        ok, out_text, rm = _perform_pending_lab_delete(
+            int(target_uid)
+        )
 
         if cq.message:
             limited_edit_message_text(
@@ -30123,6 +34690,9 @@ def cb_lab_create(cq):
             bot.answer_callback_query(cq.id)
             return
 
+        if _main_game_callback_guard(cq, target_uid, edit_current=True):
+            return
+
         deleted_row = get_deleted_lab_row(int(target_uid))
         lock_text = build_lab_recreate_lock_text(int(target_uid))
 
@@ -30168,6 +34738,9 @@ def cb_lab_restore(cq):
             bot.answer_callback_query(cq.id)
             return
 
+        if _main_game_callback_guard(cq, target_uid, edit_current=True):
+            return
+
         ok, text = _restore_deleted_lab(int(target_uid), support_mode=False)
         if ok:
             is_inline = bool(getattr(cq, "inline_message_id", None))
@@ -30196,6 +34769,9 @@ def cb_lab_restore_req(cq):
         target_uid = int(p[3])
         if int(cq.from_user.id) != int(target_uid):
             bot.answer_callback_query(cq.id)
+            return
+
+        if _main_game_callback_guard(cq, target_uid, edit_current=True):
             return
 
         if not get_deleted_lab_row(int(target_uid)):
@@ -33169,19 +37745,19 @@ def handle_owner_command(message, parsed: Parsed):
 
 def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = None, actor_user=None):
     if is_channel_sender_message(message):
-        return   
+        return
+
     actor = actor_user or message.from_user
     attacker_id = int(actor.id)
     upsert_user(actor)
     _merge_placeholder_to_real_user(actor)
-    ensure_lab_exists(attacker_id)
-    mark_lab_active(attacker_id)
 
     def _emit(text: str, reply_markup=None):
         if edit_ctx and isinstance(edit_ctx, dict):
             inline_id = edit_ctx.get("inline_id")
             chat_id = edit_ctx.get("chat_id")
             msg_id = edit_ctx.get("msg_id")
+
             if inline_id:
                 limited_edit_message_text(
                     text=text,
@@ -33191,6 +37767,7 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
                     disable_web_page_preview=True
                 )
                 return
+
             if chat_id and msg_id:
                 limited_edit_message_text(
                     text=text,
@@ -33201,7 +37778,20 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
                     disable_web_page_preview=True
                 )
                 return
-        bot.reply_to(message, text, disable_web_page_preview=True, reply_markup=reply_markup)
+
+        bot.reply_to(
+            message,
+            text,
+            disable_web_page_preview=True,
+            reply_markup=reply_markup
+        )
+
+    if main_game_enabled(int(attacker_id)) == 0:
+        _emit(MAIN_GAME_SELF_DISABLED_TEXT)
+        return
+
+    ensure_lab_exists(attacker_id)
+    mark_lab_active(attacker_id)
 
     if getattr(message, "via_bot", None) is not None:
         return
@@ -33385,7 +37975,7 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
         target_id: Optional[int] = req.get("target")
 
         if target_id is None and token:
-            target_id = _resolve_or_create_infect_target(token)
+            target_id = _resolve_known_infect_target(token)
 
         if target_id is None:
             _emit("📑 Цель для заражения не найдена.")
@@ -33397,6 +37987,11 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
         if int(target_id) == int(attacker_id):
             _emit("🧪 Вы не можете заразить самого себя.")
             return
+
+        if not main_game_target_enabled(int(target_id)):
+            _emit(MAIN_GAME_TARGET_DISABLED_TEXT)
+            return
+
         if same_corp(int(attacker_id), int(target_id)):
             _emit("📑 Участники одной Корпорации не могут заражать друг друга.")
             return
@@ -33468,16 +38063,8 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
                 )
                 first_time = (seen is None)
 
-                active = db_one(
-                    "SELECT end_ts, counted FROM infections WHERE attacker_id=? AND target_id=?",
-                    (attacker_id, int(target_id))
-                )
-                already_active = False
-                if active:
-                    end_ts0 = int(active["end_ts"] or 0)
-                    counted0 = int(active["counted"] or 0)
-                    if counted0 == 1 and end_ts0 > now:
-                        already_active = True
+                already_active, already_visible_for_target_lab = _active_infection_state(attacker_id, int(target_id))
+                target_lab_epoch = get_lab_epoch(int(target_id))
 
                 end_ts = now + inf_duration_sec
                 next_payout = now + 86400
@@ -33531,16 +38118,18 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
 
                         if not already_active:
                             c.execute("UPDATE labs SET infected_total=COALESCE(infected_total,0)+1 WHERE user_id=?", (attacker_id,))
+                        if not already_visible_for_target_lab:
                             c.execute("UPDATE labs SET diseases_total=COALESCE(diseases_total,0)+1 WHERE user_id=?", (int(target_id),))
 
                         c.execute(
-                            "INSERT INTO infections(attacker_id,target_id,start_ts,end_ts,add_bio_res,next_payout_ts,counted,pathogen_name,known_to_target) "
-                            "VALUES (?,?,?,?,?,?,1,?,0) "
+                            "INSERT INTO infections(attacker_id,target_id,start_ts,end_ts,add_bio_res,next_payout_ts,counted,pathogen_name,known_to_target,target_lab_epoch) "
+                            "VALUES (?,?,?,?,?,?,1,?,0,?) "
                             "ON CONFLICT(attacker_id,target_id) DO UPDATE SET "
                             "start_ts=excluded.start_ts, end_ts=excluded.end_ts, "
                             "add_bio_res=excluded.add_bio_res, "
-                            "next_payout_ts=excluded.next_payout_ts, counted=1, pathogen_name=excluded.pathogen_name",
-                            (attacker_id, int(target_id), now, end_ts, gained, next_payout, (pathogen_name or "").strip())
+                            "next_payout_ts=excluded.next_payout_ts, counted=1, pathogen_name=excluded.pathogen_name, "
+                            "target_lab_epoch=excluded.target_lab_epoch",
+                            (attacker_id, int(target_id), now, end_ts, gained, next_payout, (pathogen_name or "").strip(), int(target_lab_epoch))
                         )
 
                         c.execute(
@@ -34010,16 +38599,8 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
             first_cnt += 1
             first_tags.append(chosen_tag)
 
-        active = db_one(
-            "SELECT end_ts, counted FROM infections WHERE attacker_id=? AND target_id=?",
-            (attacker_id, int(tid))
-        )
-        already_active = False
-        if active:
-            end_ts0 = int(active["end_ts"] or 0)
-            counted0 = int(active["counted"] or 0)
-            if counted0 == 1 and end_ts0 > now:
-                already_active = True
+        already_active, already_visible_for_target_lab = _active_infection_state(attacker_id, int(tid))
+        target_lab_epoch = get_lab_epoch(int(tid))
 
         end_ts = now + inf_duration_sec
         next_payout = now + 86400
@@ -34048,16 +38629,18 @@ def handle_infect_command(message, parsed: Parsed, edit_ctx: Optional[dict] = No
                 )
                 if not already_active:
                     c.execute("UPDATE labs SET infected_total=COALESCE(infected_total,0)+1 WHERE user_id=?", (attacker_id,))
+                if not already_visible_for_target_lab:
                     c.execute("UPDATE labs SET diseases_total=COALESCE(diseases_total,0)+1 WHERE user_id=?", (int(tid),))
 
                 c.execute(
-                    "INSERT INTO infections(attacker_id,target_id,start_ts,end_ts,add_bio_res,next_payout_ts,counted,pathogen_name,known_to_target) "
-                    "VALUES (?,?,?,?,?,?,1,?,0) "
+                    "INSERT INTO infections(attacker_id,target_id,start_ts,end_ts,add_bio_res,next_payout_ts,counted,pathogen_name,known_to_target,target_lab_epoch) "
+                    "VALUES (?,?,?,?,?,?,1,?,0,?) "
                     "ON CONFLICT(attacker_id,target_id) DO UPDATE SET "
                     "start_ts=excluded.start_ts, end_ts=excluded.end_ts, "
                     "add_bio_res=excluded.add_bio_res, "
-                    "next_payout_ts=excluded.next_payout_ts, counted=1, pathogen_name=excluded.pathogen_name",
-                    (attacker_id, int(tid), now, end_ts, gained, next_payout, (pathogen_name or "").strip())
+                    "next_payout_ts=excluded.next_payout_ts, counted=1, pathogen_name=excluded.pathogen_name, "
+                    "target_lab_epoch=excluded.target_lab_epoch",
+                    (attacker_id, int(tid), now, end_ts, gained, next_payout, (pathogen_name or "").strip(), int(target_lab_epoch))
                 )
 
                 c.execute(
@@ -34257,34 +38840,67 @@ def handle_sabotage_command(message, parsed: Parsed, edit_ctx: Optional[dict] = 
     attacker_id = int(actor.id)
     upsert_user(actor)
     _merge_placeholder_to_real_user(actor)
-    ensure_lab_exists(attacker_id)
-    mark_lab_active(attacker_id)
 
     def _emit(text: str, reply_markup=None):
         if edit_ctx and isinstance(edit_ctx, dict):
             inline_id = edit_ctx.get("inline_id")
             chat_id = edit_ctx.get("chat_id")
             msg_id = edit_ctx.get("msg_id")
-            if inline_id:
-                limited_edit_message_text(text=text, inline_id=inline_id, parse_mode="HTML",
-                                          reply_markup=reply_markup, disable_web_page_preview=True)
-                return
-            if chat_id and msg_id:
-                limited_edit_message_text(text=text, chat_id=chat_id, msg_id=msg_id, parse_mode="HTML",
-                                          reply_markup=reply_markup, disable_web_page_preview=True)
-                return
-        bot.reply_to(message, text, disable_web_page_preview=True, reply_markup=reply_markup)
 
-    target_id, target_user = resolve_target_from_reply_or_args(message, parsed)
-    if not target_id:
+            if inline_id:
+                limited_edit_message_text(
+                    text=text,
+                    inline_id=inline_id,
+                    parse_mode="HTML",
+                    reply_markup=reply_markup,
+                    disable_web_page_preview=True
+                )
+                return
+
+            if chat_id and msg_id:
+                limited_edit_message_text(
+                    text=text,
+                    chat_id=chat_id,
+                    msg_id=msg_id,
+                    parse_mode="HTML",
+                    reply_markup=reply_markup,
+                    disable_web_page_preview=True
+                )
+                return
+
+        bot.reply_to(
+            message,
+            text,
+            disable_web_page_preview=True,
+            reply_markup=reply_markup
+        )
+
+    if main_game_enabled(int(attacker_id)) == 0:
+        _emit(MAIN_GAME_SELF_DISABLED_TEXT)
         return
 
+    ensure_lab_exists(attacker_id)
+    mark_lab_active(attacker_id)
+
+    target_id, target_user = resolve_target_from_reply_or_args(
+        message,
+        parsed
+    )
+    
+    if target_id is None:
+        _emit("📑 Цель для диверсии не найдена.")
+        return
+    
     if (target_user and getattr(target_user, "is_bot", False)) or (int(target_id) == int(bot.get_me().id)):
         _emit("📑 Как бы не сильна ваша вражда к ботам, вы не сможете навредить боту.")
         return
 
     if int(target_id) == int(attacker_id):
         _emit("📑 Ты не туда воюешь.")
+        return
+
+    if not main_game_target_enabled(int(target_id)):
+        _emit(MAIN_GAME_TARGET_DISABLED_TEXT)
         return
 
     ensure_lab_exists(int(target_id))
@@ -34738,7 +39354,10 @@ def handle_lab_commands(message, parsed: Parsed):
             )
             return
 
-        set_lab_delete_pending(int(uid))
+        set_lab_delete_pending(
+            int(uid),
+            mode="lab"
+        )
         bot.reply_to(
             message,
             build_lab_delete_confirm_text(),
@@ -34778,9 +39397,9 @@ def handle_lab_commands(message, parsed: Parsed):
         if not has_lab_delete_pending(int(uid)):
             return
 
-        ok, text = _perform_lab_delete(int(uid))
-        rm = kb_inactive_lab_actions(int(uid)) if ok else None
-        out_text = build_inactive_lab_text(int(uid), after_delete=True) if ok else text
+        ok, out_text, rm = _perform_pending_lab_delete(
+            int(uid)
+        )
 
         bot.reply_to(
             message,
@@ -34798,6 +39417,15 @@ def handle_lab_commands(message, parsed: Parsed):
     
     if parsed.cmd in ("my_victims", "my_diseases"):
         if not is_lab_active(int(uid)):
+            if parsed.cmd == "my_diseases":
+                bot.reply_to(
+                    message,
+                    render_lab_diseases_list(int(uid), visible_current_lab_only=False),
+                    parse_mode="HTML",
+                    disable_web_page_preview=True
+                )
+                return
+
             bot.reply_to(
                 message,
                 build_inactive_lab_text(int(uid), after_delete=False),
@@ -35158,6 +39786,13 @@ def handle_lab_commands(message, parsed: Parsed):
             return
 
         if int(target_id) != int(uid):
+            if not main_game_target_enabled(int(target_id)):
+                bot.reply_to(
+                    message,
+                    MAIN_GAME_TARGET_DISABLED_TEXT
+                )
+                return
+
             if not is_lab_active(int(target_id)):
                 bot.reply_to(message, "📑 Этот пользователь ещё не создал свою лабораторию.")
                 return
@@ -35498,6 +40133,13 @@ def handle_corp_commands(message, parsed: Parsed):
         if int(target_id) == int(uid):
             return
 
+        if not main_game_target_enabled(int(target_id)):
+            bot.reply_to(
+                message,
+                MAIN_GAME_TARGET_DISABLED_TEXT
+            )
+            return
+
         if target_user_obj is not None:
             capture_user_context(message, target_user_obj)
 
@@ -35566,6 +40208,13 @@ def handle_corp_commands(message, parsed: Parsed):
             bot.reply_to(message, "📑 Нельзя назначить заместителем самого себя.")
             return
 
+        if not main_game_target_enabled(int(target_id)):
+            bot.reply_to(
+                message,
+                MAIN_GAME_TARGET_DISABLED_TEXT
+            )
+            return
+
         if target_user_obj is not None:
             capture_user_context(message, target_user_obj)
 
@@ -35624,6 +40273,13 @@ def handle_corp_commands(message, parsed: Parsed):
             bot.reply_to(message, "📑 Вы не можете разжаловать самого себя")
             return
 
+        if not main_game_target_enabled(int(target_id)):
+            bot.reply_to(
+                message,
+                MAIN_GAME_TARGET_DISABLED_TEXT
+            )
+            return
+
         if target_user_obj is not None:
             capture_user_context(message, target_user_obj)
 
@@ -35677,6 +40333,13 @@ def handle_corp_commands(message, parsed: Parsed):
 
         if int(target_id) == int(uid):
             bot.reply_to(message, "📑 Нельзя исключить самого себя. Используйте команду \"<code>Био покинуть</code>\".", parse_mode="HTML", disable_web_page_preview=True)
+            return
+
+        if not main_game_target_enabled(int(target_id)):
+            bot.reply_to(
+                message,
+                MAIN_GAME_TARGET_DISABLED_TEXT
+            )
             return
 
         if target_user_obj is not None:
@@ -35770,6 +40433,13 @@ def handle_corp_commands(message, parsed: Parsed):
             bot.reply_to(message, "📑 Нельзя передать права владельца самому себе.")
             return
 
+        if not main_game_target_enabled(int(target_id)):
+            bot.reply_to(
+                message,
+                MAIN_GAME_TARGET_DISABLED_TEXT
+            )
+            return
+
         if target_user_obj is not None:
             capture_user_context(message, target_user_obj)
 
@@ -35828,6 +40498,13 @@ def handle_corp_commands(message, parsed: Parsed):
 
         if int(target_id) == int(uid):
             bot.reply_to(message, "📑 Нет смысла передавать средства самому себе.")
+            return
+
+        if not main_game_target_enabled(int(target_id)):
+            bot.reply_to(
+                message,
+                MAIN_GAME_TARGET_DISABLED_TEXT
+            )
             return
 
         if target_user_obj is not None:
@@ -36027,6 +40704,13 @@ def handle_corp_commands(message, parsed: Parsed):
                     )
                     return
 
+                if not main_game_target_enabled(int(target_id)):
+                    bot.reply_to(
+                        message,
+                        MAIN_GAME_TARGET_DISABLED_TEXT
+                    )
+                    return
+
                 rcid, _ = get_user_corp_resolved(int(target_id))
                 if rcid > 0:
                     corp = corp_by_id(int(rcid))
@@ -36044,6 +40728,13 @@ def handle_corp_commands(message, parsed: Parsed):
         if corp is None and not name and message.reply_to_message and getattr(message.reply_to_message, "from_user", None):
             ru = message.reply_to_message.from_user
             if not bool(getattr(ru, "is_bot", False)):
+                if not main_game_target_enabled(int(ru.id)):
+                    bot.reply_to(
+                        message,
+                        MAIN_GAME_TARGET_DISABLED_TEXT
+                    )
+                    return
+
                 rcid, _ = get_user_corp_resolved(int(ru.id))
                 if rcid > 0:
                     corp = corp_by_id(int(rcid))
@@ -36106,7 +40797,7 @@ def _inline_strip_target_prefix(query: str) -> tuple[Optional[int], str, str]:
     tok = parts[0].strip()
     tail = parts[1].strip() if len(parts) > 1 else ""
 
-    tid = _resolve_or_create_infect_target(tok)
+    tid = _resolve_known_infect_target(tok)
     if tid is not None:
         return int(tid), tok, tail
 
@@ -36144,6 +40835,9 @@ def _render_inline_balance_for_viewer(viewer_id: int, target_id: int) -> tuple[s
     return render_balance(int(target_id)), None
 
 def _render_inline_lab_for_viewer(viewer_id: int, target_id: int) -> tuple[str, Optional[InlineKeyboardMarkup]]:
+    if not main_game_target_enabled(int(target_id)):
+        return MAIN_GAME_TARGET_DISABLED_TEXT, None
+
     if int(target_id) != int(viewer_id) and not is_lab_active(int(target_id)):
         return "📑 Этот пользователь ещё не создал свою лабораторию.", None
 
@@ -36155,6 +40849,9 @@ def _render_inline_lab_for_viewer(viewer_id: int, target_id: int) -> tuple[str, 
     return _render_lab_view_for_viewer(int(viewer_id), int(target_id), "D", is_inline=True)
 
 def _render_inline_corp_for_viewer(viewer_id: int, target_id: int) -> tuple[str, Optional[InlineKeyboardMarkup]]:
+    if not main_game_target_enabled(int(target_id)):
+        return MAIN_GAME_TARGET_DISABLED_TEXT, None
+
     cid, _ = get_user_corp_resolved(int(target_id))
     if int(cid) <= 0:
         return "📑 Этот пользователь не состоит в Корпорации.", None
@@ -36210,11 +40907,11 @@ def _parse_inline_infect_query(query: str):
         return None
 
     if len(toks) >= 2 and toks[0].isdigit():
-        tid = _resolve_or_create_infect_target(toks[1])
+        tid = _resolve_known_infect_target(toks[1])
         if tid is not None:
             return {"kind": "U", "target": int(tid), "count": max(1, int(toks[0]))}
 
-    tid0 = _resolve_or_create_infect_target(toks[0])
+    tid0 = _resolve_known_infect_target(toks[0])
     if tid0 is not None:
         cnt = int(toks[1]) if len(toks) >= 2 and toks[1].isdigit() else 1
         return {"kind": "U", "target": int(tid0), "count": max(1, cnt)}
@@ -36436,6 +41133,7 @@ def inline_query_handler(inline_query):
 
         results = []
         iq_chat_type = str(getattr(inline_query, "chat_type", "") or "").lower()
+        actor_main_game_on = main_game_enabled(int(uid)) == 1
 
 
         my_cid, _ = get_user_corp_resolved(uid)
@@ -36447,7 +41145,11 @@ def inline_query_handler(inline_query):
         # @username + выбор баланса/досье/корпы
         if inline_target_token:
             if inline_target_id is not None:
-                if _inline_wants_lab(inline_tail):
+                if (
+                    actor_main_game_on
+                    and main_game_target_enabled(int(inline_target_id))
+                    and _inline_wants_lab(inline_tail)
+                ):
                     text, rm = _render_inline_lab_for_viewer(uid, int(inline_target_id))
                     results.append(_inline_article(
                         article_id=f"lab_{uid}_{int(inline_target_id)}",
@@ -36469,7 +41171,11 @@ def inline_query_handler(inline_query):
                         thumb_url=INLINE_THUMB_BAL_URL
                     ))
 
-                if _inline_wants_corp(inline_tail):
+                if (
+                    actor_main_game_on
+                    and main_game_target_enabled(int(inline_target_id))
+                    and _inline_wants_corp(inline_tail)
+                ):
                     text, rm = _render_inline_corp_for_viewer(uid, int(inline_target_id))
                     results.append(_inline_article(
                         article_id=f"corp_{uid}_{int(inline_target_id)}",
@@ -36482,7 +41188,11 @@ def inline_query_handler(inline_query):
 
         else:
             # своё досье лаборатории
-            if (not q) or (q in ("моя лаба", "моя лаборатория", "лаб", "лаборатория")) or q.startswith(("лаб", "лабо", "моя л")):
+            if actor_main_game_on and (
+                (not q)
+                or (q in ("моя лаба", "моя лаборатория", "лаб", "лаборатория"))
+                or q.startswith(("лаб", "моя л"))
+            ):
                 text = render_lab(uid)
                 results.append(_inline_article(
                     article_id=f"lab_{uid}",
@@ -36506,7 +41216,7 @@ def inline_query_handler(inline_query):
                 ))
 
             # своё досье корпорации
-            if my_corp and (
+            if actor_main_game_on and my_corp and (
                 (not q)
                 or (q in ("корп", "корпорация", "моя корп", "моя корпорация", "досье корпорации"))
                 or q.startswith(("корп", "моя к", "досье корп"))
@@ -36522,19 +41232,22 @@ def inline_query_handler(inline_query):
                 ))
 
         # inline-заражение
-        inf_req = _parse_inline_infect_query(q_raw)
+        inf_req = _parse_inline_infect_query(q_raw) if actor_main_game_on else None
         if inf_req:
             if (inf_req.get("kind") or "") == "U":
                 tid = int(inf_req["target"])
-                cnt = max(1, int(inf_req["count"] or 1))
-                results.append(_inline_article(
-                    article_id=f"infect_u_{uid}_{tid}_{cnt}",
-                    title="Заразить",
-                    desc=_inline_infect_desc(inf_req),
-                    text=_inline_infect_preview_text(inf_req),
-                    reply_markup=kb_inline_infect_execute_user(uid, tid, cnt),
-                    thumb_url=INLINE_THUMB_INFECT_URL
-                ))
+
+                if main_game_target_enabled(int(tid)):
+                    cnt = max(1, int(inf_req["count"] or 1))
+
+                    results.append(_inline_article(
+                        article_id=f"infect_u_{uid}_{tid}_{cnt}",
+                        title="Заразить",
+                        desc=_inline_infect_desc(inf_req),
+                        text=_inline_infect_preview_text(inf_req),
+                        reply_markup=kb_inline_infect_execute_user(uid, tid, cnt),
+                        thumb_url=INLINE_THUMB_INFECT_URL
+                    ))
             else:
                 mode = str(inf_req["mode"] or "r")
                 cnt = max(1, int(inf_req["count"] or 1))
@@ -36566,7 +41279,7 @@ def inline_query_handler(inline_query):
                 ))
 
         # патроны / пат инфо
-        if not inline_target_token:
+        if actor_main_game_on and not inline_target_token:
             path_req = _parse_inline_pathogens_query(q_raw, uid)
             if path_req:
                 if path_req["kind"] == "PATH":
@@ -36746,7 +41459,7 @@ def on_document_db_command(message):
 
         if message.chat.type == "private":
             set_pm_opened(int(uid), 1)
-            set_notify_prefs(int(uid), 0, 0) 
+            set_notify_private_destination(int(uid)) 
 
         handle_owner_db_commands(message, parsed)
     except Exception as e:
@@ -36814,7 +41527,7 @@ def text_router(message):
                 upsert_user(message.from_user)
                 _merge_placeholder_to_real_user(message.from_user)
                 set_pm_opened(int(uid), 1)
-                set_notify_prefs(int(uid), 0, 0)
+                set_notify_private_destination(int(uid))
                 ensure_creator_is_support()
         
                 if parsed_banned:
@@ -36831,7 +41544,7 @@ def text_router(message):
                 upsert_user(message.from_user)
                 _merge_placeholder_to_real_user(message.from_user)
                 set_pm_opened(int(uid), 1)
-                set_notify_prefs(int(uid), 0, 0)
+                set_notify_private_destination(int(uid))
                 ensure_creator_is_support()
                 handle_report_command(message)
                 return
@@ -36843,7 +41556,7 @@ def text_router(message):
         _merge_placeholder_to_real_user(message.from_user)
         if message.chat.type == "private":
             set_pm_opened(int(uid), 1)
-            set_notify_prefs(int(uid), 0, 0)
+            set_notify_private_destination(int(uid))
         if getattr(message, "via_bot", None) is not None:
             return
         if message.chat.type in ("group", "supergroup"):
@@ -36851,6 +41564,27 @@ def text_router(message):
         ensure_creator_is_support()
 
         raw_text_for_parse = message.text or ""
+
+        if (
+            message.chat.type == "private"
+            and quick_keyboard_handle_editor_cancel(message)
+        ):
+            return
+
+        qk_matched, qk_command_text = quick_keyboard_resolve_button_command(
+            int(uid),
+            int(message.chat.id),
+            str(message.chat.type or "private"),
+            raw_text_for_parse
+        )
+        if qk_matched:
+            if not qk_command_text:
+                return
+            raw_text_for_parse = qk_command_text
+            try:
+                message.text = qk_command_text
+            except Exception:
+                pass
 
         if message.chat.type != "private" and _quick_nav_button_text_is_private_only(raw_text_for_parse):
             return
@@ -36885,18 +41619,37 @@ def text_router(message):
                 if _handle_post_content_message(message):
                     return
 
+        if (
+            message.chat.type == "private"
+            and not qk_matched
+            and quick_keyboard_handle_editor_input(message)
+        ):
+            return
+
         if not parsed:
             if try_handle_rp_action_message(message):
                 return
             return
 
-        sign0 = leading_sign_after_bot_prefix(message.text or "")
+        sign0 = leading_sign_after_bot_prefix(raw_text_for_parse or "")
         if sign0 and parsed.cmd not in SIGNED_COMMANDS_ALLOWED:
             return
 
         if message.chat.type in ("group", "supergroup"):
             if _group_short_alias_needs_prefix(message, parsed):
                 return
+
+        if (
+            command_uses_main_game(parsed.cmd)
+            and main_game_enabled(int(uid)) == 0
+        ):
+            bot.reply_to(
+                message,
+                MAIN_GAME_SELF_DISABLED_TEXT,
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
+            return
 
         if parsed.cmd in STRICT_NO_EXTRA_ARGS_CMDS and (parsed.args or "").strip():
             return
@@ -36987,6 +41740,10 @@ def text_router(message):
             handle_owner_db_commands(message, parsed)
             return
 
+        if parsed.cmd == "reguser":
+            handle_reguser_command(message, parsed)
+            return
+
         if parsed.cmd == "delete_user_db":
             handle_delete_user_db_command(message, parsed)
             return
@@ -37027,6 +41784,10 @@ def text_router(message):
 
         if parsed.cmd == "duel_rounds":
             handle_duel_rounds_command(message, parsed)
+            return
+
+        if parsed.cmd in ("quick_keyboard", "quick_keyboard_enable", "quick_keyboard_disable"):
+            handle_quick_keyboard_command(message, parsed)
             return
 
         if parsed.cmd == "hide_quick_nav":
@@ -37196,12 +41957,27 @@ def text_router(message):
             return
 
         # пользовательские настройки
-        if parsed.cmd in ("corp_notify_on", "corp_notify_off", "gender_set", "rp_on", "rp_off"):
+        if parsed.cmd in (
+            "corp_notify_on",
+            "corp_notify_off",
+
+            "game_on",
+            "game_off",
+
+            "gender_set",
+            "rp_on",
+            "rp_off"
+        ):
             handle_user_pref_command(message, parsed)
             return
         
-        # уведомление
-        if parsed.cmd in ("notify_on", "notify_off"):
+        # уведомления
+        if parsed.cmd in (
+            "notify_on",
+            "notify_off",
+            "game_notify_on",
+            "game_notify_off"
+        ):
             handle_notify_toggle(message, parsed.cmd)
             return
 
@@ -37310,7 +42086,12 @@ def text_router(message):
                     bot.reply_to(message, "📝 У вас нет горячки. Нет необходимости использовать вакцину.")
                 return
         
-            if not same_corp(int(uid), int(target_id)):
+            if not main_game_target_enabled(int(target_id)):
+                bot.reply_to(
+                    message,
+                    MAIN_GAME_TARGET_DISABLED_TEXT
+                )
+                return
                 bot.reply_to(message, "📑 Использовать вакцины на другого игрока можно только внутри вашей Корпорации.")
                 return
         
@@ -37442,6 +42223,11 @@ if __name__ == "__main__":
     except Exception as e:
         send_error_report("migrate_old_main_db_if_needed", e)
         raise
+
+    try:
+        quick_keyboard_cleanup_invalid_slots_all()
+    except Exception as e:
+        send_error_report("quick_keyboard_cleanup_invalid_slots_all", e)
 
     ensure_creator_is_support()
 
