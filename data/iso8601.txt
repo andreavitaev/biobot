@@ -1,0 +1,41 @@
+# Справочник городов Bio War.
+# флаг | города через запятую | базовое смещение UTC | зона IANA (необязательно).
+🇷🇺 | Москва, Санкт-Петербург | UTC+03:00 | Europe/Moscow
+🇷🇺 | Калининград | UTC+02:00 | Europe/Kaliningrad
+🇷🇺 | Самара | UTC+04:00 | Europe/Samara
+🇷🇺 | Екатеринбург | UTC+05:00 | Asia/Yekaterinburg
+🇷🇺 | Омск | UTC+06:00 | Asia/Omsk
+🇷🇺 | Новосибирск | UTC+07:00 | Asia/Novosibirsk
+🇷🇺 | Красноярск | UTC+07:00 | Asia/Krasnoyarsk
+🇷🇺 | Иркутск | UTC+08:00 | Asia/Irkutsk
+🇷🇺 | Якутск | UTC+09:00 | Asia/Yakutsk
+🇷🇺 | Владивосток | UTC+10:00 | Asia/Vladivostok
+🇷🇺 | Магадан | UTC+11:00 | Asia/Magadan
+🇷🇺 | Петропавловск-Камчатский | UTC+12:00 | Asia/Kamchatka
+🇧🇾 | Минск | UTC+03:00 | Europe/Minsk
+🇺🇦 | Киев | UTC+02:00 | Europe/Kyiv
+🇰🇿 | Астана, Алматы | UTC+05:00 | Asia/Almaty
+🇺🇿 | Ташкент | UTC+05:00 | Asia/Tashkent
+🇦🇲 | Ереван | UTC+04:00 | Asia/Yerevan
+🇬🇪 | Тбилиси | UTC+04:00 | Asia/Tbilisi
+🇦🇿 | Баку | UTC+04:00 | Asia/Baku
+🇹🇷 | Стамбул | UTC+03:00 | Europe/Istanbul
+🇬🇧 | Лондон | UTC+00:00 | Europe/London
+🇫🇷 | Париж | UTC+01:00 | Europe/Paris
+🇩🇪 | Берлин | UTC+01:00 | Europe/Berlin
+🇦🇪 | Дубай | UTC+04:00 | Asia/Dubai
+🇮🇳 | Дели, Мумбаи | UTC+05:30 | Asia/Kolkata
+🇨🇳 | Пекин, Шанхай | UTC+08:00 | Asia/Shanghai
+🇸🇬 | Сингапур | UTC+08:00 | Asia/Singapore
+🇯🇵 | Токио | UTC+09:00 | Asia/Tokyo
+🇰🇷 | Сеул | UTC+09:00 | Asia/Seoul
+🇦🇺 | Сидней | UTC+10:00 | Australia/Sydney
+🇳🇿 | Окленд | UTC+12:00 | Pacific/Auckland
+🇺🇸 | Нью-Йорк | UTC-05:00 | America/New_York
+🇺🇸 | Чикаго | UTC-06:00 | America/Chicago
+🇺🇸 | Денвер | UTC-07:00 | America/Denver
+🇺🇸 | Лос-Анджелес | UTC-08:00 | America/Los_Angeles
+🇨🇦 | Торонто | UTC-05:00 | America/Toronto
+🇧🇷 | Сан-Паулу | UTC-03:00 | America/Sao_Paulo
+🇦🇷 | Буэнос-Айрес | UTC-03:00 | America/Argentina/Buenos_Aires
+🇿🇦 | Йоханнесбург | UTC+02:00 | Africa/Johannesburg
